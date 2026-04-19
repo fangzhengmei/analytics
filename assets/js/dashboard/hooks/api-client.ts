@@ -9,6 +9,8 @@ import { DashboardState } from '../dashboard-state'
 import { DashboardPeriod } from '../dashboard-time-periods'
 import { Dayjs } from 'dayjs'
 import { REALTIME_UPDATE_TIME_MS } from '../util/realtime-update-timer'
+import { PlausibleSite } from '../site-context'
+import { StatsQuery } from '../stats-query'
 
 // defines when queries that don't include the current time should be refetched
 const HISTORICAL_RESPONSES_STALE_TIME_MS = 12 * 60 * 60 * 1000
@@ -24,6 +26,79 @@ type PaginatedQueryKeyBase = [Endpoint, { dashboardState: DashboardState }]
 type GetRequestParams<TKey extends PaginatedQueryKeyBase> = (
   k: TKey
 ) => [DashboardState, Record<string, unknown>]
+
+/**
+ * Hook for paginated POST /api/stats/:domain/query requests.
+ * Pass pageSize to limit results (e.g. 9 for index views, default 100 for modals).
+ * Set enabled=false to defer fetching (e.g. until the component is visible).
+ */
+export function usePaginatedQueryAPI({
+  site,
+  statsQuery,
+  afterFetchData,
+  afterFetchNextPage,
+  pageSize = PAGINATION_LIMIT,
+  enabled = true
+}: {
+  site: PlausibleSite
+  statsQuery: StatsQuery
+  afterFetchData?: (response: api.QueryApiResponse) => void
+  afterFetchNextPage?: (response: api.QueryApiResponse) => void
+  pageSize?: number
+  enabled?: boolean
+}) {
+  const queryClient = useQueryClient()
+  const dimensionKey = statsQuery.dimensions.join(',')
+
+  useEffect(() => {
+    return () => {
+      const tanstackQueryFilters: QueryFilters = {
+        predicate: (query) => {
+          const key = query.queryKey[0]
+          return (
+            typeof key === 'object' &&
+            key !== null &&
+            'dimensions' in key &&
+            (key as StatsQuery).dimensions.join(',') === dimensionKey
+          )
+        }
+      }
+      queryClient.setQueriesData(tanstackQueryFilters, cleanToPageOne)
+    }
+  }, [queryClient, dimensionKey])
+
+  return useInfiniteQuery({
+    queryKey: [statsQuery],
+    enabled,
+    queryFn: async ({
+      pageParam
+    }): Promise<api.QueryApiResponse['results']> => {
+      const response: api.QueryApiResponse = await api.stats(site, {
+        ...statsQuery,
+        pagination: { limit: pageSize, offset: pageParam as number }
+      } as StatsQuery)
+
+      if (pageParam === 0 && typeof afterFetchData === 'function') {
+        afterFetchData(response)
+      }
+      if (
+        (pageParam as number) > 0 &&
+        typeof afterFetchNextPage === 'function'
+      ) {
+        afterFetchNextPage(response)
+      }
+
+      return response.results
+    },
+    getNextPageParam: (lastPageResults, _, lastPageParam) => {
+      return lastPageResults.length === pageSize
+        ? (lastPageParam as number) + pageSize
+        : null
+    },
+    initialPageParam: 0,
+    placeholderData: (previousData) => previousData
+  })
+}
 
 /**
  * Hook that fetches the first page from the defined GET endpoint on mount,
