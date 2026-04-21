@@ -8,6 +8,7 @@ import StatsExport from './stats-export'
 import WithImportedSwitch from './with-imported-switch'
 import { NoticesIcon } from './notices'
 import { useDashboardStateContext } from '../../dashboard-state-context'
+import { DashboardState } from '../../dashboard-state'
 import { PlausibleSite, useSiteContext } from '../../site-context'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Metric } from '../../../types/query-api'
@@ -164,15 +165,20 @@ export default function VisitorGraph({
     }
   }, [topStatsQuery.data, updateImportedDataInView])
 
-  // fetch realtime stats
-  const refetchTopStats = topStatsQuery.refetch
-  const refetchMainGraph = mainGraphQuery.refetch
-
   useEffect(() => {
     const onTick = () => {
       setIsRealtimeSilentUpdate({ topStats: true, mainGraph: true })
-      refetchTopStats()
-      refetchMainGraph()
+      queryClient.invalidateQueries({
+        predicate: ({ queryKey }) => {
+          const realtimeTopStatsOrMainGraphQuery =
+            ['top-stats', 'main-graph'].includes(queryKey[0] as string) &&
+            typeof queryKey[1] === 'object' &&
+            (queryKey[1] as { dashboardState?: DashboardState })?.dashboardState
+              ?.period === DashboardPeriod.realtime
+
+          return realtimeTopStatsOrMainGraphQuery
+        }
+      })
     }
 
     if (isRealtime) {
@@ -182,7 +188,7 @@ export default function VisitorGraph({
     return () => {
       document.removeEventListener('tick', onTick)
     }
-  }, [queryClient, isRealtime, refetchTopStats, refetchMainGraph])
+  }, [queryClient, isRealtime])
 
   const importedSwitchVisible = !['no_imported_data', 'out_of_range'].includes(
     topStatsQuery.data?.meta.imports_skip_reason as string
