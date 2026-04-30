@@ -48,7 +48,8 @@ function toJourney(steps) {
     name: s.name,
     pathname: s.pathname,
     includes_subpaths: s.includes_subpaths,
-    subpaths_count: s.subpaths_count
+    subpaths_count: s.subpaths_count,
+    is_goal: s.is_goal
   }))
 }
 
