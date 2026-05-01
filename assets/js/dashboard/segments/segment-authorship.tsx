@@ -1,0 +1,43 @@
+import React from 'react'
+import { SavedSegmentPublic, SavedSegment } from '../filtering/segments'
+import { dateForSite, formatDayShort } from '../util/date'
+import { useSiteContext } from '../site-context'
+
+type SegmentAuthorshipProps = {
+  className?: string
+  showOnlyPublicData: boolean
+  segment: SavedSegmentPublic | SavedSegment
+}
+
+export function SegmentAuthorship({
+  className,
+  showOnlyPublicData,
+  segment
+}: SegmentAuthorshipProps) {
+  const site = useSiteContext()
+  const authorLabel =
+    showOnlyPublicData === true
+      ? null
+      : (segment.owner_name ?? '(Removed User)')
+
+  const { updated_at, inserted_at } = segment
+  const showUpdatedAt = updated_at !== inserted_at
+
+  return (
+    <span className={className}>
+      <span>
+        {`Created at ${formatDayShort(dateForSite(inserted_at, site))}`}
+        {!showUpdatedAt && !!authorLabel && ` by ${authorLabel}`}
+      </span>
+      {showUpdatedAt && (
+        <>
+          {' • '}
+          <span>
+            {`Last updated at ${formatDayShort(dateForSite(updated_at, site))}`}
+            {!!authorLabel && ` by ${authorLabel}`}
+          </span>
+        </>
+      )}
+    </span>
+  )
+}

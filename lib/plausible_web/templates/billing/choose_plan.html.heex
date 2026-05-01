@@ -1,0 +1,4 @@
+{live_render(@conn, @live_module,
+  id: "choose-plan",
+  session: %{"remote_ip" => PlausibleWeb.RemoteIP.get(@conn)}
+)}

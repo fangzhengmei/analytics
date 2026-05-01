@@ -1,0 +1,105 @@
+<.settings_tiles>
+  <.tile docs="visibility">
+    <:title>
+      Public dashboard
+    </:title>
+    <:subtitle>
+      Share your stats publicly or keep them private.
+    </:subtitle>
+
+    <.form
+      action={
+        (@site.public && Routes.site_path(@conn, :make_private, @site.domain)) ||
+          Routes.site_path(@conn, :make_public, @site.domain)
+      }
+      aria-label="Make stats publicly available"
+      method="post"
+      for={nil}
+    >
+      <.toggle_submit set_to={@site.public}>
+        Make stats publicly available on
+        <.unstyled_link
+          class="text-indigo-500"
+          href={Routes.stats_path(@conn, :stats, @site.domain, [])}
+        >
+          {PlausibleWeb.StatsView.pretty_stats_url(@site)}
+        </.unstyled_link>
+      </.toggle_submit>
+    </.form>
+  </.tile>
+
+  <div :if={Plausible.Billing.Feature.SharedLinks.enabled?(@site)}>
+    {live_render(@conn, PlausibleWeb.Live.SharedLinkSettings,
+      session: %{"site_id" => @site.id, "domain" => @site.domain}
+    )}
+  </div>
+
+  <.tile
+    docs="embed-dashboard"
+    feature_mod={Plausible.Billing.Feature.SharedLinks}
+    site={@site}
+    current_user={@current_user}
+    current_team={@site_team}
+    conn={@conn}
+  >
+    <:title>
+      Embed dashboard
+    </:title>
+    <:subtitle>
+      You can use shared links to embed your stats in any other webpage using an <code>iframe</code>. Copy & paste a shared link into the form below to generate the embed code.
+    </:subtitle>
+
+    <.input
+      name="embed-link"
+      id="embed-link"
+      label="Enter shared link (only public shared links without password can be embedded)"
+      value=""
+      width="w-1/2"
+      mt?={false}
+    />
+
+    <.input
+      type="select"
+      name="theme"
+      id="theme"
+      label="Select theme"
+      options={["Light", "Dark", "System"]}
+      value="Light"
+      width="w-1/2"
+    />
+
+    <.input
+      name="background"
+      id="background"
+      label="Custom background color (optional). Try using `transparent` background to blend the dashboard with your site."
+      value=""
+      placeholder="e.g. #F9FAFB"
+      width="w-1/2"
+    />
+
+    <.input name="base-url" type="hidden" id="base-url" value={plausible_url()} />
+    <.button id="generate-embed" mt?={false}>
+      Generate embed code
+    </.button>
+
+    <.label for="embed-code" class="mt-4">Embed code</.label>
+
+    <div class="relative mt-1">
+      <textarea
+        id="embed-code"
+        name="embed-code"
+        rows="6"
+        readonly="readonly"
+        onclick="this.select()"
+        class="block w-full border-gray-300 dark:border-gray-750 resize-none text-sm shadow-xs focus:ring-indigo-500 focus:border-indigo-500 rounded-md dark:bg-gray-750 dark:text-gray-300"
+      ></textarea>
+      <a
+        onclick="var textarea = document.getElementById('embed-code'); textarea.focus(); textarea.select(); document.execCommand('copy');"
+        href="javascript:void(0)"
+        class="text-sm text-indigo-500 no-underline hover:underline"
+      >
+        <Heroicons.document_duplicate class="size-5 absolute text-indigo-600 hover:text-indigo-700 dark:text-indigo-500 dark:hover:text-indigo-400 top-3 right-3 transition-colors duration-150" />
+      </a>
+    </div>
+  </.tile>
+</.settings_tiles>

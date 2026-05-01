@@ -1,0 +1,108 @@
+<.focus_box>
+  <:title>
+    Invite guest to {@site.domain}
+  </:title>
+
+  <:subtitle>
+    Enter their email and role, and we'll email them an invite to join
+    <span class="font-bold">{@site.domain}</span>
+    analytics. Invitations expire after 48 hours.
+  </:subtitle>
+
+  <.form :let={f} for={@conn} action={Routes.membership_path(@conn, :invite_member, @site.domain)}>
+    <PlausibleWeb.Components.Billing.Notice.limit_exceeded
+      :if={Map.get(assigns, :is_at_limit, false)}
+      current_user={@current_user}
+      current_team={@site_team}
+      limit={Map.get(assigns, :team_member_limit, 0)}
+      resource="members"
+    />
+
+    <div class="my-6">
+      <.input
+        type="email"
+        field={f[:email]}
+        label="Email address"
+        placeholder="joe@example.com"
+        required="true"
+      />
+
+      <%= if @conn.assigns[:error] do %>
+        <div class="text-red-500 mb-4">{@conn.assigns[:error]}</div>
+      <% end %>
+    </div>
+
+    <fieldset x-data="{selectedOption: null}" class="flex flex-col gap-y-4">
+      <.label for={f[:role].id}>
+        Role
+      </.label>
+      <div class="flex flex-col gap-y-4">
+        <label
+          class="relative flex cursor-pointer"
+          x-class="{'bg-indigo-50 border-indigo-200 dark:bg-indigo-500 dark:border-indigo-800 z-10': selectedOption === 'editor', 'border-gray-200': selectedOption !== 'editor'}"
+        >
+          <.input
+            type="radio"
+            field={f[:role]}
+            id="role_editor"
+            value="editor"
+            x-model="selectedOption"
+            required="true"
+            width="w-4"
+            class="block dark:bg-gray-900 h-4 w-4 mt-0.5 cursor-pointer text-indigo-600 border-gray-300 dark:border-gray-500 focus:ring-indigo-500"
+          />
+          <div class="ml-3 flex flex-col">
+            <span
+              class="text-gray-900 dark:text-gray-100 block text-sm font-medium"
+              x-class="{'text-indigo-900 dark:text-white': selectedOption === 'editor', 'text-gray-900 dark:text-gray-100': selectedOption !== 'editor'}"
+            >
+              Guest Editor
+            </span>
+            <span
+              class="text-gray-500 dark:text-gray-400 text-sm block"
+              x-class="{'text-indigo-700 dark:text-gray-100': selectedOption === 'editor', 'text-gray-500 dark:text-gray-200': selectedOption !== 'editor'}"
+            >
+              Can view stats and change site settings
+            </span>
+          </div>
+        </label>
+
+        <label
+          class="relative flex cursor-pointer"
+          x-class="{'bg-indigo-50 border-indigo-200 dark:bg-indigo-500 dark:border-indigo-800 z-10': selectedOption === 'viewer', 'border-gray-200': selectedOption !== 'viewer'}"
+        >
+          <.input
+            type="radio"
+            field={f[:role]}
+            id="role_viewer"
+            value="viewer"
+            x-model="selectedOption"
+            required="true"
+            width="w-4"
+            class="block dark:bg-gray-900 h-4 w-4 mt-0.5 cursor-pointer text-indigo-600 border-gray-300 dark:border-gray-500 focus:ring-indigo-500"
+          />
+          <div class="ml-3 flex flex-col">
+            <span
+              class="text-gray-900 dark:text-gray-100 text-sm block font-medium"
+              x-class="{'text-indigo-900 dark:text-white': selectedOption === 'viewer', 'text-gray-900 dark:text-gray-100': selectedOption !== 'viewer'}"
+            >
+              Guest Viewer
+            </span>
+            <span
+              class="text-gray-500 dark:text-gray-400 text-sm block"
+              x-class="{'text-indigo-700 dark:text-gray-100': selectedOption === 'viewer', 'text-gray-500 dark:text-gray-200': selectedOption !== 'viewer'}"
+            >
+              Can view stats but cannot access settings
+            </span>
+          </div>
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="mt-6">
+      <.button type="submit" class="w-full">
+        Invite
+      </.button>
+    </div>
+  </.form>
+</.focus_box>

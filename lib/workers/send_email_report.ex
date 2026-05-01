@@ -1,0 +1,210 @@
+defmodule Plausible.Workers.SendEmailReport do
+  use Plausible
+  use Plausible.Repo
+  use Oban.Worker, queue: :send_email_reports, max_attempts: 1
+
+  alias Plausible.Stats.{QueryResult, QueryBuilder, ParsedQueryParams, QueryInclude}
+
+  import Ecto.Query, only: [from: 2]
+
+  @weekly "weekly"
+  @monthly "monthly"
+
+  def perform(%Oban.Job{args: %{"interval" => interval, "site_id" => site_id}})
+      when interval in [@weekly, @monthly] do
+    report_type = report_type(interval)
+
+    site =
+      from(s in Plausible.Site,
+        where: s.id == ^site_id,
+        inner_join: r in assoc(s, ^report_type),
+        inner_join: t in assoc(s, :team),
+        preload: [{^report_type, r}, {:team, t}]
+      )
+      |> Repo.one()
+
+    with %Plausible.Site{} <- site,
+         %{} = report <- Map.fetch!(site, report_type),
+         true <- ok_to_send?(site) do
+      date_range = date_range(site, interval)
+      report_name = report_name(interval, date_range.first)
+      date_label = Calendar.strftime(date_range.last, "%-d %b %Y")
+      stats = stats(site, date_range)
+
+      report
+      |> Map.fetch!(:recipients)
+      |> Enum.each(fn email ->
+        assigns = %{
+          site: site,
+          report_name: report_name,
+          date_label: date_label,
+          unsubscribe_link: unsubscribe_link(site, email, interval),
+          site_member?: site_member?(site, email),
+          interval: interval,
+          stats: stats
+        }
+
+        email
+        |> PlausibleWeb.Email.stats_report(assigns)
+        |> Plausible.Mailer.send()
+      end)
+    else
+      _ -> :discard
+    end
+  end
+
+  defp report_type(@weekly), do: :weekly_report
+  defp report_type(@monthly), do: :monthly_report
+
+  defp site_member?(site, email) do
+    user = Plausible.Auth.find_user_by(email: email)
+    user && Plausible.Teams.Memberships.site_member?(site, user)
+  end
+
+  defp unsubscribe_link(site, email, interval) do
+    PlausibleWeb.Endpoint.url() <>
+      "/sites/#{URI.encode_www_form(site.domain)}/#{interval}-report/unsubscribe?email=#{email}"
+  end
+
+  defp report_name(@weekly, _), do: "Weekly"
+  defp report_name(@monthly, first), do: Calendar.strftime(first, "%B")
+
+  defp stats(site, date_range) do
+    shared_params = %ParsedQueryParams{
+      metrics: [:visitors],
+      input_date_range: {:date_range, date_range.first, date_range.last},
+      pagination: %{limit: 5, offset: 0}
+    }
+
+    stats = stats_aggregates(site, shared_params)
+    pages = pages(site, shared_params)
+    sources = sources(site, shared_params)
+    goals = goals(site, shared_params)
+
+    stats
+    |> Map.put(:pages, pages)
+    |> Map.put(:sources, sources)
+    |> Map.put(:goals, goals)
+  end
+
+  defp stats_aggregates(site, %ParsedQueryParams{} = shared_params) do
+    query =
+      QueryBuilder.build!(
+        site,
+        struct!(shared_params,
+          metrics: [:pageviews, :visitors, :bounce_rate],
+          include: %QueryInclude{compare: :previous_period}
+        )
+      )
+
+    %QueryResult{
+      results: [
+        %{
+          metrics: [pageviews, visitors, bounce_rate],
+          comparison: %{
+            change: [pageviews_change, visitors_change, bounce_rate_change]
+          }
+        }
+      ]
+    } = Plausible.Stats.query(site, query)
+
+    %{
+      pageviews: %{value: pageviews, change: pageviews_change},
+      visitors: %{value: visitors, change: visitors_change},
+      bounce_rate: %{value: bounce_rate, change: bounce_rate_change}
+    }
+  end
+
+  defp pages(site, %ParsedQueryParams{} = shared_params) do
+    query = QueryBuilder.build!(site, struct!(shared_params, dimensions: ["event:page"]))
+
+    site
+    |> Plausible.Stats.query(query)
+    |> Map.fetch!(:results)
+    |> Enum.map(fn %{metrics: [visitors], dimensions: [page]} ->
+      %{
+        page: page,
+        visitors: visitors
+      }
+    end)
+  end
+
+  defp sources(site, %ParsedQueryParams{} = shared_params) do
+    query =
+      QueryBuilder.build!(
+        site,
+        struct!(shared_params,
+          dimensions: ["visit:source"],
+          filters: [[:is_not, "visit:source", ["Direct / None"]]]
+        )
+      )
+
+    site
+    |> Plausible.Stats.query(query)
+    |> Map.fetch!(:results)
+    |> Enum.map(fn %{metrics: [visitors], dimensions: [source]} ->
+      %{
+        source: source,
+        visitors: visitors
+      }
+    end)
+  end
+
+  defp goals(site, %ParsedQueryParams{} = shared_params) do
+    query = QueryBuilder.build!(site, struct!(shared_params, dimensions: ["event:goal"]))
+
+    site
+    |> Plausible.Stats.query(query)
+    |> Map.fetch!(:results)
+    |> Enum.map(fn %{metrics: [visitors], dimensions: [goal_name]} ->
+      %{
+        goal: goal_name,
+        visitors: visitors
+      }
+    end)
+  end
+
+  defp date_range(site, @weekly) do
+    first =
+      site.timezone
+      |> DateTime.now!()
+      |> Date.shift(day: -7)
+      |> Date.beginning_of_week()
+
+    last =
+      site.timezone
+      |> DateTime.now!()
+      |> DateTime.to_date()
+      |> Date.shift(day: -7)
+      |> Date.end_of_week()
+
+    Date.range(first, last)
+  end
+
+  defp date_range(site, @monthly) do
+    first =
+      site.timezone
+      |> DateTime.now!()
+      |> Date.shift(month: -1)
+      |> Date.beginning_of_month()
+
+    last =
+      site.timezone
+      |> DateTime.now!()
+      |> DateTime.shift(month: -1)
+      |> DateTime.to_date()
+      |> Date.end_of_month()
+
+    Date.range(first, last)
+  end
+
+  on_ee do
+    defp ok_to_send?(site) do
+      Plausible.Sites.regular?(site) or
+        (Plausible.Sites.consolidated?(site) and
+           Plausible.ConsolidatedView.ok_to_display?(site.team))
+    end
+  else
+    defp ok_to_send?(_site), do: always(true)
+  end
+end
