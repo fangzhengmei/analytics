@@ -1,0 +1,352 @@
+defmodule PlausibleWeb.Live.GoalSettingsTest do
+  use PlausibleWeb.ConnCase, async: true
+  import Phoenix.LiveViewTest
+
+  @funnels_cta ~s|p[data-test-id="setup-funnels-cta"]|
+
+  describe "GET /:domain/settings/goals" do
+    setup [:create_user, :log_in, :create_site]
+
+    @tag :ee_only
+    test "lists goals for the site and renders links", %{conn: conn, site: site} do
+      {:ok, [g1, g2, g3]} = setup_goals(site)
+      conn = get(conn, "/#{site.domain}/settings/goals")
+
+      resp = html_response(conn, 200)
+      assert resp =~ "Define actions that you want your users to take"
+      assert text_of_element(resp, @funnels_cta) =~ "compose goals into funnels"
+
+      assert text_of_attr(resp, "#{@funnels_cta} a", "href") =~
+               "/#{URI.encode_www_form(site.domain)}/settings/funnels"
+
+      assert element_exists?(resp, ~s|a[href="https://plausible.io/docs/goal-conversions"]|)
+
+      assert resp =~ to_string(g1)
+      assert resp =~ "Pageview"
+      assert resp =~ to_string(g2)
+      assert resp =~ "Custom Event"
+      assert resp =~ to_string(g3)
+      assert resp =~ "Revenue Goal (EUR)"
+    end
+
+    @tag :ee_only
+    test "lists Revenue Goals with feature availability annotation if the plan does not cover them",
+         %{conn: conn, user: user, site: site} do
+      {:ok, [_, _, g3]} = setup_goals(site)
+
+      user
+      |> team_of()
+      |> Plausible.Teams.Team.end_trial()
+      |> Plausible.Repo.update!()
+
+      conn = get(conn, "/#{site.domain}/settings/goals")
+
+      resp = html_response(conn, 200)
+
+      assert g3.currency
+      assert resp =~ to_string(g3)
+      assert text_of_element(resp, ~s/[data-test-id="feature-unavailable-cta"]/) =~ "Upgrade"
+
+      assert element_exists?(
+               resp,
+               ~s/button[data-test-id="edit-goal-button"][disabled]/
+             )
+    end
+
+    @tag :ee_only
+    test "lists goals with custom props with feature availability annotation if the plan does not cover them",
+         %{conn: conn, user: user, site: site} do
+      {:ok, goal_with_props} =
+        Plausible.Goals.create(site, %{
+          "event_name" => "Signup",
+          "custom_props" => %{"plan" => "premium"}
+        })
+
+      user
+      |> team_of()
+      |> Plausible.Teams.Team.end_trial()
+      |> Plausible.Repo.update!()
+
+      conn = get(conn, "/#{site.domain}/settings/goals")
+
+      resp = html_response(conn, 200)
+
+      assert Plausible.Goal.has_custom_props?(goal_with_props)
+      assert resp =~ to_string(goal_with_props)
+      assert text_of_element(resp, ~s/[data-test-id="feature-unavailable-cta"]/) =~ "Upgrade"
+
+      assert element_exists?(
+               resp,
+               ~s/button[data-test-id="edit-goal-button"][disabled]/
+             )
+    end
+
+    test "lists goals with actions", %{conn: conn, site: site} do
+      {:ok, goals} = setup_goals(site)
+      conn = get(conn, "/#{site.domain}/settings/goals")
+      resp = html_response(conn, 200)
+
+      for g <- goals do
+        assert element_exists?(
+                 resp,
+                 ~s/button[phx-click="delete-goal"][phx-value-goal-id="#{g.id}"]#delete-goal-#{g.id}/
+               )
+
+        assert element_exists?(
+                 resp,
+                 ~s/button[data-test-id="edit-goal-button"][phx-click="edit-goal"][phx-value-goal-id="#{g.id}"]:not([disabled])#edit-goal-#{g.id}/
+               )
+      end
+    end
+
+    test "if no goals are present, a proper info is displayed", %{conn: conn, site: site} do
+      conn = get(conn, "/#{site.domain}/settings/goals")
+      resp = html_response(conn, 200)
+      assert resp =~ "Create your first goal"
+    end
+
+    test "if goals are present, no info about missing goals is displayed", %{
+      conn: conn,
+      site: site
+    } do
+      {:ok, _goals} = setup_goals(site)
+      conn = get(conn, "/#{site.domain}/settings/goals")
+      resp = html_response(conn, 200)
+      refute resp =~ "Create your first goal"
+    end
+
+    test "add goal dropdown is rendered in empty state", %{conn: conn, site: site} do
+      conn = get(conn, "/#{site.domain}/settings/goals")
+      resp = html_response(conn, 200)
+      assert element_exists?(resp, ~s/[id="add-goal-dropdown-empty"]/)
+
+      assert element_exists?(
+               resp,
+               ~s/[phx-click="add-goal"][phx-value-goal-type="custom_events"]/
+             )
+
+      assert element_exists?(resp, ~s/[phx-click="add-goal"][phx-value-goal-type="pageviews"]/)
+      assert element_exists?(resp, ~s/[phx-click="add-goal"][phx-value-goal-type="scroll"]/)
+    end
+
+    test "add goal dropdown is rendered in non-empty state", %{conn: conn, site: site} do
+      {:ok, _goals} = setup_goals(site)
+      conn = get(conn, "/#{site.domain}/settings/goals")
+      resp = html_response(conn, 200)
+      assert element_exists?(resp, ~s/[id="add-goal-dropdown"]/)
+
+      assert element_exists?(
+               resp,
+               ~s/[phx-click="add-goal"][phx-value-goal-type="custom_events"]/
+             )
+
+      assert element_exists?(resp, ~s/[phx-click="add-goal"][phx-value-goal-type="pageviews"]/)
+      assert element_exists?(resp, ~s/[phx-click="add-goal"][phx-value-goal-type="scroll"]/)
+    end
+
+    test "search goals input is rendered", %{conn: conn, site: site} do
+      {:ok, _goals} = setup_goals(site)
+      conn = get(conn, "/#{site.domain}/settings/goals")
+      resp = html_response(conn, 200)
+      assert element_exists?(resp, ~s/input[type="text"]#filter-text/)
+      assert element_exists?(resp, ~s/form[phx-change="filter"]#filter-form/)
+    end
+  end
+
+  on_ee do
+    describe "GET /:domain/settings/goals - consolidated views" do
+      setup [:create_user, :create_team, :log_in]
+
+      setup %{team: team} = context do
+        new_site(team: team)
+        new_site(team: team)
+
+        {:ok, Map.put(context, :consolidated_view, new_consolidated_view(team))}
+      end
+
+      test "no goals exist", %{conn: conn, consolidated_view: consolidated_view} do
+        conn = get(conn, "/#{consolidated_view.domain}/settings/goals")
+
+        assert resp = html_response(conn, 200)
+        assert resp =~ "Define actions that you want your users to take"
+        assert resp =~ "Create your first goal"
+        assert element_exists?(resp, ~s|a[href="https://plausible.io/docs/goal-conversions"]|)
+      end
+
+      test "lists goals", %{conn: conn, consolidated_view: consolidated_view} do
+        {:ok, g1} = Plausible.Goals.create(consolidated_view, %{"page_path" => "/go/to/blog/**"})
+        {:ok, g2} = Plausible.Goals.create(consolidated_view, %{"event_name" => "Register"})
+
+        conn = get(conn, "/#{consolidated_view.domain}/settings/goals")
+
+        assert resp = html_response(conn, 200)
+        assert resp =~ "Define actions that you want your users to take"
+        assert element_exists?(resp, ~s|a[href="https://plausible.io/docs/goal-conversions"]|)
+
+        assert resp =~ to_string(g1)
+        assert resp =~ "Pageview"
+        assert resp =~ to_string(g2)
+        assert resp =~ "Custom Event"
+      end
+
+      test "does not render funnels cta", %{conn: conn, consolidated_view: consolidated_view} do
+        conn = get(conn, "/#{consolidated_view.domain}/settings/goals")
+
+        assert resp = html_response(conn, 200)
+        refute element_exists?(resp, @funnels_cta)
+      end
+    end
+  end
+
+  describe "GoalSettings live view" do
+    setup [:create_user, :log_in, :create_site]
+
+    test "allows dashboard toggle", %{conn: conn, site: site} do
+      lv = get_liveview(conn, site)
+      lv |> element("#feature-goals-toggle button") |> render_click()
+      assert render(lv) =~ "Goals are now hidden from your dashboard"
+      assert Plausible.Billing.Feature.Goals.opted_out?(Plausible.Repo.reload!(site))
+      lv |> element("#feature-goals-toggle button") |> render_click()
+      assert render(lv) =~ "Goals are now visible again on your dashboard"
+      refute Plausible.Billing.Feature.Goals.opted_out?(Plausible.Repo.reload!(site))
+    end
+
+    test "allows goal deletion", %{conn: conn, site: site} do
+      {:ok, [g1, g2 | _]} = setup_goals(site)
+      {lv, html} = get_liveview(conn, site, with_html?: true)
+
+      assert html =~ to_string(g1)
+      assert html =~ to_string(g2)
+
+      html = lv |> element(~s/button#delete-goal-#{g1.id}/) |> render_click()
+
+      refute html =~ to_string(g1)
+      assert html =~ to_string(g2)
+
+      html = get(conn, "/#{site.domain}/settings/goals") |> html_response(200)
+
+      refute html =~ to_string(g1)
+      assert html =~ to_string(g2)
+    end
+
+    test "allows list filtering / search", %{conn: conn, site: site} do
+      {:ok, [g1, g2, g3]} = setup_goals(site)
+      {lv, html} = get_liveview(conn, site, with_html?: true)
+
+      assert html =~ to_string(g1)
+      assert html =~ to_string(g2)
+      assert html =~ to_string(g3)
+
+      html = type_into_search(lv, to_string(g3))
+
+      refute html =~ to_string(g1)
+      refute html =~ to_string(g2)
+      assert html =~ to_string(g3)
+    end
+
+    test "allows resetting filter text via backspace icon", %{conn: conn, site: site} do
+      {:ok, [g1, g2, g3]} = setup_goals(site)
+      {lv, html} = get_liveview(conn, site, with_html?: true)
+
+      refute element_exists?(html, ~s/svg[phx-click="reset-filter-text"]#reset-filter/)
+
+      html = type_into_search(lv, to_string(g3))
+
+      assert element_exists?(html, ~s/svg[phx-click="reset-filter-text"]#reset-filter/)
+
+      html = lv |> element(~s/svg#reset-filter/) |> render_click()
+
+      assert html =~ to_string(g1)
+      assert html =~ to_string(g2)
+      assert html =~ to_string(g3)
+    end
+
+    test "allows resetting filter text via no match link", %{conn: conn, site: site} do
+      {:ok, _goals} = setup_goals(site)
+      lv = get_liveview(conn, site)
+      html = type_into_search(lv, "Definitely this is not going to render any matches")
+
+      assert html =~ "No goals found for this site. Please refine or"
+      assert html =~ "reset your search"
+
+      assert element_exists?(html, ~s/a[phx-click="reset-filter-text"]#reset-filter-hint/)
+      html = lv |> element(~s/a#reset-filter-hint/) |> render_click()
+
+      refute html =~ "No goals found for this site. Please refine or"
+    end
+  end
+
+  on_ee do
+    describe "GoalSettings live view - consolidated views" do
+      setup [:create_user, :create_team, :log_in]
+
+      setup %{team: team} = context do
+        new_site(team: team)
+        new_site(team: team)
+
+        {:ok, Map.put(context, :consolidated_view, new_consolidated_view(team))}
+      end
+
+      test "allows goal deletion", %{conn: conn, consolidated_view: consolidated_view} do
+        {:ok, g1} = Plausible.Goals.create(consolidated_view, %{"page_path" => "/go/to/blog/**"})
+        {:ok, g2} = Plausible.Goals.create(consolidated_view, %{"event_name" => "Register"})
+
+        {lv, html} = get_liveview(conn, consolidated_view, with_html?: true)
+
+        assert html =~ to_string(g1)
+        assert html =~ to_string(g2)
+
+        html = lv |> element(~s/button#delete-goal-#{g1.id}/) |> render_click()
+
+        refute html =~ to_string(g1)
+        assert html =~ to_string(g2)
+
+        html = get(conn, "/#{consolidated_view.domain}/settings/goals") |> html_response(200)
+
+        refute html =~ to_string(g1)
+        assert html =~ to_string(g2)
+      end
+
+      test "allows list filtering / search", %{conn: conn, consolidated_view: consolidated_view} do
+        {:ok, g1} = Plausible.Goals.create(consolidated_view, %{"page_path" => "/go/to/blog/**"})
+        {:ok, g2} = Plausible.Goals.create(consolidated_view, %{"event_name" => "Register"})
+        {lv, html} = get_liveview(conn, consolidated_view, with_html?: true)
+
+        assert html =~ to_string(g1)
+        assert html =~ to_string(g2)
+
+        html = type_into_search(lv, to_string(g2))
+
+        refute html =~ to_string(g1)
+        assert html =~ to_string(g2)
+      end
+    end
+  end
+
+  defp setup_goals(site) do
+    {:ok, g1} = Plausible.Goals.create(site, %{"page_path" => "/go/to/blog/**"})
+    {:ok, g2} = Plausible.Goals.create(site, %{"event_name" => "Register"})
+    {:ok, g3} = Plausible.Goals.create(site, %{"event_name" => "Purchase", "currency" => "EUR"})
+    {:ok, [g1, g2, g3]}
+  end
+
+  defp get_liveview(conn, site, opts \\ []) do
+    conn = assign(conn, :live_module, PlausibleWeb.Live.GoalSettings)
+    {:ok, lv, html} = live(conn, "/#{site.domain}/settings/goals")
+
+    if Keyword.get(opts, :with_html?) do
+      {lv, html}
+    else
+      lv
+    end
+  end
+
+  defp type_into_search(lv, text) do
+    lv
+    |> element("form#filter-form")
+    |> render_change(%{
+      "_target" => ["filter-text"],
+      "filter-text" => "#{text}"
+    })
+  end
+end

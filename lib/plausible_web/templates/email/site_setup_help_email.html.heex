@@ -1,0 +1,10 @@
+We haven't recorded any traffic for {@site.domain} yet.<br /><br />
+This usually means Plausible has not been connected to your website or the tracking code has not been added correctly.<br /><br />
+To finish your setup, check
+<a href={"#{plausible_url()}/#{URI.encode_www_form(@site.domain)}/installation?__team=#{@site_team.identifier}"}>
+  your installation
+</a>.<br /><br />
+If something still doesn't look right, see our troubleshooting guide:<br />
+<a href="https://plausible.io/docs/troubleshoot-integration">
+  https://plausible.io/docs/troubleshoot-integration
+</a>

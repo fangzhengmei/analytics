@@ -1,0 +1,27 @@
+<%= on_ee do %>
+  <script
+    :if={!@conn.assigns[:skip_plausible_tracking]}
+    id="dogfood-script"
+    data-script-params={JSON.encode!(PlausibleWeb.Dogfood.script_params(@conn.assigns))}
+  >
+    var scriptParams = JSON.parse(document.currentScript.dataset.scriptParams)
+
+    window.plausible=window.plausible||function(){(window.plausible.q=window.plausible.q||[]).push(arguments)},window.plausible.init=function(i){window.plausible.o=i||{}};var script=document.createElement("script");script.type="text/javascript",script.async=!0,script.src=scriptParams.script_url;var r=document.getElementsByTagName("script")[0];r.parentNode.insertBefore(script,r);
+
+    plausible.init({
+      captureOnLocalhost: scriptParams.capture_on_localhost,
+      customProperties: {
+        ...scriptParams.custom_properties,
+        browser_language: navigator.language || navigator.userLanguage
+      },
+      transformRequest: function (payload) {
+        if (scriptParams.location_override) {
+          payload.u = scriptParams.location_override
+        } else if (scriptParams.domain_to_replace) {
+          payload.u = payload.u.replace(scriptParams.domain_to_replace, ':dashboard')
+        }
+        return payload
+      }
+    })
+  </script>
+<% end %>

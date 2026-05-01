@@ -1,0 +1,74 @@
+defmodule Plausible.Workers.SendCheckStatsEmailsTest do
+  use Plausible.DataCase, async: true
+  use Oban.Testing, repo: Plausible.Repo
+  use Bamboo.Test
+
+  alias Plausible.Workers.SendCheckStatsEmails
+
+  test "does not send an email before a week has passed" do
+    user = new_user(inserted_at: days_ago(6), last_seen: days_ago(6))
+    new_site(domain: "test-site.com", owner: user)
+
+    perform_job(SendCheckStatsEmails, %{})
+
+    assert_no_emails_delivered()
+  end
+
+  test "does not send an email if the user has logged in recently" do
+    user = new_user(inserted_at: days_ago(9), last_seen: days_ago(6))
+    new_site(domain: "test-site.com", owner: user)
+
+    perform_job(SendCheckStatsEmails, %{})
+
+    assert_no_emails_delivered()
+  end
+
+  test "does not send an email if the user has configured a weekly report" do
+    user = new_user(inserted_at: days_ago(9), last_seen: days_ago(7))
+    site = new_site(domain: "test-site.com", owner: user)
+
+    populate_stats(site, [build(:pageview)])
+    insert(:weekly_report, site: site, recipients: ["user@email.com"])
+
+    perform_job(SendCheckStatsEmails, %{})
+
+    assert_no_emails_delivered()
+  end
+
+  test "sends an email after a week of signup if the user hasn't logged in" do
+    user = new_user(inserted_at: days_ago(8), last_seen: days_ago(8))
+    site = new_site(domain: "test-site.com", owner: user)
+    populate_stats(site, [build(:pageview)])
+
+    perform_job(SendCheckStatsEmails, %{})
+
+    assert_email_delivered_with(
+      to: [{user.name, user.email}],
+      subject: "How Plausible is different"
+    )
+  end
+
+  test "team members idling will get the email" do
+    user = new_user(last_seen: NaiveDateTime.utc_now(:second), inserted_at: days_ago(8))
+    site = new_site(owner: user)
+    populate_stats(site, [build(:pageview)])
+
+    user2 =
+      add_member(team_of(user),
+        user: new_user(inserted_at: days_ago(8), last_seen: days_ago(8)),
+        role: :editor
+      )
+
+    perform_job(SendCheckStatsEmails, %{})
+
+    assert_email_delivered_with(
+      to: [{user2.name, user2.email}],
+      subject: "How Plausible is different"
+    )
+  end
+
+  defp days_ago(days) do
+    NaiveDateTime.utc_now(:second)
+    |> NaiveDateTime.shift(day: -days)
+  end
+end

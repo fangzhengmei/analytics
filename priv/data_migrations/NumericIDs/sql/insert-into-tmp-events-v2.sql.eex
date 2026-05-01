@@ -1,0 +1,42 @@
+INSERT INTO tmp_events_v2 (
+  site_id, timestamp, name, user_id,
+  session_id, hostname, pathname, referrer,
+  referrer_source, country_code, screen_size,
+  operating_system, browser, utm_medium,
+  utm_source, utm_campaign, meta.key,
+  meta.value, browser_version, operating_system_version,
+  subdivision1_code, subdivision2_code,
+  city_geoname_id, utm_content, utm_term,
+  transferred_from
+)
+SELECT
+  site_id,
+  timestamp,
+  name,
+  user_id,
+  session_id,
+  hostname,
+  pathname,
+  referrer,
+  referrer_source,
+  country_code,
+  screen_size,
+  operating_system,
+  browser,
+  utm_medium,
+  utm_source,
+  utm_campaign,
+  meta.key,
+  meta.value,
+  browser_version,
+  operating_system_version,
+  subdivision1_code,
+  subdivision2_code,
+  city_geoname_id,
+  utm_content,
+  utm_term,
+  transferred_from
+FROM
+  events
+INNER JOIN domains_lookup ON domains_lookup.domain = events.domain
+WHERE (_partition_id = '<%= @partition %>')

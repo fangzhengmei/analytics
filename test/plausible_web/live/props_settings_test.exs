@@ -1,0 +1,288 @@
+defmodule PlausibleWeb.Live.PropsSettingsTest do
+  use PlausibleWeb.ConnCase, async: true
+  import Phoenix.LiveViewTest
+
+  describe "GET /:domain/settings/properties" do
+    setup [:create_user, :log_in, :create_site]
+
+    @tag :ee_only
+    test "renders with locked content when subscription is insufficient", %{
+      conn: conn,
+      site: site,
+      user: user
+    } do
+      subscribe_to_growth_plan(user)
+
+      lock_notice =
+        conn
+        |> get("/#{site.domain}/settings/properties")
+        |> html_response(200)
+        |> text_of_element("#lock-notice")
+
+      assert lock_notice =~ "upgrade your subscription"
+    end
+
+    @tag :ee_only
+    test "does not lock content when subscription is sufficient", %{
+      conn: conn,
+      site: site,
+      user: user
+    } do
+      subscribe_to_business_plan(user)
+
+      lock_notice =
+        conn
+        |> get("/#{site.domain}/settings/properties")
+        |> html_response(200)
+        |> text_of_element("#lock-notice")
+
+      refute lock_notice =~ "upgrade your subscription"
+    end
+
+    @tag :ee_only
+    test "guest editors should be able to access prop settings", %{site: site, conn: conn} do
+      guest_user = new_user()
+      add_guest(site, user: guest_user, role: :editor)
+
+      {:ok, conn: conn} = log_in(%{user: guest_user, conn: conn})
+
+      lock_notice =
+        conn
+        |> get("/#{site.domain}/settings/properties")
+        |> html_response(200)
+        |> text_of_element("#lock-notice")
+
+      refute lock_notice =~ "upgrade your subscription"
+    end
+
+    test "lists props for the site and renders links", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      conn = get(conn, "/#{site.domain}/settings/properties")
+
+      resp = html_response(conn, 200)
+      assert resp =~ "Attach custom properties"
+
+      assert element_exists?(
+               resp,
+               ~s|a[href="https://plausible.io/docs/custom-props/introduction"]|
+             )
+
+      assert resp =~ "amount"
+      assert resp =~ "logged_in"
+      assert resp =~ "is_customer"
+      refute resp =~ "upgrade your subscription"
+    end
+
+    test "lists props with disallow actions", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      conn = get(conn, "/#{site.domain}/settings/properties")
+      resp = html_response(conn, 200)
+
+      for p <- site.allowed_event_props do
+        assert element_exists?(
+                 resp,
+                 ~s/button[phx-click="disallow-prop"][phx-value-prop=#{p}]#disallow-prop-#{p}/
+               )
+      end
+    end
+
+    test "if no props are allowed, a proper info is displayed", %{conn: conn, site: site} do
+      conn = get(conn, "/#{site.domain}/settings/properties")
+      resp = html_response(conn, 200)
+      assert resp =~ "Create a custom property"
+    end
+
+    test "if props are enabled, no info about missing props is displayed", %{
+      conn: conn,
+      site: site
+    } do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      conn = get(conn, "/#{site.domain}/settings/properties")
+      resp = html_response(conn, 200)
+      refute resp =~ "Create a custom property"
+    end
+
+    test "add property button is rendered", %{conn: conn, site: site} do
+      conn = get(conn, "/#{site.domain}/settings/properties")
+      resp = html_response(conn, 200)
+      assert element_exists?(resp, ~s/button[phx-click="add-prop"]/)
+    end
+
+    test "search props input is rendered", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      conn = get(conn, "/#{site.domain}/settings/properties")
+      resp = html_response(conn, 200)
+      assert element_exists?(resp, ~s/input[type="text"]#filter-text/)
+      assert element_exists?(resp, ~s/form[phx-change="filter"]#filter-form/)
+    end
+  end
+
+  on_ee do
+    describe "GET /:domain/settings/properties - consolidated views" do
+      setup [:create_user, :create_team, :log_in]
+
+      setup %{team: team} = context do
+        new_site(team: team)
+        new_site(team: team)
+
+        {:ok, Map.put(context, :consolidated_view, new_consolidated_view(team))}
+      end
+
+      test "lists existing props and renders links", %{
+        conn: conn,
+        consolidated_view: consolidated_view
+      } do
+        {:ok, consolidated_view} =
+          Plausible.Props.allow(consolidated_view, ["amount", "logged_in", "is_customer"])
+
+        conn = get(conn, "/#{consolidated_view.domain}/settings/properties")
+
+        resp = html_response(conn, 200)
+        assert resp =~ "Attach custom properties"
+
+        assert element_exists?(
+                 resp,
+                 ~s|a[href="https://plausible.io/docs/custom-props/introduction"]|
+               )
+
+        assert resp =~ "amount"
+        assert resp =~ "logged_in"
+        assert resp =~ "is_customer"
+        refute resp =~ "upgrade your subscription"
+      end
+
+      test "if no props are allowed, a proper info is displayed", %{
+        conn: conn,
+        consolidated_view: consolidated_view
+      } do
+        conn = get(conn, "/#{consolidated_view.domain}/settings/properties")
+        resp = html_response(conn, 200)
+        assert resp =~ "Create a custom property"
+      end
+
+      test "add property button and search input are rendered", %{
+        conn: conn,
+        consolidated_view: consolidated_view
+      } do
+        {:ok, consolidated_view} =
+          Plausible.Props.allow(consolidated_view, ["amount", "logged_in", "is_customer"])
+
+        conn = get(conn, "/#{consolidated_view.domain}/settings/properties")
+        resp = html_response(conn, 200)
+        assert element_exists?(resp, ~s/button[phx-click="add-prop"]/)
+        assert element_exists?(resp, ~s/input[type="text"]#filter-text/)
+        assert element_exists?(resp, ~s/form[phx-change="filter"]#filter-form/)
+      end
+    end
+  end
+
+  describe "PropsSettings live view" do
+    setup [:create_user, :log_in, :create_site]
+
+    test "allows dashboard toggle", %{conn: conn, site: site} do
+      lv = get_liveview(conn, site)
+      lv |> element("#feature-props-toggle button") |> render_click()
+      assert render(lv) =~ "Custom Properties are now hidden from your dashboard"
+      assert Plausible.Billing.Feature.Props.opted_out?(Plausible.Repo.reload!(site))
+      lv |> element("#feature-props-toggle button") |> render_click()
+      assert render(lv) =~ "Custom Properties are now visible again on your dashboard"
+      refute Plausible.Billing.Feature.Props.opted_out?(Plausible.Repo.reload!(site))
+    end
+
+    test "allows prop removal", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in"])
+      {lv, html} = get_liveview(conn, site, with_html?: true)
+
+      assert html =~ "amount"
+      assert html =~ "logged_in"
+
+      html = lv |> element(~s/button#disallow-prop-amount/) |> render_click()
+
+      refute html =~ "amount"
+      assert html =~ "logged_in"
+
+      html = get(conn, "/#{site.domain}/settings/properties") |> html_response(200)
+
+      refute html =~ "amount"
+      assert html =~ "logged_in"
+    end
+
+    test "allows props filtering / search", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      {lv, html} = get_liveview(conn, site, with_html?: true)
+
+      assert html =~ to_string("amount")
+      assert html =~ to_string("logged_in")
+      assert html =~ to_string("is_customer")
+
+      html = type_into_search(lv, "is_customer")
+
+      refute html =~ to_string("amount")
+      refute html =~ to_string("logged_in")
+      assert html =~ to_string("is_customer")
+    end
+
+    test "allows resetting filter text via backspace icon", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      {lv, html} = get_liveview(conn, site, with_html?: true)
+
+      refute element_exists?(html, ~s/svg[phx-click="reset-filter-text"]#reset-filter/)
+
+      html = type_into_search(lv, to_string("is_customer"))
+
+      assert element_exists?(html, ~s/svg[phx-click="reset-filter-text"]#reset-filter/)
+
+      html = lv |> element(~s/svg#reset-filter/) |> render_click()
+
+      assert html =~ to_string("is_customer")
+      assert html =~ to_string("amount")
+      assert html =~ to_string("logged_in")
+    end
+
+    test "allows resetting filter text via no match link", %{conn: conn, site: site} do
+      {:ok, site} = Plausible.Props.allow(site, ["amount", "logged_in", "is_customer"])
+      lv = get_liveview(conn, site)
+      html = type_into_search(lv, "Definitely this is not going to render any matches")
+
+      assert html =~ "No properties found for this site. Please refine or"
+      assert html =~ "reset your search"
+
+      assert element_exists?(html, ~s/a[phx-click="reset-filter-text"]#reset-filter-hint/)
+      html = lv |> element(~s/a#reset-filter-hint/) |> render_click()
+
+      refute html =~ "No properties found for this site. Please refine or"
+    end
+
+    test "clicking Add Property button renders the form view", %{conn: conn, site: site} do
+      lv = get_liveview(conn, site)
+      html = lv |> element(~s/button[phx-click="add-prop"]/) |> render_click()
+
+      assert html =~ "Add property for #{site.domain}"
+
+      assert element_exists?(
+               html,
+               ~s/div#props-form form[phx-submit="allow-prop"][phx-click-away="cancel-allow-prop"]/
+             )
+    end
+  end
+
+  defp get_liveview(conn, site, opts \\ []) do
+    conn = assign(conn, :live_module, PlausibleWeb.Live.PropsSettings)
+    {:ok, lv, html} = live(conn, "/#{site.domain}/settings/properties")
+
+    if Keyword.get(opts, :with_html?) do
+      {lv, html}
+    else
+      lv
+    end
+  end
+
+  defp type_into_search(lv, text) do
+    lv
+    |> element("form#filter-form")
+    |> render_change(%{
+      "_target" => ["filter-text"],
+      "filter-text" => "#{text}"
+    })
+  end
+end

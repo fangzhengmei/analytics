@@ -1,0 +1,56 @@
+<.notice title="Danger zone" theme={:red}>
+  Destructive actions below can result in irrecoverable data loss. Be careful.
+</.notice>
+
+<.settings_tiles>
+  <.tile>
+    <:title>Transfer site ownership</:title>
+    <:subtitle>Transfer ownership of the site to a different account.</:subtitle>
+    <.button_link
+      href={Routes.membership_path(@conn, :transfer_ownership_form, @site.domain)}
+      theme="danger"
+      mt?={false}
+    >
+      Transfer {@site.domain} ownership
+    </.button_link>
+  </.tile>
+
+  <.tile :if={Enum.count(Plausible.Teams.Users.teams(@current_user, roles: [:owner, :admin])) > 1}>
+    <:title>Change Teams</:title>
+    <:subtitle>Move the site to another team that you are a member of</:subtitle>
+    <.button_link
+      href={Routes.membership_path(@conn, :change_team_form, @site.domain)}
+      theme="danger"
+    >
+      Change {@site.domain} team
+    </.button_link>
+  </.tile>
+
+  <.tile>
+    <:title>Reset stats</:title>
+    <:subtitle>Reset all stats but keep the site configuration intact.</:subtitle>
+    <.button_link
+      href={Routes.site_path(@conn, :reset_stats, @site.domain)}
+      method="delete"
+      data-confirm="Resetting the stats cannot be reversed. Are you sure?"
+      theme="danger"
+      mt?={false}
+    >
+      Reset {@site.domain} stats
+    </.button_link>
+  </.tile>
+
+  <.tile>
+    <:title>Delete site</:title>
+    <:subtitle>Permanently delete all stats and site settings.</:subtitle>
+    <.button_link
+      href={Routes.site_path(@conn, :delete_site, @site.domain)}
+      theme="danger"
+      method="delete"
+      data-confirm="Deleting the site data cannot be reversed. Are you sure?"
+      mt?={false}
+    >
+      Delete {@site.domain}
+    </.button_link>
+  </.tile>
+</.settings_tiles>
