@@ -1,0 +1,28 @@
+name: Add preview environment URL to PR
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+   pull-requests: write
+
+env:
+  PR_NUMBER: ${{ github.event.number }}
+
+jobs:
+  comment:
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'preview') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment with preview URL
+        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b # v3.0.1
+        with:
+          message: |
+            <div align="center">
+
+            |Preview environment👷🏼‍♀️🏗️ |
+            |:-:|
+            | [PR-${{env.PR_NUMBER}}](https://pr-${{env.PR_NUMBER}}.review.plausible.io)
+
+            </div>

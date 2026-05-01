@@ -1,0 +1,7 @@
+node_modules/
+static/images/
+.*.json
+.*rc
+*.json
+*.config.js
+js/types/query-api.d.ts

@@ -1,0 +1,65 @@
+<.focus_box>
+  <:title>
+    Setup Two-Factor Authentication
+  </:title>
+
+  <:subtitle>
+    <.notice :if={@forced?} class="mb-2" theme={:gray} title="Team requires 2FA setup">
+      You've been redirected here because your team enforces 2FA. Please complete the setup or switch to another team.
+    </.notice>
+    Link your Plausible account to the authenticator app you have installed either on your phone or computer.
+  </:subtitle>
+
+  <:footer :if={not @forced?}>
+    <.focus_list>
+      <:item>
+        Changed your mind?
+        <.styled_link href={Routes.settings_path(@conn, :security) <> "#update-2fa"}>
+          Go back to Settings
+        </.styled_link>
+      </:item>
+    </.focus_list>
+  </:footer>
+
+  <div class="flex flex-col sm:flex-row items-center sm:items-start">
+    <div class="mt-8">
+      <div class="border-2 border-gray-300 inline-block p-2 dark:bg-white">
+        <PlausibleWeb.Components.TwoFactor.qr_code text={@totp_uri} />
+      </div>
+    </div>
+
+    <div class="mt-8 sm:ml-4">
+      <.focus_list>
+        <:item>
+          Open the authenticator application
+        </:item>
+        <:item>
+          Tap Scan a QR Code
+        </:item>
+        <:item>
+          Scan this code with your phone camera or paste the code manually
+        </:item>
+      </.focus_list>
+      <div class="sm:ml-2">
+        <PlausibleWeb.Live.Components.Form.input_with_clipboard
+          id="secret"
+          name="secret_clipboard"
+          label="Code"
+          value={@secret}
+          onfocus="this.value = this.value;"
+          class="focus:ring-indigo-500 focus:border-indigo-500 bg-gray-50 dark:bg-gray-850 dark:text-gray-300 block w-7/12 rounded-md sm:text-sm border-gray-300 dark:border-gray-500 w-full p-2 mt-2"
+        />
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-6 flex flex-col-reverse sm:flex-row justify-between items-center">
+    <.unstyled_link
+      id="proceed"
+      class="button w-full"
+      href={Routes.auth_path(@conn, :verify_2fa_setup_form)}
+    >
+      Proceed
+    </.unstyled_link>
+  </div>
+</.focus_box>

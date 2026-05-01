@@ -1,0 +1,907 @@
+defmodule PlausibleWeb.Plugins.API.Controllers.GoalsTest do
+  use PlausibleWeb.PluginsAPICase, async: true
+  alias PlausibleWeb.Plugins.API.Schemas
+
+  describe "examples" do
+    test "Goal.CreateRequest.Revenue" do
+      assert_schema(
+        Schemas.Goal.CreateRequest.Revenue.schema().example,
+        "Goal.CreateRequest.Revenue",
+        spec()
+      )
+    end
+
+    test "Goal.CreateRequest.Pageview" do
+      assert_schema(
+        Schemas.Goal.CreateRequest.Pageview.schema().example,
+        "Goal.CreateRequest.Pageview",
+        spec()
+      )
+    end
+
+    test "Goal.CreateRequest.CustomEvent" do
+      assert_schema(
+        Schemas.Goal.CreateRequest.CustomEvent.schema().example,
+        "Goal.CreateRequest.CustomEvent",
+        spec()
+      )
+    end
+  end
+
+  describe "unauthorized calls" do
+    for {method, url} <- [
+          {:get, Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :index)},
+          {:get, Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :get, 1)},
+          {:put, Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create, %{})},
+          {:delete, Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :delete, 1)},
+          {:delete, Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :delete_bulk, %{})}
+        ] do
+      test "unauthorized call: #{method} #{url}", %{conn: conn} do
+        conn
+        |> unquote(method)(unquote(url))
+        |> json_response(401)
+        |> assert_schema("UnauthorizedError", spec())
+      end
+    end
+  end
+
+  describe "business tier" do
+    @tag :ee_only
+    test "fails on revenue goal creation attempt with insufficient plan", %{
+      site: site,
+      token: token,
+      conn: conn
+    } do
+      subscribe_to_growth_plan(site.team)
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.Revenue",
+        goal: %{event_name: "Purchase", currency: "EUR"}
+      }
+
+      assert_request_schema(payload, "Goal.CreateRequest.Revenue", spec())
+
+      conn
+      |> authenticate(site.domain, token)
+      |> put_req_header("content-type", "application/json")
+      |> put(url, payload)
+      |> json_response(402)
+      |> assert_schema("PaymentRequiredError", spec())
+    end
+
+    @tag :ee_only
+    test "fails on bulk revenue goal creation attempt with insufficient plan", %{
+      site: site,
+      token: token,
+      conn: conn
+    } do
+      subscribe_to_growth_plan(site.team)
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goals: [
+          %{
+            goal_type: "Goal.CustomEvent",
+            goal: %{event_name: "Signup"}
+          },
+          %{
+            goal_type: "Goal.Revenue",
+            goal: %{event_name: "Purchase", currency: "EUR"}
+          },
+          %{
+            goal_type: "Goal.Pageview",
+            goal: %{path: "/checkout"}
+          }
+        ]
+      }
+
+      conn
+      |> authenticate(site.domain, token)
+      |> put_req_header("content-type", "application/json")
+      |> put(url, payload)
+      |> json_response(402)
+      |> assert_schema("PaymentRequiredError", spec())
+    end
+  end
+
+  describe "put /goals - create a single goal" do
+    test "creates a custom event goal with custom props", %{conn: conn, token: token, site: site} do
+      subscribe_to_business_plan(site.team)
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.CustomEvent",
+        goal: %{event_name: "Signup", custom_props: %{"tier" => "premium", "source" => "landing"}}
+      }
+
+      assert_request_schema(payload, "Goal.CreateRequest.CustomEvent", spec())
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+
+      resp = json_response(conn, 201)
+
+      schema = assert_schema(resp, "Goal.ListResponse", spec())
+
+      resp
+      |> Map.fetch!("goals")
+      |> List.first()
+      |> assert_schema("Goal.CustomEvent", spec())
+
+      [location] = get_resp_header(conn, "location")
+
+      assert location ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 List.first(schema.goals).goal.id
+               )
+
+      [goal] = Plausible.Goals.for_site(site)
+      assert goal.event_name == "Signup"
+      assert goal.custom_props == %{"tier" => "premium", "source" => "landing"}
+
+      first_goal = List.first(resp["goals"])
+      assert first_goal["goal"]["custom_props"] == %{"tier" => "premium", "source" => "landing"}
+    end
+
+    test "fails to create goal with custom prop having invalid value", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      subscribe_to_business_plan(site.team)
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.CustomEvent",
+        goal: %{event_name: "Signup", custom_props: %{"count" => 5}}
+      }
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert Enum.any?(resp.errors, &(&1.detail == "Invalid string. Got: integer"))
+    end
+
+    test "fails to create goal with more than 3 custom props", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      subscribe_to_business_plan(site.team)
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.CustomEvent",
+        goal: %{
+          event_name: "Signup",
+          custom_props: %{"a" => "1", "b" => "2", "c" => "3", "d" => "4"}
+        }
+      }
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert Enum.any?(
+               resp.errors,
+               &(&1.detail == "Object property count 4 is greater than maxProperties: 3")
+             )
+    end
+
+    test "fails to create goal with null custom props values", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      subscribe_to_business_plan(site.team)
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.CustomEvent",
+        goal: %{event_name: "Signup", custom_props: %{"tier" => nil}}
+      }
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert Enum.any?(resp.errors, &(&1.detail == "null value where string expected"))
+    end
+
+    @tag :ee_only
+    test "fails without Props feature when custom props is non-empty", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      site = Plausible.Repo.preload(site, :team)
+      # End trial to ensure team doesn't have access to Props feature
+      site.team
+      |> Ecto.Changeset.change(%{trial_expiry_date: Date.add(Date.utc_today(), -1)})
+      |> Plausible.Repo.update!()
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.CustomEvent",
+        goal: %{event_name: "Signup", custom_props: %{"tier" => "premium"}}
+      }
+
+      conn
+      |> authenticate(site.domain, token)
+      |> put_req_header("content-type", "application/json")
+      |> put(url, payload)
+      |> json_response(402)
+      |> assert_schema("PaymentRequiredError", spec())
+    end
+
+    test "validates input according to the schema", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      conn
+      |> authenticate(site.domain, token)
+      |> put_req_header("content-type", "application/json")
+      |> put(url, %{goal_type: "Goal.SomeTypo", goal: %{event_name: "Signup"}})
+      |> json_response(422)
+      |> assert_schema("UnprocessableEntityError", spec())
+    end
+
+    test "creates a custom event goal", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{goal_type: "Goal.CustomEvent", goal: %{event_name: "Signup"}}
+
+      assert_request_schema(payload, "Goal.CreateRequest.CustomEvent", spec())
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+
+      resp = json_response(conn, 201)
+
+      schema = assert_schema(resp, "Goal.ListResponse", spec())
+
+      resp
+      |> Map.fetch!("goals")
+      |> List.first()
+      |> assert_schema("Goal.CustomEvent", spec())
+
+      [location] = get_resp_header(conn, "location")
+
+      assert location ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 List.first(schema.goals).goal.id
+               )
+
+      assert [%{event_name: "Signup"}] = Plausible.Goals.for_site(site)
+    end
+
+    @tag :ee_only
+    test "creates a revenue goal", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.Revenue",
+        goal: %{event_name: "Purchase", currency: "EUR"}
+      }
+
+      assert_request_schema(payload, "Goal.CreateRequest.Revenue", spec())
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+
+      resp = json_response(conn, 201)
+
+      schema = assert_schema(resp, "Goal.ListResponse", spec())
+
+      resp
+      |> Map.fetch!("goals")
+      |> List.first()
+      |> assert_schema("Goal.Revenue", spec())
+
+      [location] = get_resp_header(conn, "location")
+
+      assert location ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 List.first(schema.goals).goal.id
+               )
+
+      assert [%{event_name: "Purchase", currency: :EUR}] = Plausible.Goals.for_site(site)
+    end
+
+    @tag :ee_only
+    test "fails to create a revenue goal with unknown currency", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goal_type: "Goal.Revenue",
+        goal: %{event_name: "Purchase", currency: "DFJKHJESFHYU"}
+      }
+
+      assert_request_schema(payload, "Goal.CreateRequest.Revenue", spec())
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+
+      resp =
+        conn
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert [%{detail: "currency: is invalid"}] = resp.errors
+    end
+
+    @tag :ee_only
+    test "edge case - revenue goal exists under the same name and different currency", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      {:ok, _} = Plausible.Goals.create(site, %{"event_name" => "Purchase", "currency" => "USD"})
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, %{goal_type: "Goal.Revenue", goal: %{event_name: "Purchase", currency: "EUR"}})
+
+      resp =
+        conn
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert [%{detail: "event_name: 'Purchase' (with currency: USD) has already been taken"}] =
+               resp.errors
+    end
+
+    test "creates a pageview goal", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{goal_type: "Goal.Pageview", goal: %{path: "/checkout"}}
+      assert_request_schema(payload, "Goal.CreateRequest.Pageview", spec())
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+
+      resp = json_response(conn, 201)
+      schema = assert_schema(resp, "Goal.ListResponse", spec())
+
+      resp
+      |> Map.fetch!("goals")
+      |> List.first()
+      |> assert_schema("Goal.Pageview", spec())
+
+      [location] = get_resp_header(conn, "location")
+
+      assert location ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 List.first(schema.goals).goal.id
+               )
+
+      assert [%{page_path: "/checkout"}] = Plausible.Goals.for_site(site)
+    end
+
+    test "fails to create goal when max goals per site limit reached", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      for i <- 1..10, do: {:ok, _} = Plausible.Goals.create(site, %{"event_name" => "G#{i}"})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{goal_type: "Goal.Pageview", goal: %{path: "/checkout"}}
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert %Schemas.Error{
+               detail: "event_name: Maximum number of goals reached"
+             } in resp.errors
+
+      assert Plausible.Goals.count(site) == 10
+    end
+
+    test "is idempotent", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      initial_conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+
+      resp1 =
+        initial_conn
+        |> put(url, %{goal_type: "Goal.Pageview", goal: %{path: "/checkout"}})
+        |> json_response(201)
+
+      schema = assert_schema(resp1, "Goal.ListResponse", spec())
+
+      resp1
+      |> Map.fetch!("goals")
+      |> List.first()
+      |> assert_schema("Goal.Pageview", spec())
+
+      assert initial_conn
+             |> put(url, %{goal_type: "Goal.Pageview", goal: %{path: "/checkout"}})
+             |> json_response(201)
+             |> assert_schema("Goal.ListResponse", spec()) == schema
+    end
+  end
+
+  describe "put /goals - bulk creation" do
+    @tag :ee_only
+    test "creates a goal of each type", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload = %{
+        goals: [
+          %{
+            goal_type: "Goal.CustomEvent",
+            goal: %{event_name: "Signup"}
+          },
+          %{
+            goal_type: "Goal.Revenue",
+            goal: %{event_name: "Purchase", currency: "EUR"}
+          },
+          %{
+            goal_type: "Goal.Pageview",
+            goal: %{path: "/checkout"}
+          }
+        ]
+      }
+
+      assert_request_schema(payload, "Goal.CreateRequest.BulkGetOrCreate", spec())
+
+      conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, payload)
+
+      resp =
+        conn
+        |> json_response(201)
+        |> assert_schema("Goal.ListResponse", spec())
+
+      [l1, l2, l3] = get_resp_header(conn, "location")
+
+      assert l1 ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 Enum.at(resp.goals, 0).goal.id
+               )
+
+      assert l2 ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 Enum.at(resp.goals, 1).goal.id
+               )
+
+      assert l3 ==
+               Routes.plugins_api_goals_url(
+                 PlausibleWeb.Endpoint,
+                 :get,
+                 Enum.at(resp.goals, 2).goal.id
+               )
+
+      assert Enum.count(resp.goals) == 3
+
+      assert [
+               %{page_path: "/checkout"},
+               %{event_name: "Purchase", currency: :EUR},
+               %{event_name: "Signup"}
+             ] = Plausible.Goals.for_site(site)
+    end
+
+    test "no more than 8 goals can be created in bulk", %{conn: conn, token: token, site: site} do
+      # if this test fails due to implementation change, consider what to do with the pagination meta
+      # object returned in the response and also revise how funnels are created based on a list of goals
+      # - the funnels creation endpoint will likely reuse this schema's constraints
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      payload =
+        Enum.map(1..9, fn i ->
+          %{goal_type: "Goal.CustomEvent", goal: %{event_name: "Bulk Goal ##{i}"}}
+        end)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+        |> put(url, %{
+          goals: payload
+        })
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert %Schemas.Error{
+               detail: "Array length 9 is larger than maxItems: 8"
+             } in resp.errors
+    end
+
+    @tag :ee_only
+    test "is idempotent", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      initial_conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+
+      payload = [
+        %{
+          goal_type: "Goal.CustomEvent",
+          goal: %{event_name: "Signup"}
+        },
+        %{
+          goal_type: "Goal.Revenue",
+          goal: %{event_name: "Purchase", currency: "EUR"}
+        },
+        %{
+          goal_type: "Goal.Pageview",
+          goal: %{path: "/checkout"}
+        }
+      ]
+
+      initial_conn
+      |> put(url, %{goals: payload})
+      |> json_response(201)
+      |> assert_schema("Goal.ListResponse", spec())
+
+      initial_conn
+      |> put(url, %{goals: payload})
+      |> json_response(201)
+      |> assert_schema("Goal.ListResponse", spec())
+    end
+
+    @tag :ee_only
+    test "edge case - revenue goals exist under the same name and different currency", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+
+      initial_conn =
+        conn
+        |> authenticate(site.domain, token)
+        |> put_req_header("content-type", "application/json")
+
+      payload1 = [%{goal_type: "Goal.Revenue", goal: %{event_name: "Purchase", currency: "EUR"}}]
+      payload2 = [%{goal_type: "Goal.Revenue", goal: %{event_name: "Purchase", currency: "USD"}}]
+
+      initial_conn
+      |> put(url, %{goals: payload1})
+      |> json_response(201)
+      |> assert_schema("Goal.ListResponse", spec())
+
+      resp =
+        initial_conn
+        |> put(url, %{goals: payload2})
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert [%{detail: "event_name: 'Purchase' (with currency: EUR) has already been taken"}] =
+               resp.errors
+    end
+  end
+
+  describe "get /goals/:id" do
+    test "validates input out of the box", %{conn: conn, token: token, site: site} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :get, "hello")
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(422)
+        |> assert_schema("UnprocessableEntityError", spec())
+
+      assert %{errors: [%{detail: "Invalid integer. Got: string"}]} = resp
+    end
+
+    @tag :ee_only
+    test "retrieves revenue goal by ID", %{conn: conn, site: site, token: token} do
+      {:ok, goal} =
+        Plausible.Goals.create(site, %{"event_name" => "Purchase", "currency" => "EUR"})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :get, goal.id)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(200)
+
+      assert_schema(resp, "Goal", spec())
+      schema = assert_schema(resp, "Goal.Revenue", spec())
+
+      assert schema.goal.id == goal.id
+      assert schema.goal_type == "Goal.Revenue"
+      assert schema.goal.display_name == "Purchase"
+    end
+
+    test "retrieves pageview goal by ID", %{conn: conn, site: site, token: token} do
+      {:ok, goal} = Plausible.Goals.create(site, %{"page_path" => "/checkout"})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :get, goal.id)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(200)
+
+      assert_schema(resp, "Goal", spec())
+      schema = assert_schema(resp, "Goal.Pageview", spec())
+
+      assert schema.goal.id == goal.id
+      assert schema.goal_type == "Goal.Pageview"
+      assert schema.goal.display_name == "Visit /checkout"
+    end
+
+    test "retrieves custom event goal by ID", %{conn: conn, site: site, token: token} do
+      {:ok, goal} =
+        Plausible.Goals.create(site, %{
+          "event_name" => "Signup",
+          "custom_props" => %{"tier" => "premium"}
+        })
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :get, goal.id)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(200)
+
+      assert_schema(resp, "Goal", spec())
+      schema = assert_schema(resp, "Goal.CustomEvent", spec())
+
+      assert schema.goal.id == goal.id
+      assert schema.goal_type == "Goal.CustomEvent"
+      assert schema.goal.display_name == "Signup"
+      assert schema.goal.custom_props == %{"tier" => "premium"}
+    end
+  end
+
+  describe "get /goals" do
+    test "returns goals with custom props in response", %{conn: conn, site: site, token: token} do
+      {:ok, _g1} =
+        Plausible.Goals.create(site, %{
+          "event_name" => "Signup",
+          "custom_props" => %{"tier" => "premium"}
+        })
+
+      {:ok, _g2} =
+        Plausible.Goals.create(site, %{"page_path" => "/checkout", "custom_props" => %{}})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :index)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(200)
+        |> assert_schema("Goal.ListResponse", spec())
+
+      [checkout, signup] = resp.goals
+
+      assert signup.goal.event_name == "Signup"
+      assert signup.goal.custom_props == %{"tier" => "premium"}
+
+      assert checkout.goal.path == "/checkout"
+      assert checkout.goal.custom_props == %{}
+    end
+
+    test "returns an empty goals list if there's none", %{
+      conn: conn,
+      token: token,
+      site: site
+    } do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :index)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(200)
+        |> assert_schema("Goal.ListResponse", spec())
+
+      assert resp.goals == []
+      assert resp.meta.pagination.has_next_page == false
+      assert resp.meta.pagination.has_prev_page == false
+      assert resp.meta.pagination.links == %{}
+    end
+
+    @tag :ee_only
+    test "returns a list of goals of each possible goal type", %{
+      conn: conn,
+      site: site,
+      token: token
+    } do
+      {:ok, g1} = Plausible.Goals.create(site, %{"event_name" => "Signup"})
+      {:ok, g2} = Plausible.Goals.create(site, %{"event_name" => "Purchase", "currency" => "EUR"})
+      {:ok, g3} = Plausible.Goals.create(site, %{"page_path" => "/checkout"})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :index)
+
+      resp =
+        conn
+        |> authenticate(site.domain, token)
+        |> get(url)
+        |> json_response(200)
+        |> assert_schema("Goal.ListResponse", spec())
+
+      assert [checkout, purchase, signup] = resp.goals
+      assert checkout.goal.display_name == "Visit /checkout"
+      assert checkout.goal.path == "/checkout"
+      assert checkout.goal.id == g3.id
+      assert checkout.goal_type == "Goal.Pageview"
+
+      assert purchase.goal.display_name == "Purchase"
+      assert purchase.goal.currency == "EUR"
+      assert purchase.goal.event_name == "Purchase"
+      assert purchase.goal.id == g2.id
+      assert purchase.goal_type == "Goal.Revenue"
+
+      assert signup.goal.display_name == "Signup"
+      assert signup.goal.event_name == "Signup"
+      assert signup.goal.id == g1.id
+      assert signup.goal_type == "Goal.CustomEvent"
+    end
+
+    test "returns a list of goals with pagination", %{conn: conn, site: site, token: token} do
+      for i <- 1..5 do
+        insert(:goal, site: site, event_name: "Goal #{i}")
+      end
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :index, limit: 2)
+
+      initial_conn = authenticate(conn, site.domain, token)
+
+      page1 =
+        initial_conn
+        |> get(url)
+        |> json_response(200)
+        |> assert_schema("Goal.ListResponse", spec())
+
+      assert [%{goal: %{event_name: "Goal 5"}}, %{goal: %{event_name: "Goal 4"}}] = page1.goals
+      assert page1.meta.pagination.has_next_page == true
+      assert page1.meta.pagination.has_prev_page == false
+      assert page1.meta.pagination.links.next
+      refute page1.meta.pagination.links[:prev]
+
+      page2 =
+        initial_conn
+        |> get(page1.meta.pagination.links.next.url)
+        |> json_response(200)
+        |> assert_schema("Goal.ListResponse", spec())
+
+      assert [%{goal: %{event_name: "Goal 3"}}, %{goal: %{event_name: "Goal 2"}}] = page2.goals
+
+      assert page2.meta.pagination.has_next_page == true
+      assert page2.meta.pagination.has_prev_page == true
+      assert page2.meta.pagination.links.next
+      assert page2.meta.pagination.links.prev
+
+      assert ^page1 =
+               initial_conn
+               |> get(page2.meta.pagination.links.prev.url)
+               |> json_response(200)
+               |> assert_schema("Goal.ListResponse", spec())
+    end
+  end
+
+  describe "delete /goals/:id" do
+    test "deletes goal by id", %{conn: conn, site: site, token: token} do
+      {:ok, %{id: goal_id}} =
+        Plausible.Goals.create(site, %{"event_name" => "Purchase", "currency" => "USD"})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :delete, goal_id)
+
+      conn
+      |> authenticate(site.domain, token)
+      |> delete(url)
+      |> response(204)
+
+      refute Plausible.Repo.exists?(Plausible.Goal)
+    end
+
+    test "is idempotent", %{conn: conn, site: site, token: token} do
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :delete, 666)
+
+      conn
+      |> authenticate(site.domain, token)
+      |> delete(url)
+      |> response(204)
+    end
+  end
+
+  describe "delete - bulk" do
+    test "delete multiple goals", %{conn: conn, site: site, token: token} do
+      {:ok, g1} =
+        Plausible.Goals.create(site, %{"event_name" => "Purchase", "currency" => "USD"})
+
+      {:ok, g2} =
+        Plausible.Goals.create(site, %{"event_name" => "Signup"})
+
+      {:ok, g3} =
+        Plausible.Goals.create(site, %{"page_path" => "/home"})
+
+      url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :delete_bulk)
+
+      payload = %{
+        goal_ids: [
+          g1.id,
+          g2.id,
+          g3.id
+        ]
+      }
+
+      conn
+      |> authenticate(site.domain, token)
+      |> put_req_header("content-type", "application/json")
+      |> delete(url, payload)
+      |> response(204)
+
+      refute Plausible.Repo.exists?(Plausible.Goal)
+    end
+  end
+end
