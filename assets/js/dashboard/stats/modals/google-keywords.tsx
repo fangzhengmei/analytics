@@ -1,0 +1,106 @@
+import React, { useMemo, useState } from 'react'
+
+import Modal from './modal'
+import { useDashboardStateContext } from '../../dashboard-state-context'
+import { useSiteContext } from '../../site-context'
+import { usePaginatedGetAPI } from '../../hooks/api-client'
+import { createVisitors, Metric } from '../reports/metrics'
+import {
+  numberShortFormatter,
+  percentageFormatter
+} from '../../util/number-formatter'
+import { apiPath } from '../../util/url'
+import { DashboardState } from '../../dashboard-state'
+import { ColumnConfiguraton } from '../../components/table'
+import { BreakdownTable } from './breakdown-table'
+
+type GoogleKeywordItem = {
+  visitors: string
+  name: string
+  impressions: number
+  ctr: number
+  position: number
+}
+
+const metrics = [
+  createVisitors({ renderLabel: () => 'Visitors', sortable: false }),
+  new Metric({
+    width: 'w-28',
+    key: 'impressions',
+    renderLabel: () => 'Impressions',
+    formatter: numberShortFormatter,
+    sortable: false
+  }),
+  new Metric({
+    width: 'w-16',
+    key: 'ctr',
+    renderLabel: () => 'CTR',
+    formatter: percentageFormatter,
+    sortable: false
+  }),
+  new Metric({
+    width: 'w-28',
+    key: 'position',
+    renderLabel: () => 'Position',
+    formatter: numberShortFormatter,
+    sortable: false
+  })
+]
+
+function GoogleKeywordsModal() {
+  const { dashboardState } = useDashboardStateContext()
+  const site = useSiteContext()
+  const endpoint = apiPath(site, '/referrers/Google')
+
+  const [search, setSearch] = useState('')
+
+  const apiState = usePaginatedGetAPI<
+    { results: GoogleKeywordItem[] },
+    [string, { dashboardState: DashboardState; search: string }]
+  >({
+    siteTimezoneOffset: site.offset,
+    siteStatsBegin: site.statsBegin,
+    key: [endpoint, { dashboardState, search }],
+    getRequestParams: (key) => {
+      const [_endpoint, { dashboardState, search }] = key
+      const params = { detailed: true }
+
+      return [dashboardState, search === '' ? params : { ...params, search }]
+    },
+    initialPageParam: 0
+  })
+
+  const columns: ColumnConfiguraton<GoogleKeywordItem>[] = useMemo(
+    () => [
+      {
+        label: 'Search term',
+        key: 'name',
+        width: 'w-48 md:w-56 lg:w-1/3',
+        align: 'left'
+      },
+      ...metrics.map(
+        (m): ColumnConfiguraton<GoogleKeywordItem> => ({
+          label: m.renderLabel(dashboardState),
+          key: m.key,
+          width: m.width,
+          align: 'right'
+        })
+      )
+    ],
+    [dashboardState]
+  )
+
+  return (
+    <Modal>
+      <BreakdownTable
+        title="Google search terms"
+        displayError={true}
+        onSearch={setSearch}
+        {...apiState}
+        columns={columns}
+      />
+    </Modal>
+  )
+}
+
+export default GoogleKeywordsModal

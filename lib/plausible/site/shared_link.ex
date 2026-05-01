@@ -1,0 +1,58 @@
+defmodule Plausible.Site.SharedLink do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @type t() :: %__MODULE__{}
+
+  schema "shared_links" do
+    belongs_to :site, Plausible.Site
+    field :name, :string
+    field :slug, :string
+    field :password_hash, :string
+    field :password, :string, virtual: true
+    belongs_to :segment, Plausible.Segments.Segment
+
+    timestamps()
+  end
+
+  def changeset(link, attrs \\ %{}, opts \\ []) do
+    link
+    |> cast(attrs, [:slug, :password, :name, :segment_id])
+    |> validate_required([:slug, :name])
+    |> validate_special_name(opts)
+    |> unique_constraint(:slug)
+    |> unique_constraint(:name, name: :shared_links_site_id_name_index)
+    |> foreign_key_constraint(:segment_id)
+    |> hash_password()
+  end
+
+  defp validate_special_name(changeset, opts) do
+    name = get_change(changeset, :name)
+
+    if name not in Plausible.Sites.shared_link_special_names() ||
+         Keyword.get(opts, :skip_special_name_check?, false) do
+      changeset
+    else
+      changeset |> add_error(:name, "This name is reserved. Please choose another one")
+    end
+  end
+
+  defp hash_password(link) do
+    case link.changes[:password] do
+      nil ->
+        link
+
+      password ->
+        hash = Plausible.Auth.Password.hash(password)
+        change(link, password_hash: hash)
+    end
+  end
+
+  def password_protected?(%__MODULE__{password_hash: hash}) when not is_nil(hash), do: true
+  def password_protected?(%__MODULE__{}), do: false
+
+  def limited_to_segment?(%__MODULE__{segment_id: segment_id}) when is_integer(segment_id),
+    do: true
+
+  def limited_to_segment?(%__MODULE__{}), do: false
+end

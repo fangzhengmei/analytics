@@ -1,0 +1,37 @@
+There are currently <b>{@current_visitors}</b>
+visitors
+<%= if Plausible.Sites.consolidated?(@site) do %>
+  across all your sites.
+<% else %>
+  on <a href={"https://" <> @site.domain}>{@site.domain}</a>.
+<% end %>
+<br />
+<%= if Enum.count(@sources) > 0 do %>
+  <br /> The top sources for current visitors:<br />
+  <ul>
+    <%= for %{dimensions: [source], metrics: [visitors]} <- @sources do %>
+      <li>
+        <b>{visitors}</b> visitor{if visitors > 1, do: "s"} from <b>{source}</b>
+      </li>
+    <% end %>
+  </ul>
+<% end %>
+
+<br /> Your top pages being visited:<br />
+<ul>
+  <%= for %{dimensions: [page], metrics: [visitors]} <- @pages do %>
+    <li>
+      <b>{visitors}</b> visitor{if visitors > 1, do: "s"} on <b>{page}</b>
+    </li>
+  <% end %>
+</ul>
+
+<%= if @link do %>
+  <br /> View dashboard <a href={@link}>here</a>
+<% end %>
+<br /><br /> Congrats on the spike in traffic!
+<%= if ce?() do %>
+  <br /><br /> Plausible CE is funded by our cloud subscribers. If you
+  <a href="https://plausible.io/?utm_medium=email&utm_source=CE">enjoy using Plausible</a>
+  and know someone who might benefit from it, please spread the word.
+<% end %>

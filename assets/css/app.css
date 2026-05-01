@@ -1,0 +1,333 @@
+@import 'tailwindcss' source(none);
+@import 'flatpickr/dist/flatpickr.min.css' layer(components);
+@import './modal.css' layer(components);
+@import './loader.css' layer(components);
+@import './tooltip.css' layer(components);
+@import './flatpickr-colors.css' layer(components);
+
+@plugin "@tailwindcss/forms";
+
+@source "../css";
+@source "../js";
+@source "../../lib/plausible_web";
+@source "../../extra/lib/plausible_web";
+
+/* Tailwind v3 compatibility: restore v3 default border and ring styling */
+
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
+  *:focus-visible {
+    @apply ring-2 ring-indigo-500 ring-offset-2 dark:ring-offset-gray-900 outline-none;
+  }
+
+  :focus:not(:focus-visible) {
+    @apply outline-none;
+  }
+}
+
+@layer components {
+  /* Replace Tailwind form plugin's focus with focus-visible */
+  [type='checkbox']:focus,
+  [type='radio']:focus {
+    outline: none;
+    box-shadow: none;
+  }
+
+  [type='checkbox']:focus-visible,
+  [type='radio']:focus-visible {
+    @apply ring-2 ring-indigo-500 ring-offset-2 outline-none;
+  }
+}
+
+@layer components {
+  /*
+   * Button component classes shared between the React `Button` component
+   * (assets/js/dashboard/components/button.tsx) and the Phoenix `button`
+   * component (lib/plausible_web/components/generic.ex). Update here only.
+   */
+  .btn-base {
+    @apply whitespace-nowrap truncate inline-flex items-center justify-center
+      gap-x-2 text-sm font-medium rounded-md cursor-pointer
+      disabled:cursor-not-allowed;
+  }
+
+  .btn-sm {
+    @apply px-3 py-2;
+  }
+
+  .btn-md {
+    @apply px-3.5 py-2.5;
+  }
+
+  .btn-theme-primary {
+    @apply border border-indigo-600 bg-indigo-600 text-white
+      hover:bg-indigo-700 focus-visible:outline-indigo-600
+      disabled:border-transparent disabled:bg-indigo-400/60
+      disabled:dark:bg-indigo-600/30 disabled:dark:text-white/35;
+  }
+
+  .btn-theme-secondary {
+    @apply border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-700
+      text-gray-800 dark:text-gray-100 hover:bg-gray-50 hover:text-gray-900
+      dark:hover:bg-gray-600 dark:hover:border-gray-600 dark:hover:text-white
+      disabled:text-gray-700/40 dark:disabled:text-gray-500
+      dark:disabled:bg-gray-800 dark:disabled:border-gray-800;
+  }
+
+  .btn-theme-yellow {
+    @apply border border-yellow-600/90 bg-yellow-600/90 text-white
+      hover:bg-yellow-600 focus-visible:outline-yellow-600
+      disabled:border-yellow-400/60 disabled:bg-yellow-400/60
+      disabled:dark:border-yellow-600/30 disabled:dark:bg-yellow-600/30
+      disabled:dark:text-white/35;
+  }
+
+  .btn-theme-danger {
+    @apply border border-gray-300 dark:border-gray-800 text-red-600 bg-white
+      dark:bg-gray-800 hover:text-red-700 dark:hover:text-red-400
+      dark:text-red-500 active:text-red-800 disabled:text-red-700/40
+      disabled:hover:shadow-none dark:disabled:text-red-500/35
+      dark:disabled:bg-gray-800;
+  }
+
+  .btn-theme-ghost {
+    @apply border border-transparent text-gray-700 dark:text-gray-300
+      hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-100
+      dark:hover:bg-gray-800 hover:border-gray-100 dark:hover:border-gray-800
+      disabled:text-gray-500 disabled:dark:text-gray-600
+      disabled:hover:bg-transparent disabled:hover:border-transparent;
+  }
+
+  .btn-theme-icon {
+    @apply border border-transparent text-gray-400 dark:text-gray-400
+      hover:text-gray-900 dark:hover:text-gray-100;
+  }
+}
+
+@theme {
+  /* Color aliases from tailwind.config.js */
+
+  /* yellow: colors.amber - Map yellow to amber colors */
+  --color-yellow-50: var(--color-amber-50);
+  --color-yellow-100: var(--color-amber-100);
+  --color-yellow-200: var(--color-amber-200);
+  --color-yellow-300: var(--color-amber-300);
+  --color-yellow-400: var(--color-amber-400);
+  --color-yellow-500: var(--color-amber-500);
+  --color-yellow-600: var(--color-amber-600);
+  --color-yellow-700: var(--color-amber-700);
+  --color-yellow-800: var(--color-amber-800);
+  --color-yellow-900: var(--color-amber-900);
+  --color-yellow-950: var(--color-amber-950);
+
+  /* green: colors.emerald - Map green to emerald colors */
+  --color-green-50: var(--color-emerald-50);
+  --color-green-100: var(--color-emerald-100);
+  --color-green-200: var(--color-emerald-200);
+  --color-green-300: var(--color-emerald-300);
+  --color-green-400: var(--color-emerald-400);
+  --color-green-500: var(--color-emerald-500);
+  --color-green-600: var(--color-emerald-600);
+  --color-green-700: var(--color-emerald-700);
+  --color-green-800: var(--color-emerald-800);
+  --color-green-900: var(--color-emerald-900);
+  --color-green-950: var(--color-emerald-950);
+
+  /* gray: colors.zinc - Map gray to zinc colors */
+  --color-gray-50: var(--color-zinc-50);
+  --color-gray-100: var(--color-zinc-100);
+  --color-gray-200: var(--color-zinc-200);
+  --color-gray-300: var(--color-zinc-300);
+  --color-gray-400: var(--color-zinc-400);
+  --color-gray-500: var(--color-zinc-500);
+  --color-gray-600: var(--color-zinc-600);
+  --color-gray-700: var(--color-zinc-700);
+  --color-gray-800: var(--color-zinc-800);
+  --color-gray-900: var(--color-zinc-900);
+  --color-gray-950: var(--color-zinc-950);
+
+  /* Custom gray shades from config (override some zinc values) */
+  --color-gray-75: rgb(247 247 248);
+  --color-gray-150: rgb(236 236 238);
+  --color-gray-750: rgb(50 50 54);
+  --color-gray-825: rgb(35 35 38);
+  --color-gray-850: rgb(34 34 38);
+
+  /* Set v3 default ring behavior */
+  --default-ring-width: 2px;
+  --default-ring-color: var(--color-indigo-500);
+  --animate-pulse: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@media print {
+  canvas {
+    width: 100% !important;
+    height: auto !important;
+  }
+}
+
+@utility container {
+  margin-inline: auto;
+  padding-inline: 1rem;
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+@custom-variant phx-click-loading (.phx-click-loading&, .phx-click-loading &);
+@custom-variant phx-hook-loading (.phx-hook-loading&, .phx-hook-loading &);
+@custom-variant phx-submit-loading (.phx-submit-loading&, .phx-submit-loading &);
+@custom-variant phx-change-loading (.phx-change-loading&, .phx-change-loading &);
+
+[x-cloak] {
+  display: none;
+}
+
+.button {
+  @apply inline-flex justify-center px-3.5 py-2.5 text-sm font-medium text-white bg-indigo-600 border border-transparent rounded-md leading-5 transition hover:bg-indigo-700;
+}
+
+.button[disabled] {
+  @apply bg-gray-400 dark:bg-gray-600;
+}
+
+html {
+  @apply text-gray-800;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  width: 100vw; /* Prevents content from jumping when scrollbar is added/removed due to vertical overflow */
+  overflow-x: hidden;
+}
+
+@media (width >= 1280px) {
+  .container {
+    max-width: 70rem;
+  }
+}
+
+.transition {
+  transition: all 0.1s ease-in;
+}
+
+.pulsating-circle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+}
+
+.pulsating-circle::before {
+  content: '';
+  position: relative;
+  display: block;
+  width: 300%;
+  height: 300%;
+  box-sizing: border-box;
+  margin-left: -100%;
+  margin-top: -100%;
+  border-radius: 45px;
+  background-color: #9ae6b4;
+  animation: pulse-ring 3s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+  @apply bg-green-500;
+}
+
+.pulsating-circle::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  background-color: white;
+  border-radius: 15px;
+  animation: pulse-dot 3s cubic-bezier(0.455, 0.03, 0.515, 0.955) -0.4s infinite;
+  @apply bg-green-500;
+}
+
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.33);
+  }
+
+  50% {
+    transform: scale(1);
+  }
+
+  40%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes pulse-dot {
+  0% {
+    transform: scale(0.8);
+  }
+
+  25% {
+    transform: scale(1);
+  }
+
+  50%,
+  100% {
+    transform: scale(0.8);
+  }
+}
+
+.feather {
+  height: 1em;
+  width: 1em;
+  overflow: visible;
+  display: inline;
+}
+
+.feather-sm {
+  height: 1em;
+  width: 1em;
+  overflow: visible;
+  display: inline;
+}
+
+.table-striped tbody tr:nth-child(odd) td {
+  background-color: var(--color-gray-75);
+}
+
+.dark .table-striped tbody tr:nth-child(odd) td {
+  background-color: var(--color-gray-850);
+}
+
+.fade-enter {
+  opacity: 0;
+}
+
+.fade-enter-active {
+  opacity: 1;
+  transition: opacity 100ms ease-in;
+}
+
+iframe[hidden] {
+  display: none;
+}
+
+.pagination-link[disabled] {
+  @apply cursor-default bg-gray-100 dark:bg-gray-300 pointer-events-none;
+}
+
+/* This class is used for styling embedded dashboards. Do not remove. */
+/* stylelint-disable */
+/* prettier-ignore */
+.date-option-group { }
+/* stylelint-enable */
