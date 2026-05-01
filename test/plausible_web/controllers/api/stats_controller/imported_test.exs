@@ -1,0 +1,1378 @@
+defmodule PlausibleWeb.Api.StatsController.ImportedTest do
+  use PlausibleWeb.ConnCase
+
+  @user_id Enum.random(1000..9999)
+
+  defp import_data(ga_data, site_id, import_id, table_name) do
+    ga_data
+    |> Plausible.Imported.GoogleAnalytics4.from_report(site_id, import_id, table_name)
+    |> then(&Plausible.Imported.Buffer.insert_all(table_name, &1))
+  end
+
+  for import_type <- [:new_and_legacy, :new] do
+    describe "Parse and import third party data fetched from Google Analytics as #{import_type} import" do
+      setup [:create_user, :log_in, :create_site]
+
+      setup %{user: user, site: site} do
+        import_params =
+          %{
+            source: :google_analytics_4,
+            start_date: ~D[2005-01-01],
+            end_date: Date.utc_today(),
+            legacy: unquote(import_type) == :new_and_legacy
+          }
+
+        site_import =
+          site
+          |> Plausible.Imported.SiteImport.create_changeset(
+            user,
+            import_params
+          )
+          |> Plausible.Repo.insert!()
+          |> Plausible.Imported.SiteImport.complete_changeset()
+          |> Plausible.Repo.update!()
+
+        {:ok, %{import_id: site_import.id}}
+      end
+
+      test "Visitors data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview, timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, timestamp: ~N[2021-01-31 00:00:00])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{"date" => "20210101"},
+              metrics: %{
+                "totalUsers" => "1",
+                "screenPageViews" => "1",
+                "bounces" => "0",
+                "sessions" => "1",
+                "userEngagementDuration" => "60"
+              }
+            },
+            %{
+              dimensions: %{"date" => "20210131"},
+              metrics: %{
+                "totalUsers" => "1",
+                "screenPageViews" => "1",
+                "bounces" => "0",
+                "sessions" => "1",
+                "userEngagementDuration" => "60"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_visitors"
+        )
+
+        params = %{
+          "date_range" => "month",
+          "metrics" => ["visitors"],
+          "relative_date" => "2021-01-01",
+          "dimensions" => ["time:day"],
+          "include" => %{"imports" => true, "time_labels" => true}
+        }
+
+        conn = post(conn, "/api/stats/#{site.domain}/query", params)
+
+        response = json_response(conn, 200)
+
+        assert length(response["meta"]["time_labels"]) == 31
+
+        assert response["results"] == [
+                 %{"dimensions" => ["2021-01-01"], "metrics" => [2]},
+                 %{"dimensions" => ["2021-01-31"], "metrics" => [2]}
+               ]
+      end
+
+      test "returns data grouped by week", %{conn: conn, site: site, import_id: import_id} do
+        populate_stats(site, [
+          build(:pageview, timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, timestamp: ~N[2021-01-31 00:00:00])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{"date" => "20210101"},
+              metrics: %{
+                "totalUsers" => "1",
+                "screenPageViews" => "1",
+                "bounces" => "0",
+                "sessions" => "1",
+                "userEngagementDuration" => "60"
+              }
+            },
+            %{
+              dimensions: %{"date" => "20210131"},
+              metrics: %{
+                "totalUsers" => "1",
+                "screenPageViews" => "1",
+                "bounces" => "0",
+                "sessions" => "1",
+                "userEngagementDuration" => "60"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_visitors"
+        )
+
+        params = %{
+          "date_range" => "month",
+          "metrics" => ["visitors"],
+          "relative_date" => "2021-01-01",
+          "dimensions" => ["time:week"],
+          "include" => %{"imports" => true, "time_labels" => true}
+        }
+
+        conn = post(conn, "/api/stats/#{site.domain}/query", params)
+
+        response = json_response(conn, 200)
+
+        assert length(response["meta"]["time_labels"]) == 5
+
+        assert response["results"] == [
+                 %{"dimensions" => ["2021-01-01"], "metrics" => [2]},
+                 %{"dimensions" => ["2021-01-25"], "metrics" => [2]}
+               ]
+      end
+
+      test "Sources are imported", %{conn: conn, site: site, import_id: import_id} do
+        populate_stats(site, [
+          build(:pageview,
+            referrer_source: "Google",
+            referrer: "google.com",
+            timestamp: ~N[2021-01-01 00:00:00]
+          ),
+          build(:pageview,
+            referrer_source: "Google",
+            referrer: "google.com",
+            timestamp: ~N[2021-01-01 00:00:00]
+          ),
+          build(:pageview,
+            referrer_source: "DuckDuckGo",
+            referrer: "duckduckgo.com",
+            timestamp: ~N[2021-01-01 00:00:00]
+          )
+        ])
+
+        populate_stats(site, import_id, [
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-31]),
+          build(:imported_visitors, date: ~D[2021-01-31])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "organic",
+                "sessionSource" => "duckduckgo.com",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210131",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "organic",
+                "sessionSource" => "google.com",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "paid",
+                "sessionSource" => "google.com",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "social",
+                "sessionSource" => "Twitter",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "newsletter",
+                "date" => "20210131",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "email",
+                "sessionSource" => "A Nice Newsletter",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "(none)",
+                "sessionSource" => "(direct)",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_sources"
+        )
+
+        results =
+          conn
+          |> get(
+            "/api/stats/#{site.domain}/sources?period=month&date=2021-01-01&with_imported=true"
+          )
+          |> json_response(200)
+          |> Map.get("results")
+          |> Enum.sort()
+
+        assert results == [
+                 %{"name" => "A Nice Newsletter", "visitors" => 1, "percentage" => 11.11},
+                 %{"name" => "Direct / None", "visitors" => 1, "percentage" => 11.11},
+                 %{"name" => "DuckDuckGo", "visitors" => 2, "percentage" => 22.22},
+                 %{"name" => "Google", "visitors" => 4, "percentage" => 44.44},
+                 %{"name" => "Twitter", "visitors" => 1, "percentage" => 11.11}
+               ]
+      end
+
+      test "Channels are imported", %{conn: conn, site: site, import_id: import_id} do
+        populate_stats(site, [
+          # Organic Search
+          build(:pageview,
+            referrer_source: "Bing",
+            timestamp: ~N[2021-01-01 00:00:00]
+          ),
+          # Paid Search
+          build(:pageview,
+            referrer_source: "Google",
+            utm_medium: "paid",
+            timestamp: ~N[2021-01-01 00:00:00]
+          ),
+          # Direct
+          build(:pageview,
+            timestamp: ~N[2021-01-01 00:00:00]
+          )
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "organic",
+                "sessionSource" => "duckduckgo.com",
+                "sessionDefaultChannelGroup" => "Organic Search"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210131",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "organic",
+                "sessionSource" => "google.com",
+                "sessionDefaultChannelGroup" => "Organic Search"
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "paid",
+                "sessionSource" => "google.com",
+                "sessionDefaultChannelGroup" => "Paid Search"
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "(none)",
+                "sessionSource" => "(direct)",
+                "sessionDefaultChannelGroup" => "Direct"
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "(none)",
+                "sessionSource" => "(direct)",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_sources"
+        )
+
+        results =
+          conn
+          |> get(
+            "/api/stats/#{site.domain}/channels?period=month&date=2021-01-01&with_imported=true"
+          )
+          |> json_response(200)
+          |> Map.get("results")
+          |> Enum.sort()
+
+        assert results == [
+                 %{"name" => "(not set)", "visitors" => 1, "percentage" => 33.33},
+                 %{"name" => "Direct", "visitors" => 2, "percentage" => 66.67},
+                 %{"name" => "Organic Search", "visitors" => 3, "percentage" => 100.0},
+                 %{"name" => "Paid Search", "visitors" => 2, "percentage" => 66.67}
+               ]
+      end
+
+      test "UTM mediums data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview,
+            utm_medium: "social",
+            timestamp: ~N[2021-01-01 00:00:00]
+          ),
+          build(:pageview,
+            utm_medium: "social",
+            timestamp: ~N[2021-01-01 12:00:00]
+          )
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "social",
+                "sessionSource" => "Twitter",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "(none)",
+                "sessionSource" => "(direct)",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_sources"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/utm_mediums?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "bounce_rate" => 100.0,
+                   "name" => "social",
+                   "visit_duration" => 20.0,
+                   "visitors" => 3,
+                   "percentage" => 100.0
+                 }
+               ]
+      end
+
+      test "UTM campaigns data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview, utm_campaign: "profile", timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, utm_campaign: "august", timestamp: ~N[2021-01-01 00:00:00])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "profile",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "social",
+                "sessionSource" => "Twitter",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "august",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "email",
+                "sessionSource" => "Gmail",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "(not set)",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "email",
+                "sessionSource" => "Gmail",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_sources"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/utm_campaigns?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "name" => "august",
+                   "visitors" => 2,
+                   "bounce_rate" => 50.0,
+                   "visit_duration" => 50.0,
+                   "percentage" => 50.0
+                 },
+                 %{
+                   "name" => "profile",
+                   "visitors" => 2,
+                   "bounce_rate" => 100.0,
+                   "visit_duration" => 50.0,
+                   "percentage" => 50.0
+                 }
+               ]
+      end
+
+      test "UTM terms data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview, utm_term: "oat milk", timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, utm_term: "Sweden", timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, utm_term: "Sweden", timestamp: ~N[2021-01-01 00:00:00])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "oat milk",
+                "sessionMedium" => "paid",
+                "sessionSource" => "Google",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "Sweden",
+                "sessionMedium" => "paid",
+                "sessionSource" => "Google",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "(not set)",
+                "sessionMedium" => "paid",
+                "sessionSource" => "Google",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_sources"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/utm_terms?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "name" => "Sweden",
+                   "visitors" => 3,
+                   "bounce_rate" => 67.0,
+                   "visit_duration" => 33.0,
+                   "percentage" => 60.0
+                 },
+                 %{
+                   "name" => "oat milk",
+                   "visitors" => 2,
+                   "bounce_rate" => 100.0,
+                   "visit_duration" => 50.0,
+                   "percentage" => 40.0
+                 }
+               ]
+      end
+
+      test "UTM contents data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview, utm_content: "ad", timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, utm_content: "blog", timestamp: ~N[2021-01-01 00:00:00])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "ad",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "paid",
+                "sessionSource" => "Google",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "1",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "blog",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "paid",
+                "sessionSource" => "Google",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "sessionManualAdContent" => "(not set)",
+                "sessionCampaignName" => "",
+                "date" => "20210101",
+                "sessionGoogleAdsKeyword" => "",
+                "sessionMedium" => "paid",
+                "sessionSource" => "Google",
+                "sessionDefaultChannelGroup" => ""
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "100",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_sources"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/utm_contents?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "name" => "ad",
+                   "visitors" => 2,
+                   "bounce_rate" => 100.0,
+                   "visit_duration" => 50.0,
+                   "percentage" => 50.0
+                 },
+                 %{
+                   "name" => "blog",
+                   "visitors" => 2,
+                   "bounce_rate" => 50.0,
+                   "visit_duration" => 50.0,
+                   "percentage" => 50.0
+                 }
+               ]
+      end
+
+      test "Page event data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview,
+            pathname: "/",
+            hostname: "host-a.com",
+            user_id: @user_id,
+            timestamp: ~N[2021-01-01 00:00:00]
+          ),
+          build(:pageview,
+            pathname: "/some-other-page",
+            hostname: "host-a.com",
+            user_id: @user_id,
+            timestamp: ~N[2021-01-01 00:15:00]
+          )
+        ])
+
+        populate_stats(site, import_id, [
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-01]),
+          build(:imported_visitors, date: ~D[2021-01-01])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "date" => "20210101",
+                "hostName" => "host-a.com",
+                "pagePath" => "/"
+              },
+              metrics: %{
+                "screenPageViews" => "1",
+                "userEngagementDuration" => "700",
+                "totalUsers" => "1",
+                "activeUsers" => "1",
+                "sessions" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "date" => "20210101",
+                "hostName" => "host-b.com",
+                "pagePath" => "/some-other-page"
+              },
+              metrics: %{
+                "screenPageViews" => "2",
+                "userEngagementDuration" => "60",
+                "totalUsers" => "1",
+                "activeUsers" => "1",
+                "sessions" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "date" => "20210101",
+                "hostName" => "host-b.com",
+                "pagePath" => "/some-other-page?wat=wot"
+              },
+              metrics: %{
+                "screenPageViews" => "1",
+                "userEngagementDuration" => "60",
+                "totalUsers" => "1",
+                "activeUsers" => "1",
+                "sessions" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_pages"
+        )
+
+        import_data(
+          [
+            %{
+              dimensions: %{"date" => "20210101", "landingPage" => "/"},
+              metrics: %{
+                "bounces" => "1",
+                "sessions" => "3",
+                "userEngagementDuration" => "10",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_entry_pages"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/pages?period=day&date=2021-01-01&detailed=true&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "bounce_rate" => 0.0,
+                   "time_on_page" => 60,
+                   "visitors" => 3,
+                   "pageviews" => 4,
+                   "scroll_depth" => nil,
+                   "name" => "/some-other-page",
+                   "percentage" => 60.0
+                 },
+                 %{
+                   "bounce_rate" => 25.0,
+                   "time_on_page" => 700,
+                   "visitors" => 2,
+                   "pageviews" => 2,
+                   "scroll_depth" => nil,
+                   "name" => "/",
+                   "percentage" => 40.0
+                 }
+               ]
+      end
+
+      test "imports city data from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview,
+            country_code: "EE",
+            timestamp: ~N[2021-01-01 00:15:00]
+          ),
+          build(:pageview,
+            country_code: "EE",
+            timestamp: ~N[2021-01-01 00:15:00]
+          ),
+          build(:pageview,
+            country_code: "GB",
+            timestamp: ~N[2021-01-01 00:15:00]
+          )
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "countryId" => "EE",
+                "city" => "Tartu",
+                "date" => "20210101",
+                "region" => "Tartumaa"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "countryId" => "GB",
+                "city" => "Edinburgh",
+                "date" => "20210101",
+                "region" => "Midlothian"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_locations"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/cities?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "code" => 588_335,
+                   "name" => "Tartu",
+                   "visitors" => 1,
+                   "country_flag" => "🇪🇪",
+                   "percentage" => 50.0
+                 },
+                 %{
+                   "code" => 2_650_225,
+                   "name" => "Edinburgh",
+                   "visitors" => 1,
+                   "country_flag" => "🇬🇧",
+                   "percentage" => 50.0
+                 }
+               ]
+      end
+
+      test "imports country data from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, import_id, [
+          build(:pageview,
+            country_code: "EE",
+            timestamp: ~N[2021-01-01 00:15:00]
+          ),
+          build(:pageview,
+            country_code: "EE",
+            timestamp: ~N[2021-01-01 00:15:00]
+          ),
+          build(:pageview,
+            country_code: "GB",
+            timestamp: ~N[2021-01-01 00:15:00]
+          ),
+          build(:imported_visitors, date: ~D[2021-01-01], visitors: 2)
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "countryId" => "EE",
+                "city" => "Tartu",
+                "date" => "20210101",
+                "region" => "Tartumaa"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "countryId" => "GB",
+                "city" => "Edinburgh",
+                "date" => "20210101",
+                "region" => "Midlothian"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_locations"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/countries?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{
+                   "code" => "EE",
+                   "alpha_3" => "EST",
+                   "name" => "Estonia",
+                   "flag" => "🇪🇪",
+                   "visitors" => 3,
+                   "percentage" => 60
+                 },
+                 %{
+                   "code" => "GB",
+                   "alpha_3" => "GBR",
+                   "name" => "United Kingdom",
+                   "flag" => "🇬🇧",
+                   "visitors" => 2,
+                   "percentage" => 40
+                 }
+               ]
+      end
+
+      test "Devices data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, import_id, [
+          build(:pageview, screen_size: "Desktop", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:pageview, screen_size: "Desktop", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:pageview, screen_size: "Laptop", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:imported_visitors, date: ~D[2021-01-01], visitors: 2)
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{"date" => "20210101", "deviceCategory" => "mobile"},
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{"date" => "20210101", "deviceCategory" => "Laptop"},
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_devices"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/screen-sizes?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{"name" => "Desktop", "visitors" => 2, "percentage" => 40},
+                 %{"name" => "Laptop", "visitors" => 2, "percentage" => 40},
+                 %{"name" => "Mobile", "visitors" => 1, "percentage" => 20}
+               ]
+      end
+
+      test "Browsers data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, import_id, [
+          build(:pageview, browser: "Chrome", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:pageview, browser: "Firefox", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:imported_visitors, visitors: 2, date: ~D[2021-01-01])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "browser" => "User-Agent: Mozilla",
+                "date" => "20210101"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{"browser" => "Android Browser", "date" => "20210101"},
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_browsers"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/browsers?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert stats = json_response(conn, 200)["results"]
+        assert length(stats) == 3
+        assert %{"name" => "Firefox", "visitors" => 2, "percentage" => 50.0} in stats
+        assert %{"name" => "Mobile App", "visitors" => 1, "percentage" => 25.0} in stats
+        assert %{"name" => "Chrome", "visitors" => 1, "percentage" => 25.0} in stats
+      end
+
+      test "OS data imported from Google Analytics", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, import_id, [
+          build(:pageview, operating_system: "Mac", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:pageview, operating_system: "Mac", timestamp: ~N[2021-01-01 00:15:00]),
+          build(:pageview,
+            operating_system: "GNU/Linux",
+            timestamp: ~N[2021-01-01 00:15:00]
+          ),
+          build(:imported_visitors, date: ~D[2021-01-01], visitors: 2)
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{
+                "date" => "20210101",
+                "operatingSystem" => "Macintosh",
+                "operatingSystemVersion" => "10.15.1"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            },
+            %{
+              dimensions: %{
+                "date" => "20210101",
+                "operatingSystem" => "Linux",
+                "operatingSystemVersion" => "12.12"
+              },
+              metrics: %{
+                "bounces" => "0",
+                "userEngagementDuration" => "10",
+                "sessions" => "1",
+                "totalUsers" => "1",
+                "screenPageViews" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_operating_systems"
+        )
+
+        conn =
+          get(
+            conn,
+            "/api/stats/#{site.domain}/operating-systems?period=day&date=2021-01-01&with_imported=true"
+          )
+
+        assert json_response(conn, 200)["results"] == [
+                 %{"name" => "Mac", "visitors" => 3, "percentage" => 60},
+                 %{"name" => "GNU/Linux", "visitors" => 2, "percentage" => 40}
+               ]
+      end
+
+      test "Can import visit duration with scientific notation", %{
+        conn: conn,
+        site: site,
+        import_id: import_id
+      } do
+        populate_stats(site, [
+          build(:pageview, timestamp: ~N[2021-01-01 00:00:00]),
+          build(:pageview, timestamp: ~N[2021-01-31 00:00:00])
+        ])
+
+        import_data(
+          [
+            %{
+              dimensions: %{"date" => "20210101"},
+              metrics: %{
+                "bounces" => "0",
+                "screenPageViews" => "1",
+                "userEngagementDuration" => "1.391607E7",
+                "sessions" => "1",
+                "totalUsers" => "1"
+              }
+            },
+            %{
+              dimensions: %{"date" => "20210131"},
+              metrics: %{
+                "bounces" => "1",
+                "screenPageViews" => "1",
+                "userEngagementDuration" => "60",
+                "sessions" => "1",
+                "totalUsers" => "1"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_visitors"
+        )
+
+        params = %{
+          "metrics" => ["visit_duration"],
+          "date_range" => ["2021-01-01", "2021-01-31"],
+          "include" => %{"imports" => true},
+          "filters" => []
+        }
+
+        conn = post(conn, "/api/stats/#{site.domain}/query", params)
+        response = json_response(conn, 200)
+
+        assert response["results"] == [
+                 %{"dimensions" => [], "metrics" => [3_479_032]}
+               ]
+      end
+
+      test "skips empty dates from import", %{conn: conn, site: site, import_id: import_id} do
+        import_data(
+          [
+            %{
+              dimensions: %{"date" => "20210101"},
+              metrics: %{
+                "totalUsers" => "1",
+                "screenPageViews" => "1",
+                "bounces" => "0",
+                "sessions" => "1",
+                "userEngagementDuration" => "60"
+              }
+            },
+            %{
+              dimensions: %{"date" => "(other)"},
+              metrics: %{
+                "totalUsers" => "1",
+                "screenPageViews" => "1",
+                "bounces" => "0",
+                "sessions" => "1",
+                "userEngagementDuration" => "60"
+              }
+            }
+          ],
+          site.id,
+          import_id,
+          "imported_visitors"
+        )
+
+        params = %{
+          "metrics" => [
+            "visitors",
+            "visits",
+            "pageviews",
+            "views_per_visit",
+            "bounce_rate",
+            "visit_duration"
+          ],
+          "date_range" => ["2021-01-01", "2021-01-31"],
+          "include" => %{"imports" => true},
+          "filters" => []
+        }
+
+        conn = post(conn, "/api/stats/#{site.domain}/query", params)
+        response = json_response(conn, 200)
+
+        assert response["results"] == [
+                 %{"dimensions" => [], "metrics" => [1, 1, 1, 1, 0, 60]}
+               ]
+      end
+    end
+  end
+end

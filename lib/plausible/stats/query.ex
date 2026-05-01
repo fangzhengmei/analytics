@@ -1,0 +1,233 @@
+defmodule Plausible.Stats.Query do
+  use Plausible
+
+  defstruct utc_time_range: nil,
+            comparison_utc_time_range: nil,
+            interval: nil,
+            input_date_range: nil,
+            dimensions: [],
+            filters: [],
+            sample_threshold: 20_000_000,
+            imports_exist: false,
+            imports_in_range: [],
+            include_imported: false,
+            skip_imported_reason: nil,
+            now: nil,
+            metrics: [],
+            order_by: nil,
+            timezone: nil,
+            legacy_breakdown: false,
+            preloaded_goals: [],
+            include: Plausible.Stats.ApiQueryParser.default_include(),
+            debug_metadata: %{},
+            pagination: nil,
+            # Revenue metric specific metadata
+            revenue_currencies: %{},
+            revenue_warning: nil,
+            site_id: nil,
+            consolidated_site_ids: nil,
+            site_native_stats_start_at: nil,
+            # Contains information to determine how to combine legacy and new time on page metrics
+            time_on_page_data: %{},
+            sql_join_type: :left,
+            smear_session_metrics: false
+
+  require OpenTelemetry.Tracer, as: Tracer
+
+  alias Plausible.Stats.{
+    DateTimeRange,
+    Imported,
+    Legacy,
+    Comparisons,
+    ApiQueryParser,
+    ParsedQueryParams,
+    QueryBuilder,
+    QueryError
+  }
+
+  @type t :: %__MODULE__{}
+
+  def parse_and_build(
+        %Plausible.Site{domain: domain} = site,
+        %{"site_id" => domain} = params,
+        opts \\ []
+      ) do
+    with {:ok, %ParsedQueryParams{} = parsed_query_params} <-
+           ApiQueryParser.parse(params, opts) do
+      QueryBuilder.build(site, parsed_query_params, Keyword.get(opts, :debug_metadata, %{}))
+    end
+  end
+
+  def parse_and_build!(site, params, opts \\ []) do
+    case parse_and_build(site, params, opts) do
+      {:ok, query} ->
+        query
+
+      {:error, %QueryError{message: message}} ->
+        raise "Failed to build query: #{inspect(message)}"
+    end
+  end
+
+  @doc """
+  Builds query from old-style stats APIv1 params. New code should use `Query.parse_and_build`
+  or `QueryBuilder.build` with already parsed params.
+  """
+  def from(site, params, opts \\ []) do
+    Legacy.QueryBuilder.from(
+      site,
+      params,
+      Keyword.get(opts, :debug_metadata, %{}),
+      Keyword.get(opts, :now)
+    )
+  end
+
+  def date_range(query, options \\ []) do
+    date_range = DateTimeRange.to_date_range(query.utc_time_range, query.timezone)
+
+    if Keyword.get(options, :trim_trailing) do
+      today = query.now |> DateTime.shift_zone!(query.timezone) |> DateTime.to_date()
+
+      Date.range(
+        date_range.first,
+        clamp(today, date_range)
+      )
+    else
+      date_range
+    end
+  end
+
+  defp clamp(date, date_range) do
+    cond do
+      date in date_range -> date
+      Date.before?(date, date_range.first) -> date_range.first
+      Date.after?(date, date_range.last) -> date_range.last
+    end
+  end
+
+  def set(query, keywords) do
+    new_query = struct!(query, keywords)
+
+    if Keyword.has_key?(keywords, :include_imported) do
+      new_query
+    else
+      refresh_imported_opts(new_query)
+    end
+  end
+
+  def set_include(query, key, value) do
+    struct!(query, include: struct!(query.include, [{key, value}]))
+  end
+
+  def add_filter(query, filter) do
+    query
+    |> struct!(filters: query.filters ++ [filter])
+    |> refresh_imported_opts()
+  end
+
+  @doc """
+  Removes top level filters matching any of passed prefix from the query.
+
+  Note that this doesn't handle cases with AND/OR/NOT and as such is discouraged
+  from use.
+  """
+  def remove_top_level_filters(query, prefixes) do
+    new_filters =
+      Enum.reject(query.filters, fn [_, dimension_or_filter_tree | _rest] ->
+        is_binary(dimension_or_filter_tree) and
+          Enum.any?(prefixes, &String.starts_with?(dimension_or_filter_tree, &1))
+      end)
+
+    query
+    |> struct!(filters: new_filters)
+    |> refresh_imported_opts()
+  end
+
+  defp refresh_imported_opts(query) do
+    put_imported_opts(query, nil)
+  end
+
+  def put_imported_opts(query, site) do
+    requested? = query.include.imports
+
+    query =
+      if site && Imported.schema_supports_interval?(query) do
+        site = Plausible.Repo.preload(site, :completed_imports)
+
+        struct!(query,
+          imports_exist: Plausible.Imported.any_completed_imports?(site),
+          imports_in_range: get_imports_in_range(site, query)
+        )
+      else
+        query
+      end
+
+    skip_imported_reason = get_skip_imported_reason(query)
+
+    struct!(query,
+      include_imported: requested? and is_nil(skip_imported_reason),
+      skip_imported_reason: skip_imported_reason
+    )
+  end
+
+  defp get_imports_in_range(_site, %__MODULE__{input_date_range: period})
+       when period in [:realtime, :realtime_30m] do
+    []
+  end
+
+  defp get_imports_in_range(site, query) do
+    in_range = Plausible.Imported.completed_imports_in_query_range(site, query)
+
+    in_comparison_range =
+      if query.include.compare do
+        comparison_query = Comparisons.get_comparison_query(query)
+        Plausible.Imported.completed_imports_in_query_range(site, comparison_query)
+      else
+        []
+      end
+
+    in_comparison_range ++ in_range
+  end
+
+  @spec get_skip_imported_reason(t()) ::
+          nil | :no_imported_data | :out_of_range | :unsupported_interval | :unsupported_query
+  def get_skip_imported_reason(query) do
+    cond do
+      not Imported.schema_supports_interval?(query) ->
+        :unsupported_interval
+
+      not query.imports_exist ->
+        :no_imported_data
+
+      query.imports_in_range == [] ->
+        :out_of_range
+
+      not Imported.schema_supports_query?(query) ->
+        :unsupported_query
+
+      true ->
+        nil
+    end
+  end
+
+  @spec trace(%__MODULE__{}, [atom()]) :: %__MODULE__{}
+  def trace(%__MODULE__{} = query, metrics) do
+    filter_dimensions =
+      query.filters
+      |> Plausible.Stats.Filters.dimensions_used_in_filters()
+      |> Enum.sort()
+      |> Enum.uniq()
+      |> Enum.join(";")
+
+    metrics = metrics |> Enum.sort() |> Enum.join(";")
+
+    Tracer.set_attributes([
+      {"plausible.query.interval", query.interval},
+      {"plausible.query.dimensions", query.dimensions |> Enum.join(";")},
+      {"plausible.query.include_imported", query.include_imported},
+      {"plausible.query.filter_keys", filter_dimensions},
+      {"plausible.query.metrics", metrics}
+    ])
+
+    query
+  end
+end

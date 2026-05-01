@@ -1,0 +1,922 @@
+defmodule PlausibleWeb.Live.SitesTest do
+  use PlausibleWeb.ConnCase, async: true
+
+  import Phoenix.LiveViewTest
+
+  alias Plausible.Repo
+
+  setup [:create_user, :log_in]
+
+  describe "/sites" do
+    test "renders empty sites page", %{conn: conn} do
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      text = text(html)
+
+      assert text =~ "My personal sites"
+      assert text =~ "Add your first personal site"
+      refute text =~ "Go to team sites"
+    end
+
+    test "renders team switcher link, if on personal sites with other teams available", %{
+      conn: conn,
+      user: user
+    } do
+      team2 = new_site().team
+
+      add_member(team2, user: user, role: :admin)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+      text = text(html)
+
+      assert text =~ "My personal sites"
+      refute text =~ "You don't have any sites yet"
+      assert text =~ "Add your first personal site"
+      assert text =~ "Go to team sites"
+    end
+
+    test "renders settings link when current team is set", %{user: user, conn: conn} do
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      refute element_exists?(html, ~s|a[data-test-id="team-settings-link"]|)
+
+      new_site(owner: user)
+      team = team_of(user)
+      team = Plausible.Teams.complete_setup(team)
+
+      conn = set_current_team(conn, team)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert element_exists?(html, ~s|a[data-test-id="team-settings-link"]|)
+    end
+
+    @tag :ee_only
+    test "renders upgrade nag when current team has a site and trial expired", %{
+      conn: conn,
+      user: user
+    } do
+      team = new_site(owner: user).team
+
+      team
+      |> Ecto.Changeset.change(trial_expiry_date: Date.add(Date.utc_today(), -1))
+      |> Repo.update!()
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert html =~ "Payment required"
+    end
+
+    @tag :ee_only
+    test "does not render upgrade nag when there's no current team", %{conn: conn, user: user} do
+      team = new_site().team |> Plausible.Teams.complete_setup()
+      add_member(team, user: user, role: :owner)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      refute html =~ "Payment required"
+    end
+
+    @tag :ee_only
+    test "does not render upgrade nag if current team does not have any sites yet",
+         %{conn: conn, user: user} do
+      {:ok, personal_team} = Plausible.Teams.get_or_create(user)
+
+      personal_team
+      |> Ecto.Changeset.change(trial_expiry_date: Date.add(Date.utc_today(), -1))
+      |> Repo.update!()
+
+      team = new_site().team |> Plausible.Teams.complete_setup()
+      add_member(team, user: user, role: :owner)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      refute html =~ "Payment required"
+    end
+
+    test "renders 24h visitors correctly", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+
+      populate_stats(site, [build(:pageview), build(:pageview), build(:pageview)])
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      html = render(lv)
+      site_card = text_of_element(html, "li[data-domain=\"#{site.domain}\"]")
+      assert site_card =~ "3 visitors in last 24h"
+      assert site_card =~ site.domain
+    end
+
+    test "filters by domain", %{conn: conn, user: user} do
+      _site1 = new_site(domain: "first.example.com", owner: user)
+      _site2 = new_site(domain: "second.example.com", owner: user)
+      _site3 = new_site(domain: "first-another.example.com", owner: user)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      type_into_input(lv, "filter-text", "firs")
+      html = render(lv)
+
+      assert html =~ "first.example.com"
+      assert html =~ "first-another.example.com"
+      refute html =~ "second.example.com"
+    end
+
+    test "filtering plays well with pagination", %{conn: conn, user: user} do
+      _site1 = new_site(domain: "first.another.example.com", owner: user)
+      _site2 = new_site(domain: "second.example.com", owner: user)
+      _site3 = new_site(domain: "third.another.example.com", owner: user)
+
+      {:ok, lv, html} = live(conn, "/sites?sort_by=alnum&sort_direction=asc&page_size=2")
+
+      assert html =~ "first.another.example.com"
+      assert html =~ "second.example.com"
+      refute html =~ "third.another.example.com"
+      assert html =~ "page=2"
+      refute html =~ "page=1"
+
+      type_into_input(lv, "filter-text", "anot")
+      html = render(lv)
+
+      assert html =~ "first.another.example.com"
+      refute html =~ "second.example.com"
+      assert html =~ "third.another.example.com"
+      refute html =~ "page=1"
+      refute html =~ "page=2"
+    end
+  end
+
+  on_ee do
+    describe "consolidated views appearance" do
+      test "consolidated view shows up", %{conn: conn, user: user} do
+        new_site(owner: user)
+        new_site(owner: user)
+        team = user |> team_of()
+
+        conn = set_current_team(conn, team)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+
+        team = Plausible.Teams.complete_setup(team)
+        conn = set_current_team(conn, team)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-stats-loaded"]|)
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-chart-loaded"]|)
+      end
+
+      test "consolidated view presents consolidated stats", %{conn: conn, user: user} do
+        site1 = new_site(owner: user)
+        site2 = new_site(owner: user)
+
+        populate_stats(site1, [
+          build(:pageview, user_id: 1),
+          build(:pageview, user_id: 1),
+          build(:pageview)
+        ])
+
+        populate_stats(site2, [
+          build(:pageview, user_id: 3)
+        ])
+
+        team = user |> team_of() |> Plausible.Teams.complete_setup()
+
+        conn = set_current_team(conn, team)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        stats = text_of_element(html, ~s|[data-test-id="consolidated-view-stats-loaded"]|)
+        assert stats =~ "Unique visitors 3"
+        assert stats =~ "Total visits 3"
+        assert stats =~ "Total pageviews 4"
+        assert stats =~ "Views per visit 1.33"
+      end
+
+      test "consolidated view disappears when trial ends - CTA is shown instead", %{
+        conn: conn,
+        user: user
+      } do
+        new_site(owner: user)
+        new_site(owner: user)
+        team = user |> team_of() |> Plausible.Teams.complete_setup()
+
+        conn = set_current_team(conn, team)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+
+        team |> Plausible.Teams.Team.end_trial() |> Plausible.Repo.update!()
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+
+        assert text_of_element(html, ~s|[data-test-id="consolidated-view-card-cta"]|) =~
+                 "Upgrade to the Business plan to enable consolidated view."
+
+        assert element_exists?(
+                 html,
+                 ~s|[data-test-id="consolidated-view-card-cta"] a[href$="/billing/choose-plan"]|
+               )
+      end
+
+      test "CTA for insufficient custom plans", %{conn: conn, user: user} do
+        user
+        |> subscribe_to_enterprise_plan(features: [Plausible.Billing.Feature.Goals])
+        |> team_of()
+
+        new_site(owner: user)
+        new_site(owner: user)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+
+        assert text_of_element(html, ~s|[data-test-id="consolidated-view-card-cta"]|) =~
+                 "Your plan does not include consolidated view. Contact us to discuss an upgrade."
+      end
+
+      test "a team that hasn't been set up shows different CTA", %{
+        conn: conn,
+        user: user
+      } do
+        new_site(owner: user)
+        new_site(owner: user)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+
+        assert text_of_element(html, ~s|[data-test-id="consolidated-view-card-cta"]|) =~
+                 "To create a consolidated view, you'll need to set up a team."
+      end
+
+      test "single site won't show neither CTA or view - team not setup", %{
+        conn: conn,
+        user: user
+      } do
+        new_site(owner: user)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+      end
+
+      test "single site won't show neither CTA or view - team setup", %{
+        conn: conn,
+        user: user
+      } do
+        new_site(owner: user)
+
+        user |> team_of() |> Plausible.Teams.complete_setup()
+
+        {:ok, _lv, html} = live(conn, "/sites")
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+      end
+
+      test "CTA advertises contacting team owner to viewers", %{
+        conn: conn,
+        user: user
+      } do
+        new_site(owner: user)
+        new_site(owner: user)
+
+        subscribe_to_growth_plan(user)
+
+        team = user |> team_of() |> Plausible.Teams.complete_setup()
+
+        viewer = add_member(team, role: :viewer)
+
+        {:ok, conn: conn} = log_in(%{user: viewer, conn: conn})
+
+        {:ok, _lv, html} = live(conn, "/sites?__team=#{team.identifier}")
+
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+
+        assert text_of_element(html, ~s|[data-test-id="consolidated-view-card-cta"]|) =~
+                 "Available on Business plans. Contact your team owner to create it."
+
+        refute element_exists?(
+                 html,
+                 ~s|[data-test-id="consolidated-view-card-cta"] a[href="/billing/choose-plan"]|
+               )
+      end
+
+      test "CTA can be permanently dismissed, in which case dropdown option to restore it shows up",
+           %{conn: conn, user: user} do
+        new_site(owner: user)
+        new_site(owner: user)
+
+        dismiss_selector = ~s|[phx-click="consolidated-view-cta-dismiss"]|
+        cta_selector = ~s|[data-test-id="consolidated-view-card-cta"]|
+        restore_selector = ~s|[phx-click="consolidated-view-cta-restore"]|
+
+        subscribe_to_growth_plan(user)
+
+        {:ok, lv, html} = live(conn, "/sites")
+
+        assert element_exists?(html, cta_selector)
+        refute element_exists?(html, restore_selector)
+
+        lv
+        |> element(dismiss_selector)
+        |> render_click()
+
+        html = render(lv)
+
+        refute element_exists?(html, cta_selector)
+        assert element_exists?(html, restore_selector)
+
+        {:ok, _lv, html} = live(conn, "/sites")
+        refute element_exists?(html, cta_selector)
+
+        lv
+        |> element(restore_selector)
+        |> render_click()
+
+        html = render(lv)
+        assert element_exists?(html, cta_selector)
+      end
+
+      test "consolidated view card disappears when searching", %{conn: conn, user: user} do
+        new_site(owner: user)
+        new_site(owner: user)
+
+        team = user |> team_of() |> Plausible.Teams.complete_setup()
+        conn = set_current_team(conn, team)
+
+        {:ok, lv, html} = live(conn, "/sites")
+
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+
+        type_into_input(lv, "filter-text", "a")
+
+        html = render(lv)
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card"]|)
+      end
+
+      test "CTA card disappears when searching", %{conn: conn, user: user} do
+        new_site(owner: user)
+        new_site(owner: user)
+
+        {:ok, lv, html} = live(conn, "/sites")
+
+        assert element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+
+        type_into_input(lv, "filter-text", "a")
+
+        html = render(lv)
+
+        refute element_exists?(html, ~s|[data-test-id="consolidated-view-card-cta"]|)
+      end
+    end
+  end
+
+  describe "invitation notices" do
+    test "renders team invitation notice", %{conn: conn, user: user} do
+      inviter = new_user(name: "Jane Doe")
+      _site = new_site(owner: inviter)
+      team = team_of(inviter)
+
+      inv = invite_member(team, user, inviter: inviter, role: :admin)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      notice = text_of_element(html, "#invitation-#{inv.invitation_id}")
+      assert notice =~ "Jane Doe"
+      assert notice =~ team.name
+      assert notice =~ "admin"
+
+      assert element_exists?(
+               html,
+               ~s|#invitation-#{inv.invitation_id} a[href$="#{inv.invitation_id}/accept"]|
+             )
+
+      assert element_exists?(
+               html,
+               ~s|#invitation-#{inv.invitation_id} a[href$="#{inv.invitation_id}/reject"]|
+             )
+    end
+
+    test "renders multiple team invitation notices", %{conn: conn, user: user} do
+      inviter1 = new_user(name: "Alice")
+      inviter2 = new_user(name: "Bob")
+      _site1 = new_site(owner: inviter1)
+      _site2 = new_site(owner: inviter2)
+      team1 = team_of(inviter1)
+      team2 = team_of(inviter2)
+
+      inv1 = invite_member(team1, user, inviter: inviter1, role: :viewer)
+      inv2 = invite_member(team2, user, inviter: inviter2, role: :editor)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert element_exists?(html, "#invitation-#{inv1.invitation_id}")
+      assert element_exists?(html, "#invitation-#{inv2.invitation_id}")
+    end
+
+    test "renders guest invitation notice", %{conn: conn, user: user} do
+      inviter = new_user(name: "John Smith")
+      site = new_site(owner: inviter)
+
+      inv = invite_guest(site, user, inviter: inviter, role: :viewer)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      notice = text_of_element(html, "#site-invitation-#{inv.invitation_id}")
+      assert notice =~ "John Smith"
+      assert notice =~ site.domain
+      assert notice =~ "viewer"
+
+      assert element_exists?(
+               html,
+               ~s|#site-invitation-#{inv.invitation_id} a[href$="#{inv.invitation_id}/accept"]|
+             )
+
+      assert element_exists?(
+               html,
+               ~s|#site-invitation-#{inv.invitation_id} a[href$="#{inv.invitation_id}/reject"]|
+             )
+    end
+
+    @tag :ee_only
+    test "renders site transfer invitation notice", %{conn: conn, user: user} do
+      inviter = new_user(name: "Carol White")
+      site = new_site(owner: inviter)
+
+      subscribe_to_growth_plan(user)
+      transfer = invite_transfer(site, user, inviter: inviter)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      notice = text_of_element(html, "#site-ownership-invitation-#{transfer.transfer_id}")
+      assert notice =~ "Carol White"
+      assert notice =~ site.domain
+
+      assert element_exists?(
+               html,
+               ~s|#site-ownership-invitation-#{transfer.transfer_id} a[href$="#{transfer.transfer_id}/accept"]|
+             )
+
+      assert element_exists?(
+               html,
+               ~s|#site-ownership-invitation-#{transfer.transfer_id} a[href$="#{transfer.transfer_id}/reject"]|
+             )
+    end
+
+    @tag :ee_only
+    test "renders upgrade CTA instead of accept for site transfer when no plan", %{
+      conn: conn,
+      user: user
+    } do
+      inviter = new_user()
+      site = new_site(owner: inviter)
+
+      transfer = invite_transfer(site, user, inviter: inviter)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      notice = text_of_element(html, "#site-ownership-invitation-#{transfer.transfer_id}")
+      assert notice =~ "You don't have an active subscription"
+
+      assert element_exists?(
+               html,
+               ~s|#site-ownership-invitation-#{transfer.transfer_id} a[href$="/billing/choose-plan"]|
+             )
+
+      refute element_exists?(
+               html,
+               ~s|#site-ownership-invitation-#{transfer.transfer_id} a[href$="#{transfer.transfer_id}/accept"]|
+             )
+    end
+
+    @tag :ee_only
+    test "renders upgrade CTA instead of accept for site transfer when plan limits exceeded", %{
+      conn: conn,
+      user: user
+    } do
+      inviter = new_user()
+      site = new_site(owner: inviter)
+
+      transfer = invite_transfer(site, user, inviter: inviter)
+
+      subscribe_to_growth_plan(user)
+      for _ <- 1..10, do: new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      notice = text_of_element(html, "#site-ownership-invitation-#{transfer.transfer_id}")
+      assert notice =~ "site limit"
+
+      assert element_exists?(
+               html,
+               ~s|#site-ownership-invitation-#{transfer.transfer_id} a[href$="/billing/choose-plan"]|
+             )
+
+      refute element_exists?(
+               html,
+               ~s|#site-ownership-invitation-#{transfer.transfer_id} a[href$="#{transfer.transfer_id}/accept"]|
+             )
+    end
+
+    test "shows invitations on page 1 (explicit) and with no page parameter, hides on page 2+",
+         %{conn: conn, user: user} do
+      for _ <- 1..3, do: new_site(owner: user)
+
+      inviter = new_user()
+      _site = new_site(owner: inviter)
+      inv = invite_member(team_of(inviter), user, inviter: inviter, role: :admin)
+
+      {:ok, _lv, html} = live(conn, "/sites?page_size=2")
+      assert element_exists?(html, "#invitation-#{inv.invitation_id}")
+
+      {:ok, _lv, html} = live(conn, "/sites?page_size=2&page=1")
+      assert element_exists?(html, "#invitation-#{inv.invitation_id}")
+
+      {:ok, _lv, html} = live(conn, "/sites?page_size=2&page=2")
+      refute element_exists?(html, "#invitation-#{inv.invitation_id}")
+    end
+
+    test "does not render notices for other users' invitations", %{conn: conn} do
+      other_user = new_user()
+
+      team_inviter = new_user()
+      _site = new_site(owner: team_inviter)
+      inv = invite_member(team_of(team_inviter), other_user, inviter: team_inviter, role: :admin)
+
+      guest_inviter = new_user()
+      guest_site = new_site(owner: guest_inviter)
+      gi = invite_guest(guest_site, other_user, inviter: guest_inviter, role: :viewer)
+
+      transfer_inviter = new_user()
+      transfer_site = new_site(owner: transfer_inviter)
+      transfer = invite_transfer(transfer_site, other_user, inviter: transfer_inviter)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      refute element_exists?(html, "#invitation-#{inv.invitation_id}")
+      refute element_exists?(html, "#site-invitation-#{gi.invitation_id}")
+      refute element_exists?(html, "#site-ownership-invitation-#{transfer.transfer_id}")
+    end
+  end
+
+  describe "pinning" do
+    test "renders pin site option when site not pinned", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert text_of_element(
+               html,
+               ~s/li[data-domain="#{site.domain}"] button[phx-value-domain]/
+             ) == "Pin site"
+    end
+
+    test "site state changes when pin toggled", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      button_selector =
+        ~s/button[phx-value-domain="#{site.domain}"][data-test-id="ellipsis-menu-pin-item"]/
+
+      html =
+        lv
+        |> element(button_selector)
+        |> render_click()
+
+      assert html =~ "Site pinned"
+
+      assert text_of_element(html, button_selector) == "Unpin site"
+
+      html =
+        lv
+        |> element(button_selector)
+        |> render_click()
+
+      assert html =~ "Site unpinned"
+
+      assert text_of_element(html, button_selector) == "Pin site"
+    end
+
+    test "shows error when pins limit hit", %{conn: conn, user: user} do
+      for _ <- 1..9 do
+        site = new_site(owner: user)
+        assert {:ok, _} = Plausible.Sites.toggle_pin(user, site)
+      end
+
+      site = new_site(owner: user)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      button_selector = ~s/li[data-domain="#{site.domain}"] button[phx-value-domain]/
+
+      html =
+        lv
+        |> element(button_selector)
+        |> render_click()
+
+      assert html =~
+               LazyHTML.html_escape("Looks like you've hit the pinned sites limit!")
+    end
+
+    test "does not allow pinning site user doesn't have access to", %{conn: conn, user: user} do
+      site = new_site()
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      render_click(lv, "pin-toggle", %{"domain" => site.domain})
+
+      refute Repo.get_by(Plausible.Site.UserPreference, user_id: user.id, site_id: site.id)
+    end
+
+    test "pin icon is shown on site card when site is pinned", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+      assert {:ok, _} = Plausible.Sites.toggle_pin(user, site)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert element_exists?(
+               html,
+               ~s/li[data-domain="#{site.domain}"] [data-test-id="site-card-pin-icon"]/
+             )
+    end
+
+    test "pin icon is not shown on site card when site is not pinned", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      refute element_exists?(
+               html,
+               ~s/li[data-domain="#{site.domain}"] [data-test-id="site-card-pin-icon"]/
+             )
+    end
+
+    test "pin icon appears on site card after pinning", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      button_selector =
+        ~s/button[phx-value-domain="#{site.domain}"][data-test-id="ellipsis-menu-pin-item"]/
+
+      lv |> element(button_selector) |> render_click()
+
+      html = render(lv)
+
+      assert element_exists?(
+               html,
+               ~s/li[data-domain="#{site.domain}"] [data-test-id="site-card-pin-icon"]/
+             )
+    end
+
+    test "pin icon disappears from site card after unpinning", %{conn: conn, user: user} do
+      site = new_site(owner: user)
+      assert {:ok, _} = Plausible.Sites.toggle_pin(user, site)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      button_selector =
+        ~s/[phx-value-domain="#{site.domain}"][data-test-id="site-card-pin-icon"]/
+
+      lv |> element(button_selector) |> render_click()
+
+      html = render(lv)
+
+      refute element_exists?(
+               html,
+               button_selector
+             )
+    end
+  end
+
+  describe "sort widget" do
+    test "renders sort widget with default 'Most visitors' label", %{conn: conn, user: user} do
+      new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert text(find(html, "#sort-dropdown-trigger")) =~ "Most visitors"
+    end
+
+    test "sort widget shows all four options", %{conn: conn, user: user} do
+      new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert html =~ "Most visitors"
+      assert html =~ "Fewest visitors"
+      assert html =~ "Name A-Z"
+      assert html =~ "Name Z-A"
+
+      assert find(html, "#sort-dropdown-item-traffic-desc")
+      assert find(html, "#sort-dropdown-item-traffic-asc")
+      assert find(html, "#sort-dropdown-item-alnum-desc")
+      assert find(html, "#sort-dropdown-item-alnum-asc")
+    end
+
+    test "clicking a sort option updates the active label", %{conn: conn, user: user} do
+      new_site(owner: user)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      lv
+      |> element(~s|[id="sort-dropdown-item-alnum-asc"]|)
+      |> render_click()
+
+      html = render(lv)
+
+      assert text(find(html, "#sort-dropdown-trigger")) =~ "Name A-Z"
+    end
+
+    test "invalid sort_by param is sanitized to traffic", %{conn: conn, user: user} do
+      new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=invalid&sort_direction=desc")
+
+      assert text(find(html, "#sort-dropdown-trigger")) =~ "Most visitors"
+    end
+
+    test "invalid sort_direction param is sanitized to desc", %{conn: conn, user: user} do
+      new_site(owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=alnum&sort_direction=invalid")
+
+      assert text(find(html, "#sort-dropdown-trigger")) =~ "Name Z-A"
+    end
+
+    test "Name A-Z sort orders sites alphabetically ascending", %{conn: conn, user: user} do
+      new_site(domain: "zebra.example.com", owner: user)
+      new_site(domain: "apple.example.com", owner: user)
+      new_site(domain: "mango.example.com", owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=alnum&sort_direction=asc")
+
+      domains = find(html, "li[data-domain] h3") |> text()
+
+      assert domains == "apple.example.com mango.example.com zebra.example.com"
+    end
+
+    test "Name Z-A sort orders sites alphabetically descending", %{conn: conn, user: user} do
+      new_site(domain: "zebra.example.com", owner: user)
+      new_site(domain: "apple.example.com", owner: user)
+      new_site(domain: "mango.example.com", owner: user)
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=alnum&sort_direction=desc")
+
+      domains = find(html, "li[data-domain] h3") |> text()
+
+      assert domains == "zebra.example.com mango.example.com apple.example.com"
+    end
+
+    test "Most visitors sort orders sites by traffic", %{
+      conn: conn,
+      user: user
+    } do
+      high = new_site(domain: "high.example.com", owner: user)
+      mid = new_site(domain: "mid.example.com", owner: user)
+      low = new_site(domain: "low.example.com", owner: user)
+
+      populate_stats(high, [build(:pageview), build(:pageview), build(:pageview)])
+      populate_stats(mid, [build(:pageview)])
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=traffic&sort_direction=desc")
+
+      domains = find(html, "li[data-domain] h3") |> text()
+
+      assert domains == "#{high.domain} #{mid.domain} #{low.domain}"
+    end
+
+    test "Fewest visitors sort orders by traffic", %{
+      conn: conn,
+      user: user
+    } do
+      low = new_site(domain: "low.example.com", owner: user)
+      mid = new_site(domain: "mid.example.com", owner: user)
+      high = new_site(domain: "high.example.com", owner: user)
+
+      populate_stats(high, [build(:pageview), build(:pageview), build(:pageview)])
+      populate_stats(mid, [build(:pageview)])
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=traffic&sort_direction=asc")
+
+      domains = find(html, "li[data-domain] h3") |> text()
+
+      assert domains == "#{low.domain} #{mid.domain} #{high.domain}"
+    end
+
+    test "switching sort resets to page 1", %{conn: conn, user: user} do
+      for _ <- 1..3, do: new_site(owner: user)
+
+      {:ok, lv, html} = live(conn, "/sites?page_size=2&page=2&sort_by=alnum&sort_direction=asc")
+
+      assert html =~ "page=1"
+
+      lv
+      |> element(~s|[id="sort-dropdown-item-alnum-desc"]|)
+      |> render_click()
+
+      html = render(lv)
+
+      refute html =~ "page=1"
+    end
+
+    test "selecting a sort option persists the preference to the database", %{
+      conn: conn,
+      user: user
+    } do
+      new_site(owner: user)
+
+      {:ok, lv, _html} = live(conn, "/sites")
+
+      lv
+      |> element(~s|[id="sort-dropdown-item-alnum-asc"]|)
+      |> render_click()
+
+      {:ok, team} = Plausible.Teams.get_by_owner(user)
+      {:ok, membership} = Plausible.Teams.Memberships.get_team_membership(team, user)
+
+      assert Plausible.Teams.Memberships.get_preference(membership, :sort_index_options) ==
+               %Plausible.Sites.Index.UserPreference{
+                 sort_by: :alnum,
+                 sort_direction: :asc
+               }
+    end
+
+    test "selecting a sort option for a guest won't persist the preference", %{
+      conn: conn,
+      user: user
+    } do
+      site = new_site(owner: user)
+      viewer_guest = add_guest(site, role: :viewer, user: new_user())
+
+      {:ok, conn: conn} = log_in(%{user: viewer_guest, conn: conn})
+
+      {:ok, lv, html} = live(conn, "/sites")
+
+      assert html =~ site.domain
+
+      lv
+      |> element(~s|[id="sort-dropdown-item-alnum-asc"]|)
+      |> render_click()
+
+      {:ok, membership} =
+        Plausible.Teams.Memberships.get_team_membership(team_of(user), viewer_guest)
+
+      assert Plausible.Teams.Memberships.get_preference(membership, :sort_index_options) == nil
+    end
+
+    test "saved sort preference is applied on next visit when no URL params", %{
+      conn: conn,
+      user: user
+    } do
+      new_site(owner: user)
+
+      {:ok, team} = Plausible.Teams.get_by_owner(user)
+      {:ok, membership} = Plausible.Teams.Memberships.get_team_membership(team, user)
+
+      Plausible.Teams.Memberships.set_preference(membership, :sort_index_options, %{
+        sort_by: :alnum,
+        sort_direction: :desc
+      })
+
+      {:ok, _lv, html} = live(conn, "/sites")
+
+      assert text(find(html, "#sort-dropdown-trigger")) =~ "Name Z-A"
+    end
+
+    test "URL sort params take precedence over saved preference", %{conn: conn, user: user} do
+      new_site(owner: user)
+
+      {:ok, team} = Plausible.Teams.get_by_owner(user)
+      {:ok, membership} = Plausible.Teams.Memberships.get_team_membership(team, user)
+
+      Plausible.Teams.Memberships.set_preference(membership, :sort_index_options, %{
+        "sort_by" => "alnum",
+        "sort_direction" => "asc"
+      })
+
+      {:ok, _lv, html} = live(conn, "/sites?sort_by=traffic&sort_direction=desc")
+
+      assert text(find(html, "#sort-dropdown-trigger")) =~ "Most visitors"
+    end
+  end
+
+  defp type_into_input(lv, id, text) do
+    lv
+    |> element("form")
+    |> render_change(%{id => text})
+  end
+end

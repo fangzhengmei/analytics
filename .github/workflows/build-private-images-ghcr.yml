@@ -1,0 +1,102 @@
+name: Build Private Images GHCR
+
+on:
+  push:
+    branches: [master, stable]
+    tags: ['r*']
+  pull_request:
+    types: [synchronize, labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'preview') }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        env:
+          DOCKER_METADATA_PR_HEAD_SHA: true
+        with:
+          images: ghcr.io/plausible/analytics/ee
+          tags: |
+            type=ref,event=pr
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1.4.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: docker_build
+        uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MIX_ENV=prod
+            BUILD_METADATA=${{ steps.meta.outputs.json }}
+
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
+
+      - name: Notify team on failure
+        if: ${{ failure() && github.ref == 'refs/heads/master' }}
+        uses: fjogeleit/http-request-action@551353b829c3646756b2ec2b3694f819d7957495 # v2.0.0
+        with:
+          url: ${{ secrets.BUILD_NOTIFICATION_URL }}
+          method: 'POST'
+          customHeaders: '{"Content-Type": "application/json"}'
+          data: '{"content": "<a href=\"https://github.com/plausible/analytics/actions/workflows/build-private-images.yml\">Build failed</a>"}'
+
+      - name: Get first line and Co-Authored-By lines of the commit message
+        if: ${{ success() && github.ref == 'refs/heads/master' }}
+        id: commitmsg
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          first_line=$(printf '%s\n' "$COMMIT_MSG" | head -n1 | xargs)
+          co_authors=$(printf '%s\n' "$COMMIT_MSG" | grep -h 'Co-authored-by:' | sort -u | cut -d: -f2- | paste -sd, - | xargs)
+          {
+            echo "first_line=$first_line"
+            echo "co_authors=$co_authors"
+          } >> $GITHUB_OUTPUT
+
+      - name: Notify team on success
+        if: ${{ success() && github.ref == 'refs/heads/master' }}
+        uses: fjogeleit/http-request-action@551353b829c3646756b2ec2b3694f819d7957495 # v2.0.0
+        with:
+          url: ${{ secrets.BUILD_NOTIFICATION_URL }}
+          method: 'POST'
+          customHeaders: '{"Content-Type": "application/json"}'
+          escapeData: 'true'
+          data: |
+            {
+              "content": "<h1>🚀 Deploying ${{ steps.commitmsg.outputs.first_line }}</h1><p>Author(s): ${{ github.event.head_commit.author.name }}<br/>${{ steps.commitmsg.outputs.co_authors}}</p><p>Commit: <a href=\"${{ github.event.head_commit.url }}\">${{ github.sha }}</a></p>"
+            }
+
+      - name: Set Honeycomb marker on success
+        if: ${{ success() && github.ref == 'refs/heads/master' }}
+        uses: cnkk/honeymarker-action@1bd92aec746e38efe43a0faee94ced1ebb930712
+        with:
+          apikey: ${{ secrets.HONEYCOMB_MARKER_APIKEY }}
+          dataset: 'plausible-prod'
+          message: "${{ github.sha }}"

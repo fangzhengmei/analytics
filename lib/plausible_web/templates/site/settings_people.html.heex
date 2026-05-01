@@ -1,0 +1,163 @@
+<.settings_tiles>
+  <%= if not Plausible.Teams.setup?(@site.team) and not Plausible.Teams.Billing.solo?(@site.team) do %>
+    <PlausibleWeb.Team.Notice.owner_cta_banner :if={@site_role == :owner} />
+    <PlausibleWeb.Team.Notice.guest_cta_banner :if={@site_role != :owner} />
+  <% end %>
+
+  <.tile
+    docs="users-roles"
+    feature_mod={Plausible.Billing.Feature.Teams}
+    site={@site}
+    current_user={@current_user}
+    current_team={@site_team}
+    conn={@conn}
+  >
+    <:title>People</:title>
+    <:subtitle>Invite your friends or coworkers</:subtitle>
+
+    <.filter_bar :if={@site_role in [:owner, :admin]} filtering_enabled?={false}>
+      <.button_link
+        mt?={false}
+        href={Routes.membership_path(@conn, :invite_member_form, @site.domain)}
+      >
+        Invite new guest
+      </.button_link>
+    </.filter_bar>
+
+    <PlausibleWeb.Team.Notice.team_members_notice :if={
+      @site_role in [:owner, :admin] and Plausible.Teams.setup?(@current_team)
+    } />
+
+    <div class="flow-root">
+      <ul class="divide-y divide-gray-200 dark:divide-gray-700">
+        <%= for membership <- @memberships do %>
+          <li class="py-4" id={"membership-#{membership.user.id}"}>
+            <div class="flex items-center space-x-4">
+              <div class="shrink-0">
+                <img
+                  src={Plausible.Auth.User.profile_img_url(membership.user)}
+                  class="h-8 w-8 rounded-full"
+                />
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm truncate">
+                  <span class="font-medium text-gray-900 dark:text-gray-50">
+                    {membership.user.name}
+                  </span>
+                  <br />
+                  <span class="text-gray-500 dark:text-gray-400">
+                    {membership.user.email}
+                  </span>
+                </p>
+              </div>
+
+              <.dropdown>
+                <:button class="bg-transparent text-gray-800 dark:text-gray-100 hover:bg-gray-50 dark:hover:bg-gray-800 focus-visible:outline-gray-100 whitespace-nowrap truncate inline-flex items-center gap-x-2 font-medium rounded-md px-3.5 py-2.5 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:bg-gray-400 dark:disabled:text-white dark:disabled:text-gray-400 dark:disabled:bg-gray-700">
+                  {site_role(membership)}
+                  <Heroicons.chevron_down mini class="size-4 mt-0.5" />
+                </:button>
+                <:menu class="max-w-60">
+                  <%= if membership.role == :owner do %>
+                    <.dropdown_item disabled={true}>
+                      <div>Owner</div>
+                      <div class="text-gray-500 dark:text-gray-400 text-xs/5">
+                        Site owner cannot be assigned to any other role
+                      </div>
+                    </.dropdown_item>
+                  <% else %>
+                    <.dropdown_item
+                      href={
+                        Routes.membership_path(
+                          @conn,
+                          :update_role_by_user,
+                          @site.domain,
+                          membership.user.id,
+                          "editor"
+                        )
+                      }
+                      method="put"
+                      disabled={@site_role not in [:owner, :admin] or membership.role == "editor"}
+                    >
+                      <div>Guest editor</div>
+                      <div class="text-gray-500 dark:text-gray-400 text-xs/5">
+                        View stats and edit site settings
+                      </div>
+                    </.dropdown_item>
+                    <.dropdown_item
+                      href={
+                        Routes.membership_path(
+                          @conn,
+                          :update_role_by_user,
+                          @site.domain,
+                          membership.user.id,
+                          "viewer"
+                        )
+                      }
+                      method="put"
+                      disabled={@site_role not in [:owner, :admin] or membership.role == "viewer"}
+                    >
+                      <div>Guest viewer</div>
+                      <div class="text-gray-500 dark:text-gray-400 text-xs/5">
+                        View stats only
+                      </div>
+                    </.dropdown_item>
+                    <.dropdown_divider />
+                    <.dropdown_item
+                      href={
+                        Routes.membership_path(
+                          @conn,
+                          :remove_member_by_user,
+                          @site.domain,
+                          membership.user.id
+                        )
+                      }
+                      class="!text-red-600 hover:text-red-600 dark:!text-red-500 dark:hover:!text-red-400"
+                      method="delete"
+                      disabled={@site_role not in [:owner, :admin]}
+                    >
+                      Remove member
+                    </.dropdown_item>
+                  <% end %>
+                </:menu>
+              </.dropdown>
+            </div>
+          </li>
+        <% end %>
+      </ul>
+    </div>
+  </.tile>
+
+  <.tile :if={Enum.count(@invitations) > 0}>
+    <:title>Pending invitations</:title>
+    <:subtitle>Waiting for new members to accept their invitations.</:subtitle>
+
+    <.table
+      rows={@invitations}
+      row_attrs={fn invitation -> %{id: "invitation-#{invitation.invitation_id}"} end}
+    >
+      <:thead>
+        <.th>Email</.th>
+        <.th hide_on_mobile>Role</.th>
+        <.th invisible>Actions</.th>
+      </:thead>
+      <:tbody :let={invitation}>
+        <.td>{invitation.email}</.td>
+        <.td hide_on_mobile>{Phoenix.Naming.humanize(invitation.role)}</.td>
+        <.td actions>
+          <.delete_button
+            :if={@site_role in [:owner, :admin]}
+            href={
+              Routes.invitation_path(
+                @conn,
+                :remove_invitation,
+                @site.domain,
+                invitation.invitation_id
+              )
+            }
+            method="delete"
+          />
+        </.td>
+      </:tbody>
+    </.table>
+  </.tile>
+</.settings_tiles>

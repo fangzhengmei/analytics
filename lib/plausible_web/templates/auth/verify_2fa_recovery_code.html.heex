@@ -1,0 +1,57 @@
+<.focus_box>
+  <:title>
+    Enter Recovery Code
+  </:title>
+
+  <:subtitle>
+    Can't access your authenticator application? Enter a recovery code instead.
+  </:subtitle>
+
+  <:footer>
+    Authenticator application working again?
+    <.styled_link href={Routes.auth_path(@conn, :verify_2fa)}>
+      Enter code
+    </.styled_link>
+    <%= if ee?() do %>
+      <br /> Lost your recovery codes?
+      <.styled_link href="https://plausible.io/contact">
+        Contact us
+      </.styled_link>
+    <% end %>
+  </:footer>
+
+  <.form
+    :let={f}
+    for={@conn.params}
+    action={Routes.auth_path(@conn, :verify_2fa_recovery_code)}
+    onsubmit="document.getElementById('use-code-button').disabled = true"
+  >
+    <div class="mt-6">
+      <div>
+        <.input
+          type="text"
+          field={f[:recovery_code]}
+          autocomplete="off"
+          maxlength="10"
+          oninvalid="document.getElementById('use-code-button').disabled = false"
+          required="required"
+          placeholder="Enter recovery code"
+        />
+      </div>
+      <.button
+        id="use-code-button"
+        type="submit"
+        class="w-full mt-4 [&>span.label-enabled]:block [&>span.label-disabled]:hidden [&[disabled]>span.label-enabled]:hidden [&[disabled]>span.label-disabled]:block"
+      >
+        <span class="label-enabled pointer-events-none">
+          Use Code
+        </span>
+
+        <span class="label-disabled">
+          <.spinner class="inline-block h-5 w-5 mr-2 text-white dark:text-gray-400" />
+          Verifying...
+        </span>
+      </.button>
+    </div>
+  </.form>
+</.focus_box>
