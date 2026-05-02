@@ -1,9 +1,10 @@
-# Plausible Analytics 核心机制分析报告
+# Plausible Analytics 核心机制深度分析报告（修正版）
 
 ## 目录
 1. [机器人流量过滤机制](#1-机器人流量过滤机制)
 2. [用户隐私保护机制](#2-用户隐私保护机制)
 3. [事件归因边界处理](#3-事件归因边界处理)
+4. [附录：关键代码位置索引](#4-附录关键代码位置索引)
 
 ---
 
@@ -11,30 +12,44 @@
 
 ### 1.1 多层过滤架构
 
-Plausible Analytics 采用多层防御机制过滤机器人流量，从不同维度识别和排除非人类访问。
+Plausible Analytics 采用多层防御机制过滤机器人流量，在事件处理管道的不同阶段依次检查。
 
-#### 过滤层次结构图
+#### 过滤管道执行顺序
 
+**位置**: `lib/plausible/ingestion/event.ex:130-151`
+
+```elixir
+defp pipeline() do
+  [
+    drop_verification_agent: &drop_verification_agent/2,
+    drop_datacenter_ip: &drop_datacenter_ip/2,
+    drop_threat_ip: &drop_threat_ip/2,
+    drop_shield_rule_hostname: &drop_shield_rule_hostname/2,
+    drop_shield_rule_page: &drop_shield_rule_page/2,
+    drop_shield_rule_ip: &drop_shield_rule_ip/2,
+    put_geolocation: &put_geolocation/2,
+    drop_shield_rule_country: &drop_shield_rule_country/2,
+    put_user_agent: &put_user_agent/2,
+    put_basic_info: &put_basic_info/2,
+    put_source_info: &put_source_info/2,
+    maybe_infer_medium: &maybe_infer_medium/2,
+    put_props: &put_props/2,
+    put_revenue: &put_revenue/2,
+    put_salts: &put_salts/2,
+    put_user_id: &put_user_id/2,
+    validate_clickhouse_event: &validate_clickhouse_event/2,
+    register_session: &register_session/2
+  ]
+end
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    事件处理管道 (Pipeline)                     │
-├─────────────────────────────────────────────────────────────┤
-│  1. drop_verification_agent  ← 过滤安装验证代理               │
-│  2. drop_datacenter_ip       ← 过滤数据中心 IP                │
-│  3. drop_threat_ip           ← 过滤威胁 IP                    │
-│  4. drop_shield_rule_hostname ← 主机名白名单过滤               │
-│  5. drop_shield_rule_page    ← 页面路径屏蔽                   │
-│  6. drop_shield_rule_ip      ← IP 地址屏蔽                    │
-│  7. put_geolocation          ← 地理位置解析                    │
-│  8. drop_shield_rule_country ← 国家/地区屏蔽                  │
-│  9. put_user_agent           ← User-Agent 解析 + 机器人检测   │
-│  ...                                                          │
-└─────────────────────────────────────────────────────────────┘
-```
 
-### 1.2 机器人识别判定规则
+**管道特性**：
+- 任一环节 `drop` 后，后续步骤不再执行
+- 过滤顺序：IP 信誉检查 → 用户自定义规则 → 地理位置 → User-Agent 解析 → 来源归因
 
-#### 1.2.1 User-Agent 检测 (核心机制)
+### 1.2 机器人识别判定规则详解
+
+#### 1.2.1 User-Agent 检测（核心机制）
 
 **位置**: `lib/plausible/ingestion/event.ex:256-276`
 
@@ -62,212 +77,99 @@ defp put_user_agent(%__MODULE__{} = event, _context) do
 end
 ```
 
-**判定规则**:
-1. **Headless Chrome 检测**: 专门检测 `Headless Chrome`，这是自动化测试和爬虫常用的浏览器模式
-2. **UAInspector Bot 类型**: 任何被解析为 `%UAInspector.Result.Bot{}` 的请求都会被丢弃
-3. **超时保护**: User-Agent 解析设置 200ms 超时，防止解析卡住
+**判定规则**：
 
-#### 1.2.2 机器人规则库
+| 条件 | 处理方式 | 说明 |
+|------|----------|------|
+| `UAInspector.Result.Bot{}` | `drop(event, :bot)` | 任何被识别为 Bot 类型 |
+| Client name == "Headless Chrome" | `drop(event, :bot)` | 无头浏览器 |
+| 解析超时或失败 | 继续处理 | 不丢弃，避免误杀 |
 
-**位置**: `priv/ua_inspector/bot.bots.yml`
-
-基于 [Device Detector (Matomo)](https://matomo.org) 的机器人分类体系，包含以下类型：
-
-| 类别 | 说明 | 示例 |
-|------|------|------|
-| `Search bot` | 搜索引擎爬虫 | Googlebot, Bingbot, Baiduspider |
-| `Crawler` | 通用爬虫 | AhrefsBot, Amazonbot |
-| `AI Search Crawler` | AI 搜索爬虫 | Applebot, Amazonbot |
-| `AI Data Scraper` | AI 数据抓取 | Applebot-Extended |
-| `Site Monitor` | 站点监控 | 360 Monitoring, UptimeRobot |
-| `Feed Fetcher` | RSS 抓取 | WireReaderBot |
-| `Social Media Agent` | 社交媒体代理 | AddThis.com, FacebookExternalHit |
-| `Service Agent` | 服务代理 | Cloudflare-Healthchecks, Apache |
-| `Benchmark` | 基准测试工具 | ApacheBench |
-
-**规则示例**:
-```yaml
-- regex: 'AhrefsBot'
-  name: 'aHrefs Bot'
-  category: 'Crawler'
-  url: 'https://ahrefs.com/robot'
-
-- regex: 'HeadlessChrome'
-  name: 'Headless Chrome'
-  category: 'Browser'  # 但在代码中被特殊处理为 bot
-```
-
-#### 1.2.3 IP 分类过滤
+#### 1.2.2 IP 分类过滤
 
 **位置**: `lib/plausible/ingestion/event.ex:212-230`
 
 ```elixir
 defp drop_datacenter_ip(%__MODULE__{} = event, _context) do
   case event.request.ip_classification do
-    "dc_ip" ->
-      drop(event, :dc_ip)
-    _any ->
-      event
+    "dc_ip" -> drop(event, :dc_ip)
+    _any -> event
   end
 end
 
 defp drop_threat_ip(%__MODULE__{} = event, _context) do
   case event.request.ip_classification do
-    "threat_ip" ->
-      drop(event, :threat_ip)
-    _any ->
-      event
+    "threat_ip" -> drop(event, :threat_ip)
+    _any -> event
   end
 end
 ```
 
-**IP 分类类型**:
-- `dc_ip`: 数据中心 IP（云服务商、主机托管）
-- `threat_ip`: 威胁 IP（已知恶意 IP）
-- `anonymous_vpn_ip`: 匿名 VPN/代理（特殊处理）
+**IP 分类体系**：
 
-**来源**: 通过请求头 `x-plausible-ip-type` 传入，通常由反向代理或 CDN 进行 IP 信誉评估。
+| 分类值 | 来源 | 处理方式 | 说明 |
+|--------|------|----------|------|
+| `dc_ip` | `x-plausible-ip-type` | **丢弃** | 数据中心/云服务商 IP |
+| `threat_ip` | `x-plausible-ip-type` | **丢弃** | 已知恶意 IP |
+| `anonymous_vpn_ip` | `x-plausible-ip-type` | **保留** | 匿名 VPN/代理，国家设为 "A1" |
 
-#### 1.2.4 Shields 用户自定义屏蔽
+#### 1.2.3 Shields 用户自定义屏蔽规则
 
 **位置**: `lib/plausible/shields.ex`
 
 提供四种用户可配置的屏蔽规则：
 
-##### IP 地址屏蔽
-```elixir
-def ip_blocked?(domain, address) when is_binary(domain) and is_binary(address) do
-  case Shield.IPRuleCache.get({domain, address}) do
-    %Shield.IPRule{action: :deny} -> true
-    _ -> false
-  end
-end
-```
-- 最多 30 条规则
-- 支持单个 IP 或 CIDR 范围
+| 规则类型 | 检查时机 | 限制数量 | 匹配模式 |
+|----------|----------|----------|----------|
+| IP 地址屏蔽 | `drop_shield_rule_ip` | 最多 30 条 | 精确匹配或 CIDR |
+| 国家/地区屏蔽 | `drop_shield_rule_country` | 最多 30 条 | ISO 国家代码 |
+| 页面路径屏蔽 | `drop_shield_rule_page` | 最多 30 条 | 通配符模式 |
+| 主机名白名单 | `drop_shield_rule_hostname` | 最多 10 条 | 通配符模式（白名单） |
 
-##### 国家/地区屏蔽
-```elixir
-def country_blocked?(domain, country_code) do
-  case Shield.CountryRuleCache.get({domain, String.upcase(country_code)}) do
-    %Shield.CountryRule{action: :deny} -> true
-    _ -> false
-  end
-end
-```
-- 最多 30 条规则
-- 基于 ISO 3166-1 alpha-2 国家代码
+#### 1.2.4 垃圾推荐过滤
 
-##### 页面路径屏蔽
-```elixir
-def page_blocked?(domain, pathname) do
-  page_rules = Shield.PageRuleCache.get(domain)
-  if page_rules do
-    page_rules
-    |> List.wrap()
-    |> Enum.find_value(false, fn rule ->
-      rule.action == :deny and Regex.match?(rule.page_path_pattern, pathname)
-    end)
-  else
-    false
-  end
-end
-```
-- 最多 30 条规则
-- 支持通配符模式（如 `/admin/**`, `/test/*/page`）
+**位置**: `lib/plausible/ingestion/event.ex:56-60, 581-587`
 
-##### 主机名白名单
-```elixir
-def hostname_allowed?(domain, hostname) do
-  hostname_rules = Shield.HostnameRuleCache.get(domain)
-  if hostname_rules do
-    hostname_rules
-    |> List.wrap()
-    |> Enum.find_value(false, fn rule ->
-      rule.action == :allow and Regex.match?(rule.hostname_pattern, hostname)
-    end)
-  else
-    true  # 默认允许所有
-  end
-end
-```
-- 最多 10 条规则
-- 白名单模式：配置后只有匹配的主机名才被允许
+- 执行时机：在管道**最早期**检查，甚至在 `GateKeeper.check` 之前
+- 依赖库: `referrer_blocklist`
 
-#### 1.2.5 垃圾推荐过滤
-
-**位置**: `lib/plausible/ingestion/event.ex:581-587`
-
-```elixir
-defp spam_referrer?(%Request{referrer: referrer}) when is_binary(referrer) do
-  URI.parse(referrer).host
-  |> Request.sanitize_hostname()
-  |> ReferrerBlocklist.is_spammer?()
-end
-```
-
-- 使用独立的 `referrer_blocklist` 库
-- 过滤已知的垃圾推荐域名
-- 在管道最早期检查，避免无效处理
-
-#### 1.2.6 安装验证代理过滤
-
-**位置**: `lib/plausible/ingestion/event.ex:199-206`
-
-```elixir
-on_ee do
-  @verification_user_agent Plausible.InstallationSupport.user_agent()
-
-  defp drop_verification_agent(%__MODULE__{} = event, _context) do
-    case event.request.user_agent do
-      @verification_user_agent ->
-        drop(event, :verification_agent)
-      _ ->
-        event
-    end
-  end
-end
-```
-
-- 仅企业版功能
-- 过滤 Plausible 官方的安装验证请求
-
-### 1.3 丢弃原因汇总
+#### 1.2.5 丢弃原因完整枚举
 
 **位置**: `lib/plausible/ingestion/event.ex:24-41`
 
 ```elixir
 @type drop_reason() ::
-        :bot                    # 机器人
-        | :spam_referrer        # 垃圾推荐
-        | GateKeeper.policy()   # 站点访问控制
-        | :invalid              # 无效数据
-        | :dc_ip                # 数据中心 IP
-        | :threat_ip            # 威胁 IP
-        | :site_ip_blocklist    # 站点 IP 屏蔽
-        | :site_country_blocklist # 国家屏蔽
-        | :site_page_blocklist    # 页面屏蔽
-        | :site_hostname_allowlist # 主机名不匹配
-        | :verification_agent      # 验证代理
-        | :lock_timeout            # 锁超时
-        | :no_session_for_engagement # 无会话的互动事件
-        | :persist_timeout         # 持久化超时
-        | :persist_error           # 持久化错误
-        | :persist_decode_error    # 持久化解码错误
+        :bot                      # UA 检测为机器人
+        | :spam_referrer          # 垃圾推荐域名
+        | GateKeeper.policy()     # 站点访问控制
+        | :invalid                # 数据格式无效
+        | :dc_ip                  # 数据中心 IP
+        | :threat_ip              # 威胁 IP
+        | :site_ip_blocklist      # 用户配置 IP 屏蔽
+        | :site_country_blocklist # 用户配置国家屏蔽
+        | :site_page_blocklist    # 用户配置页面屏蔽
+        | :site_hostname_allowlist # 主机名不匹配白名单
+        | :verification_agent     # Plausible 安装验证代理
+        | :lock_timeout           # 会话锁超时
+        | :no_session_for_engagement # 互动事件无对应会话
+        | :persist_timeout        # 持久化超时
+        | :persist_error          # 持久化错误
+        | :persist_decode_error   # 持久化解码错误
 ```
 
 ---
 
 ## 2. 用户隐私保护机制
 
-### 2.1 隐私设计原则
+### 2.1 核心设计原则
 
-Plausible Analytics 以"隐私友好"为核心设计原则，通过以下方式保护用户隐私：
-1. **无 Cookie 追踪**: 不使用任何持久化 Cookie
-2. **数据最小化**: 仅收集必要的最小数据
-3. **单向哈希**: 用户标识符无法反向还原
-4. **定期重置**: 盐值轮换防止长期追踪
-5. **匿名化处理**: 敏感信息在存储前处理
+| 原则 | 实现方式 |
+|------|----------|
+| **无 Cookie 追踪** | 完全不使用持久化 Cookie |
+| **单向哈希标识** | User ID 无法反向还原 |
+| **定期盐值轮换** | 防止跨天长期追踪 |
+| **数据最小化** | 仅收集必要的最小数据 |
+| **会话超时** | 30 分钟无活动后结束 |
 
 ### 2.2 User ID 生成机制
 
@@ -283,620 +185,358 @@ defp generate_user_id(request, domain, hostname, salt) do
     true ->
       user_agent = request.user_agent || ""
       root_domain = get_root_domain(hostname)
-
       SipHash.hash!(salt, user_agent <> request.remote_ip <> domain <> root_domain)
   end
 end
 ```
 
-**输入因子**:
-| 因子 | 说明 | 来源 |
-|------|------|------|
-| `user_agent` | 用户代理字符串 | HTTP Header |
-| `remote_ip` | 客户端 IP 地址 | 连接信息 |
-| `domain` | 站点域名 | 请求参数 |
-| `root_domain` | 根域名 | 从 hostname 解析 |
-| `salt` | 每日轮换的盐值 | 数据库 + ETS 缓存 |
+**输入因子**：`user_agent` + `remote_ip` + `domain` + `root_domain` + `salt`
 
-**算法特性**:
-- **单向哈希**: SipHash 是密钥哈希函数，无法从输出反推输入
-- **确定性**: 相同输入 + 相同 salt 产生相同 ID
-- **碰撞抵抗**: 64 位输出，碰撞概率极低
+### 2.3 盐值轮换机制深度解析
 
-#### 2.2.2 盐值轮换机制
+#### 2.3.1 双盐值查找机制（关键修正）
 
-**位置**: `lib/plausible/session/salts.ex`
+**之前的误解**：盐值轮换后 User ID 改变，必然创建新会话。
 
-```elixir
-defmodule Plausible.Session.Salts do
-  use GenServer
-  use Plausible.Repo
-
-  @impl true
-  def init(opts) do
-    name = opts[:name] || __MODULE__
-    now = opts[:now] || DateTime.utc_now()
-    clean_old_salts(now)
-
-    ^name = :ets.new(name, [
-      :named_table, :set, :protected, {:read_concurrency, true}
-    ])
-
-    refresh(name, now)
-    {:ok, name}
-  end
-
-  def rotate(name \\ __MODULE__, now \\ DateTime.utc_now()) do
-    GenServer.call(name, {:rotate, now})
-  end
-
-  defp generate_and_persist_new_salt(now) do
-    salt = :crypto.strong_rand_bytes(16)
-    Repo.insert_all("salts", [%{salt: salt, inserted_at: now}])
-    salt
-  end
-
-  defp clean_old_salts(now) do
-    h48_ago = DateTime.shift(now, hour: -48)
-    Repo.delete_all(from s in "salts", where: s.inserted_at < ^h48_ago)
-  end
-end
-```
-
-**轮换策略**:
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                        盐值生命周期                               │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  第 1 天 (Day 1)                                               │
-│  ┌─────────────┐                                               │
-│  │  Salt A     │  ← current (用于生成新 User ID)              │
-│  │  (current)  │                                               │
-│  └─────────────┘                                               │
-│                                                                │
-│  第 2 天 (Day 2) - 轮换后                                       │
-│  ┌─────────────┐  ┌─────────────┐                             │
-│  │  Salt B     │  │  Salt A     │                             │
-│  │  (current)  │  │  (previous) │                             │
-│  └─────────────┘  └─────────────┘                             │
-│        ↑                  ↑                                    │
-│   新会话使用           旧会话兼容                               │
-│                                                                │
-│  第 3 天 (Day 3) - 清理后                                       │
-│  ┌─────────────┐  ┌─────────────┐                             │
-│  │  Salt C     │  │  Salt B     │                             │
-│  │  (current)  │  │  (previous) │                             │
-│  └─────────────┘  └─────────────┘                             │
-│                     ↑                                          │
-│              Salt A 已被删除 (超过 48 小时)                    │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-```
-
-**关键特性**:
-1. **每日轮换**: 通过 Oban Worker `RotateSalts` 在 UTC 0 点执行（`config/runtime.exs:792`）
-2. **双盐值保留**: 始终保留 `current` 和 `previous` 两个盐值
-3. **48 小时清理**: 超过 48 小时的盐值从数据库删除
-4. **强随机**: 使用 `:crypto.strong_rand_bytes(16)` 生成 128 位随机数
-5. **高可用**: ETS 缓存 + 读并发优化
-
-#### 2.2.3 盐值轮换对会话的影响
+**实际行为**：系统会尝试用两个盐值生成的 ID 查找会话！
 
 **位置**: `lib/plausible/session/cache_store.ex:24-27`
 
 ```elixir
 found_session =
-  find_session(event, event.user_id) || find_session(event, prev_user_id)
+  find_session(event, event.user_id) ||      # 先用 current salt 的 ID 查找
+  find_session(event, prev_user_id)           # 再用 previous salt 的 ID 查找
 ```
 
-**会话查找顺序**:
-1. 首先使用 `current` 盐值生成的 `user_id` 查找
-2. 如果找不到，再使用 `previous` 盐值生成的 `prev_user_id` 查找
-
-**效果**:
-- 盐值轮换当天，旧会话仍可被识别（平滑过渡）
-- 48 小时后，旧盐值被删除，无法再关联旧会话
-
-### 2.3 无 Cookie 追踪架构
-
-#### 2.3.1 传统 Cookie 追踪 vs Plausible
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│  传统 Google Analytics 方式                                      │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  第 1 次访问:                                                   │
-│  ┌─────────────┐     Set Cookie: _ga=GA1.1.123456789.12345  │
-│  │   Browser   │ ←──────────────────────────────────────────  │
-│  └─────────────┘                                               │
-│                                                                │
-│  第 2 次访问 (数月后):                                          │
-│  ┌─────────────┐     Cookie: _ga=GA1.1.123456789.12345     │
-│  │   Browser   │ ──────────────────────────────────────────→ │
-│  └─────────────┘                                               │
-│                                                                │
-│  问题: Cookie 可持久保存数年，实现跨天、跨月追踪                │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────┐
-│  Plausible 方式 (无 Cookie)                                      │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  第 1 次访问 (Day 1, Salt = A):                                │
-│  User_ID = SipHash(A, UA + IP + Domain) = 0xAAA111           │
-│                                                                │
-│  第 2 次访问 (Day 2, Salt = B, IP/UA 相同):                   │
-│  User_ID = SipHash(B, UA + IP + Domain) = 0xBBB222           │
-│                    ↑                                            │
-│              不同的 ID！无法关联为同一用户                       │
-│                                                                │
-│  优势: 无法跨天长期追踪同一用户                                  │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### 2.4 数据最小化实践
-
-#### 2.4.1 请求验证和截断
-
-**位置**: `lib/plausible/ingestion/request.ex`
+**测试验证** (`test/plausible_web/controllers/api/external_controller_test.exs:1281-1295`):
 
 ```elixir
-@max_url_size 2_000
-@max_props 30
+test "salts rotating once does not", %{conn: conn, site: site} do
+  # 第一次 pageview
+  post(conn, "/api/event", %{n: "pageview", u: "https://test.com", d: site.domain})
+  Plausible.Session.Salts.rotate()  # 盐值轮换！
+  # 第二次 pageview（同一用户）
+  post(conn, "/api/event", %{n: "pageview", u: "https://test.com", d: site.domain})
 
-defp put_props(changeset, %{} = request_body) do
-  props =
-    (request_body["m"] || request_body["meta"] || ...)
-    |> Plausible.Helpers.JSON.decode_or_fallback()
-    |> Enum.reduce([], &filter_bad_props/2)
-    |> Enum.take(@max_props)  # 最多 30 个属性
-    |> Map.new()
-  # ...
-end
-
-defp put_referrer(changeset, %{} = request_body) do
-  referrer = request_body["r"] || request_body["referrer"]
-  if is_binary(referrer) do
-    referrer = String.slice(referrer, 0..(@max_url_size - 1))  # 截断
-    Changeset.put_change(changeset, :referrer, referrer)
-  # ...
+  # 关键断言：
+  assert records |> Enum.map(& &1.user_id) |> Enum.uniq() |> Enum.count() == 1
+  assert records |> Enum.map(& &1.session_id) |> Enum.uniq() |> Enum.count() == 1
 end
 ```
 
-**限制措施**:
-| 限制项 | 最大值 | 说明 |
-|--------|--------|------|
-| URL 长度 | 2000 字符 | 防止超长 URL 注入 |
-| 事件名长度 | 120 字符 | 限制事件名称大小 |
-| 自定义属性 | 30 个 | 限制数据收集范围 |
-| 属性键长度 | 配置项 | 防止超大键名 |
-| 属性值长度 | 配置项 | 防止超大值 |
+**结论**：盐值轮换后，如果 30 分钟内有活动，会话会被复用！
 
-#### 2.4.2 敏感数据过滤
+#### 2.3.2 盐值轮换边界场景
 
-```elixir
-defp filter_bad_props({k, v}, acc) do
-  cond do
-    Enum.any?([k, v], &(is_list(&1) or is_map(&1))) -> acc  # 拒绝嵌套结构
-    Enum.any?([k, v], &(String.trim_leading(to_string(&1)) == "")) -> acc  # 拒绝空值
-    true -> [{to_string(k), to_string(v)} | acc]
-  end
-end
-```
+| 场景 | 时间关系 | 行为 | 原因 |
+|------|----------|------|------|
+| 轮换后立即访问 | Salt A → Salt B，30 分钟内 | ✅ 复用同一会话 | `prev_user_id` 找到旧会话 |
+| 轮换后超过 30 分钟 | Salt A → Salt B，超过 30 分钟 | ❌ 新建会话 | 旧会话已超时 |
+| 48 小时后访问 | Salt A 已被删除 | ❌ 新建会话 | 旧盐值已清理 |
 
-### 2.5 地理位置处理
-
-#### 2.5.1 匿名代理处理
-
-**位置**: `lib/plausible/ingestion/event.ex:324-333`
-
-```elixir
-defp put_geolocation(%__MODULE__{} = event, _context) do
-  case event.request.ip_classification do
-    "anonymous_vpn_ip" ->
-      update_session_attrs(event, %{country_code: "A1"})
-    _any ->
-      result = Plausible.Ingestion.Geolocation.lookup(event.request.remote_ip) || %{}
-      update_session_attrs(event, result)
-  end
-end
-```
-
-**特殊处理**:
-- `anonymous_vpn_ip` (匿名 VPN/代理) 的国家代码统一设为 `"A1"`
-- 不进行精确地理位置解析
-- 保护 VPN/Tor 用户的隐私
-
-### 2.6 会话超时机制
+### 2.4 会话超时机制
 
 **位置**: `lib/plausible/session/cache_store.ex:77-80`
 
-```elixir
-defp find_session(event, user_id) do
-  from_cache = Plausible.Cache.Adapter.get(:sessions, {event.site_id, user_id})
-  case from_cache do
-    nil -> nil
-    session ->
-      if NaiveDateTime.diff(event.timestamp, session.timestamp, :minute) <= 30 do
-        session
-      end
-  end
-end
-```
-
-**超时规则**:
-- 会话超时时间: **30 分钟**
-- 从最后一个事件的时间戳开始计算
-- 超时后创建新会话，不关联历史数据
+- 超时时间：**30 分钟**
+- 计时起点：`session.timestamp`（会话最后活跃时间）
+- 每次活动更新 `timestamp`，重置超时计时
 
 ---
 
 ## 3. 事件归因边界处理
 
-### 3.1 归因处理流程
+### 3.1 来源信息处理流程总览
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      事件归因处理流程                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  1. 请求构建 (Request.build)                                      │
-│     ├── 解析 URL、query params                                    │
-│     ├── 提取 referrer                                             │
-│     └── 验证必填字段                                               │
-│                                                                   │
-│  2. 来源解析 (put_source_info)                                    │
-│     ├── 检查 UTM 参数 (utm_source, utm_medium 等)                │
-│     ├── 解析 Referrer 头                                          │
-│     └── 使用 RefInspector 分类来源                                 │
-│                                                                   │
-│  3. 媒介推断 (maybe_infer_medium)                                 │
-│     ├── gclid → Google 付费搜索                                   │
-│     ├── msclkid → Bing 付费搜索                                   │
-│     └── 付费来源检测                                               │
-│                                                                   │
-│  4. 渠道分类 (Acquisition.get_channel)                            │
-│     ├── 基于来源 + UTM 参数判断营销渠道                            │
-│     └── 区分 Organic vs Paid                                      │
-│                                                                   │
-│  5. 会话归属 (Session.CacheStore)                                 │
-│     ├── 30 分钟内 → 同一会话                                      │
-│     ├── 新会话 → 记录首次来源                                      │
-│     └── 已有会话 → 保持原始来源不变                                │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
+输入: URL?utm_source=yt-ads&utm_medium=cpc + Referer: youtube.com
+
+阶段 1: Request.build()
+  ├── query_params: %{"utm_source" => "yt-ads", "utm_medium" => "cpc"}
+  └── referrer: "https://www.youtube.com/..."
+
+阶段 2: put_source_info()
+  ├── utm_source = "yt-ads"        ← 原始值，用于付费检测
+  ├── referrer_source = "Youtube"  ← 规范化后的值
+  └── utm_medium = "cpc"
+
+阶段 3: maybe_infer_medium()
+  └── 仅当 utm_medium 为 nil 时才推断（此处已有值，跳过）
+
+阶段 4: 渠道计算 (ClickHouse)
+  acquisition_channel = get_channel(
+    "Youtube",    # referrer_source (规范化)
+    "cpc",        # utm_medium (原始)
+    nil,          # utm_campaign
+    "yt-ads",     # utm_source (原始，关键！)
+    nil           # click_id_param
+  )
+  结果: "Paid Video"
+  原因: utm_source="yt-ads" 在 @paid_sources 中
 ```
 
-### 3.2 来源解析逻辑
+### 3.2 `utm_source` vs `referrer_source` 的关键区别
 
-#### 3.2.1 来源优先级
+这是之前报告中的主要错误点，现在澄清：
 
-**位置**: `lib/plausible/ingestion/source.ex:66-80`
+| 字段 | 数据源 | 是否规范化 | 用途 |
+|------|--------|------------|------|
+| `utm_source` | `query_params["utm_source"]` 等 | **否** | 付费检测 (`paid_source?`) |
+| `referrer_source` | `Source.resolve()` + `find_mapping()` | **是** | 显示名称、渠道分类 |
+
+**实际示例**：
+
+| URL 参数 | `utm_source` 值 | `referrer_source` 值 |
+|----------|-----------------|----------------------|
+| `?utm_source=ig` | `"ig"` | `"Instagram"` |
+| `?utm_source=yt-ads` | `"yt-ads"` | `"Youtube"` |
+| `?utm_source=fb-ads` | `"fb-ads"` | `"Facebook"` |
+
+**为什么需要两个字段？**
+
+```
+场景: 用户点击 Youtube 广告，URL 带 utm_source=yt-ads
+
+问题: 如何判断这是付费流量？
+
+方案 A (只用 referrer_source="Youtube"):
+  无法区分自然搜索的 Youtube 和广告点击的 Youtube
+  因为 referrer_source 都是 "Youtube"！
+
+方案 B (用原始 utm_source="yt-ads"):
+  @paid_sources 包含 "yt-ads", "fb-ads" 等以 "ads"/"ad" 结尾的键
+  paid_source?("yt-ads")  = true  ✓  判定为付费
+  paid_source?("Youtube") = false ✗
+```
+
+### 3.3 渠道归属计算机制
+
+#### 3.3.1 关键发现：`acquisition_channel` 是计算列
+
+**位置**: `lib/plausible/clickhouse_session_v2.ex:77`
 
 ```elixir
-def resolve(request) do
-  tagged_source =
-    request.query_params["utm_source"] ||
-      request.query_params["source"] ||
-      request.query_params["ref"]
-
-  source =
-    cond do
-      tagged_source -> tagged_source
-      has_valid_referral?(request) -> parse(request.referrer)
-      true -> nil
-    end
-
-  find_mapping(source)
-end
+field :acquisition_channel, Ch, type: "LowCardinality(String)", writable: :never
 ```
 
-**优先级顺序**:
-```
-1. utm_source  (最高优先级)
-      ↓
-2. source
-      ↓
-3. ref
-      ↓
-4. Referer HTTP Header
-      ↓
-5. nil (Direct)
-```
+**重要属性**: `writable: :never`
 
-#### 3.2.2 Referrer 验证规则
+这意味着：
+1. **应用层不写入**这个字段
+2. 它是 ClickHouse 的 **materialized column**（物化列）
+3. 由 ClickHouse 内部的 SQL 函数动态计算
 
-**位置**: `lib/plausible/ingestion/source.ex:110-124`
+#### 3.3.2 付费来源检测逻辑
+
+**位置**: `lib/plausible/ingestion/source.ex:13-16, 49-51`
 
 ```elixir
-defp has_valid_referral?(%Request{referrer: nil}), do: false
-
-defp has_valid_referral?(%Request{referrer: referrer, uri: uri}) do
-  referrer_uri = URI.parse(referrer)
-
-  valid_scheme? = referrer_uri.scheme in ["http", "https", "android-app"]
-  valid_host? = !is_nil(referrer_uri.host) && byte_size(referrer_uri.host) > 0
-
-  internal? =
-    Request.sanitize_hostname(referrer_uri.host) == Request.sanitize_hostname(uri.host)
-
-  local? = referrer_uri.host == "localhost"
-
-  valid_scheme? and valid_host? and not internal? and not local?
-end
-```
-
-**有效 Referrer 条件**:
-| 条件 | 说明 |
-|------|------|
-| `valid_scheme?` | 必须是 http、https 或 android-app |
-| `valid_host?` | 必须有主机名 |
-| `not internal?` | 不能是同一站点的内部跳转 |
-| `not local?` | 不能是 localhost |
-
-#### 3.2.3 来源规范化
-
-**位置**: `lib/plausible/ingestion/source.ex:8-43`
-
-```elixir
-@external_resource "priv/custom_sources.json"
-@custom_sources Application.app_dir(:plausible, "priv/custom_sources.json")
-                |> File.read!()
-                |> Jason.decode!()
-
 @paid_sources Map.keys(@custom_sources)
               |> Enum.filter(&String.ends_with?(&1, ["ads", "ad"]))
               |> then(&["adwords" | &1])
               |> MapSet.new()
+
+def paid_source?(source) do
+  MapSet.member?(@paid_sources, source)
+end
 ```
 
-**规范化示例**:
-- `google.com`、`google.co.uk`、`google.de` → 统一为 `"Google"`
-- `ig` → `"Instagram"`
-- `adwords` → `"Google"`
-- `yt-ads` → 标记为付费来源
+**`@paid_sources` 集合构成**：
+1. 从 `@custom_sources` 的 keys 中筛选以 `"ads"` 或 `"ad"` 结尾的键
+2. 额外添加 `"adwords"`
 
-### 3.3 渠道分类逻辑
-
-#### 3.3.1 分类引擎
-
-**位置**: `lib/plausible/ingestion/acquisition.ex`
+**测试用例验证** (`test/plausible/ingestion/acquisition_test.exs`):
 
 ```elixir
-def get_channel(source, utm_medium, utm_campaign, utm_source, click_id_param) do
-  get_channel_lowered(
-    String.downcase(source || ""),
-    String.downcase(utm_medium || ""),
-    String.downcase(utm_campaign || ""),
-    String.downcase(utm_source || ""),
-    click_id_param
-  )
-end
+# 测试: utm_source=yt-ads (原始值) 应判定为付费
+%{
+  referrer_source: "Youtube",   # 规范化后
+  utm_source: "yt-ads",          # 原始值 ← 关键！
+  expected: "Paid Video"
+}
 
-defp get_channel_lowered(source, utm_medium, utm_campaign, utm_source, click_id_param) do
-  cond do
-    cross_network?(utm_campaign) -> "Cross-network"
-    paid_shopping?(source, utm_campaign, utm_medium) -> "Paid Shopping"
-    paid_search?(source, utm_medium, utm_source, click_id_param) -> "Paid Search"
-    paid_social?(source, utm_medium, utm_source) -> "Paid Social"
-    paid_video?(source, utm_medium, utm_source) -> "Paid Video"
-    display?(utm_medium) -> "Display"
-    paid_other?(utm_medium) -> "Paid Other"
-    organic_shopping?(source, utm_campaign) -> "Organic Shopping"
-    organic_social?(source, utm_medium) -> "Organic Social"
-    organic_video?(source, utm_medium) -> "Organic Video"
-    search_source?(source) -> "Organic Search"
-    email?(source, utm_source, utm_medium) -> "Email"
-    affiliates?(utm_medium) -> "Affiliates"
-    audio?(utm_medium) -> "Audio"
-    sms?(utm_source, utm_medium) -> "SMS"
-    mobile_push_notifications?(source, utm_medium) -> "Mobile Push Notifications"
-    referral?(source, utm_medium) -> "Referral"
-    true -> "Direct"
-  end
+# 对比: utm_source=yt (原始值) 不应判定为付费
+%{
+  referrer_source: "Youtube",   # 相同
+  utm_source: "yt",              # 不同 ← 不在 @paid_sources 中
+  expected: "Organic Video"
+}
+```
+
+#### 3.3.3 `maybe_infer_medium` 的真实作用
+
+**位置**: `lib/plausible/ingestion/event.ex:312-322`
+
+```elixir
+defp maybe_infer_medium(%__MODULE__{} = event, _context) do
+  inferred_medium =
+    case event.clickhouse_session_attrs do
+      %{utm_medium: medium} when is_binary(medium) -> medium  # 已有值，不覆盖
+      %{utm_medium: nil, referrer_source: "Google", click_id_param: "gclid"} -> "(gclid)"
+      %{utm_medium: nil, referrer_source: "Bing", click_id_param: "msclkid"} -> "(msclkid)"
+      _ -> nil
+    end
+  update_session_attrs(event, %{utm_medium: inferred_medium})
 end
 ```
 
-#### 3.3.2 付费搜索检测
+**关键行为**：
+
+| 条件 | 行为 |
+|------|------|
+| `utm_medium` 已有非空值 | **直接使用，不修改** |
+| `utm_medium` 为 nil + Google + gclid | 设置为 `"(gclid)"` |
+| `utm_medium` 为 nil + Bing + msclkid | 设置为 `"(msclkid)"` |
+| 其他情况 | 保持 `nil` |
+
+**重要说明**：
+- 推断值 `"(gclid)"` **不匹配** `paid_medium?` 的正则表达式
+- 但 `paid_search?` 会**直接检查** `source` 和 `click_id_param` 的组合：
 
 ```elixir
 defp paid_search?(source, utm_medium, utm_source, click_id_param) do
   (search_source?(source) and paid_medium?(utm_medium)) or
     (search_source?(source) and paid_source?(utm_source)) or
-    (source == "google" and click_id_param == "gclid") or
-    (source == "bing" and click_id_param == "msclkid")
+    (source == "google" and click_id_param == "gclid") or  # ← 直接判断
+    (source == "bing" and click_id_param == "msclkid")     # ← 直接判断
 end
 ```
 
-**付费搜索判定条件**:
-1. 是搜索引擎来源 + `utm_medium` 是付费模式
-2. 是搜索引擎来源 + `utm_source` 是付费来源
-3. Google 来源 + 有 `gclid` 参数
-4. Bing 来源 + 有 `msclkid` 参数
+### 3.4 会话字段覆盖时机与逻辑
 
-#### 3.3.3 点击 ID 参数支持
-
-**位置**: `lib/plausible/ingestion/event.ex:435-442`
-
-```elixir
-@click_id_params ["gclid", "gbraid", "wbraid", "msclkid", "fbclid", "twclid"]
-
-defp get_click_id_param(query_params) do
-  @click_id_params
-  |> Enum.find(fn param_name -> Map.has_key?(query_params, param_name) end)
-end
-```
-
-| 参数 | 平台 | 说明 |
-|------|------|------|
-| `gclid` | Google Ads | Google Click Identifier |
-| `gbraid` | Google Ads | 应用到网页转化 |
-| `wbraid` | Google Ads | 网页到应用转化 |
-| `msclkid` | Microsoft Ads | Bing Click ID |
-| `fbclid` | Facebook/Meta | Facebook Click ID |
-| `twclid` | Twitter/X | Twitter Click ID |
-
-#### 3.3.4 付费模式检测
-
-```elixir
-defp paid_medium?(utm_medium) do
-  Regex.match?(~r/^(.*cp.*|ppc|retargeting|paid.*)$/, utm_medium)
-end
-
-defp paid_source?(utm_source) do
-  Plausible.Ingestion.Source.paid_source?(utm_source)
-end
-```
-
-**付费 medium 模式**:
-- `cp.*` (cpc, cpm, cpp 等)
-- `ppc` (按点击付费)
-- `retargeting` (再营销)
-- `paid.*` (paid, paid-search 等)
-
-### 3.4 自定义来源分类
-
-**位置**: `lib/plausible/ingestion/acquisition.ex:20-46`
-
-```elixir
-@custom_source_categories [
-  {"hacker news", "SOURCE_CATEGORY_SOCIAL"},
-  {"yahoo!", "SOURCE_CATEGORY_SEARCH"},
-  {"gmail", "SOURCE_CATEGORY_EMAIL"},
-  {"telegram", "SOURCE_CATEGORY_SOCIAL"},
-  {"slack", "SOURCE_CATEGORY_SOCIAL"},
-  {"producthunt", "SOURCE_CATEGORY_SOCIAL"},
-  {"github", "SOURCE_CATEGORY_SOCIAL"},
-  {"steamcommunity.com", "SOURCE_CATEGORY_SOCIAL"},
-  {"statics.teams.cdn.office.net", "SOURCE_CATEGORY_SOCIAL"},
-  {"vkontakte", "SOURCE_CATEGORY_SOCIAL"},
-  {"threads", "SOURCE_CATEGORY_SOCIAL"},
-  {"ecosia", "SOURCE_CATEGORY_SEARCH"},
-  {"perplexity", "SOURCE_CATEGORY_SEARCH"},
-  {"brave", "SOURCE_CATEGORY_SEARCH"},
-  {"chatgpt.com", "SOURCE_CATEGORY_SEARCH"},  # AI 工具视为搜索引擎
-  {"temu.com", "SOURCE_CATEGORY_SHOPPING"},
-  {"discord", "SOURCE_CATEGORY_SOCIAL"},
-  {"sogou", "SOURCE_CATEGORY_SEARCH"},
-  {"microsoft teams", "SOURCE_CATEGORY_SOCIAL"}
-]
-```
-
-**关键自定义规则**:
-- **AI 工具 (ChatGPT, Perplexity)**: 归类为搜索引擎 (`SOURCE_CATEGORY_SEARCH`)
-- **IM 工具 (Telegram, Discord, Slack, Teams)**: 归类为社交
-- **邮件服务 (Gmail)**: 归类为邮件渠道
-- **开发社区 (GitHub, Product Hunt, Hacker News)**: 归类为社交
-
-### 3.5 会话归属逻辑
-
-#### 3.5.1 会话创建与更新
-
-**位置**: `lib/plausible/session/cache_store.ex:55-65`
-
-```elixir
-defp handle_event(event, found_session, session_attributes, buffer_insert) do
-  if found_session do
-    updated_session = update_session(found_session, event)
-    buffer_insert.([%{found_session | sign: -1}, %{updated_session | sign: 1}])
-    update_session_cache(updated_session)
-  else
-    new_session = new_session_from_event(event, session_attributes)
-    buffer_insert.([new_session])
-    update_session_cache(new_session)
-  end
-end
-```
-
-#### 3.5.2 新会话 - 记录来源
+#### 3.4.1 新会话创建时的字段设置
 
 **位置**: `lib/plausible/session/cache_store.ex:125-161`
 
-```elixir
-defp new_session_from_event(event, session_attributes) do
-  %Plausible.ClickhouseSessionV2{
-    # ... 基础字段
-    referrer: Map.get(session_attributes, :referrer),
-    click_id_param: Map.get(session_attributes, :click_id_param),
-    referrer_source: Map.get(session_attributes, :referrer_source),
-    utm_medium: Map.get(session_attributes, :utm_medium),
-    utm_source: Map.get(session_attributes, :utm_source),
-    utm_campaign: Map.get(session_attributes, :utm_campaign),
-    utm_content: Map.get(session_attributes, :utm_content),
-    utm_term: Map.get(session_attributes, :utm_term),
-    # ... 其他字段
-  }
-end
-```
+新会话创建时，所有来源相关字段都从 `session_attributes` 读取：
+- `referrer`, `referrer_source`, `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`, `click_id_param`
 
-**新会话记录的来源属性**:
-- `referrer` - 原始推荐 URL
-- `referrer_source` - 规范化的来源名称
-- `click_id_param` - 广告点击 ID 类型
-- 所有 UTM 参数 (`utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`)
-- 地理位置信息 (`country_code`, `city_geoname_id` 等)
-
-#### 3.5.3 会话更新 - 保持原始来源
+#### 3.4.2 会话更新时的字段行为
 
 **位置**: `lib/plausible/session/cache_store.ex:95-123`
 
 ```elixir
 defp update_session(session, event) do
-  pageview? = event.name == "pageview"
-  pageviews = if(pageview?, do: session.pageviews + 1, else: session.pageviews)
-
   %{
     session
-    | timestamp: event.timestamp,
-      entry_page:  # 仅在空时设置
-        if(session.entry_page == "" and pageview?,
-          do: event.pathname,
-          else: session.entry_page
-        ),
-      hostname:  # 仅在空时设置
-        if(pageview? and session.hostname == "",
-          do: event.hostname,
-          else: session.hostname
-        ),
-      exit_page: if(pageview?, do: event.pathname, else: session.exit_page),
-      exit_page_hostname: if(pageview?, do: event.hostname, else: session.exit_page_hostname),
-      is_bounce:
-        if(session.is_bounce,
-          do: not (pageviews >= 2 or (event.interactive? and not pageview?)),
-          else: session.is_bounce
-        ),
-      duration: NaiveDateTime.diff(event.timestamp, session.start) |> abs,
-      pageviews: pageviews,
-      events: session.events + 1
+    | timestamp: event.timestamp,             # 更新
+      entry_page: if(session.entry_page == "" and pageview?, ...),  # 仅空时
+      hostname: if(pageview? and session.hostname == "", ...),      # 仅空时
+      exit_page: if(pageview?, do: event.pathname, else: ...),     # 更新
+      duration: NaiveDateTime.diff(...),                             # 更新
+      pageviews: pageviews,                                          # 更新
+      events: session.events + 1                                     # 更新
   }
 end
 ```
 
-**关键发现**: 会话更新时**不会修改**任何来源相关字段！
+**关键发现**：
 
-| 字段 | 新会话时设置 | 更新时修改 |
-|------|-------------|-----------|
-| `referrer` | ✅ | ❌ |
-| `referrer_source` | ✅ | ❌ |
-| `utm_*` 参数 | ✅ | ❌ |
-| `click_id_param` | ✅ | ❌ |
-| `entry_page` | ✅ (仅空时) | ❌ |
-| `exit_page` | ✅ | ✅ (每次 pageview) |
-| `timestamp` | ✅ | ✅ |
-| `duration` | 0 | ✅ (累加) |
-| `pageviews` | 0/1 | ✅ (累加) |
+`update_session` 函数：
+1. **完全不使用**传入的 `session_attributes` 参数
+2. **没有任何代码**更新来源相关字段
 
-**归因模型**: **首次接触归因 (First-Touch Attribution)**
+**会话更新时的字段变化汇总**：
 
-- 会话内所有事件和转化都归属于**首次**带来用户的渠道
-- 即使会话中间用户点击了其他来源的链接，只要在 30 分钟内，仍保持原始来源
+| 字段 | 新会话时设置 | 更新时修改 | 说明 |
+|------|-------------|-----------|------|
+| `referrer` | ✅ | ❌ | **首次接触归因** |
+| `referrer_source` | ✅ | ❌ | **首次接触归因** |
+| `utm_source` | ✅ | ❌ | **首次接触归因** |
+| `utm_medium` | ✅ | ❌ | **首次接触归因** |
+| `utm_campaign` | ✅ | ❌ | **首次接触归因** |
+| `click_id_param` | ✅ | ❌ | **首次接触归因** |
+| `entry_page` | ✅ | 仅空时 | 首次 pageview 的页面 |
+| `timestamp` | ✅ | ✅ | 每次更新 |
+| `exit_page` | ✅ | ✅ | 每次 pageview 更新 |
+| `duration` | ✅ | ✅ | 累加 |
+| `pageviews` | ✅ | ✅ | 累加 |
+| `events` | ✅ | ✅ | 累加 |
 
-#### 3.5.4 互动事件的特殊处理
+### 3.5 盐值轮换 + 会话窗口叠加边界
+
+#### 3.5.1 边界场景分析
+
+结合以下两个独立机制：
+1. **盐值轮换**: 每日 UTC 0 点，生成新 salt，保留 previous salt 48 小时
+2. **会话超时**: 30 分钟无活动后，会话无法再被找到
+
+**叠加后的边界场景**：
+
+```
+场景 1: 盐值轮换后立即访问（30 分钟内）
+─────────────────────────────────────────────────────────────
+T=09:00 (Day 1, Salt=A):
+  用户访问，创建会话 S1
+  user_id_A = SipHash(Salt_A, UA + IP + ...) = UID_A1
+  缓存中: {site_id, UID_A1} → S1
+
+T=00:00 (Day 2, 盐值轮换):
+  Salt_A → previous
+  Salt_B → current
+  S_A1 仍在缓存中 (超时时间 00:10 未到)
+
+T=00:05 (Day 2, 轮换后 5 分钟):
+  同一用户再次访问
+  
+  处理流程：
+  1. 生成两个 user_id:
+     - UID_B1 = SipHash(Salt_B, ...)
+     - UID_A1 = SipHash(Salt_A, ...)
+  
+  2. 查找会话：
+     find_session(UID_B1) → ❌ 未找到
+     find_session(UID_A1) → ✅ 找到 S1 (仅 5 分钟，< 30 分钟)
+  
+  3. 更新会话 S1，来源字段保持不变
+
+  结果: ✅ 复用同一会话，同一来源归因
+
+
+场景 2: 盐值轮换后超过 30 分钟访问
+─────────────────────────────────────────────────────────────
+T=09:00 (Day 1, Salt=A): 创建会话 S1
+T=00:00 (Day 2): 盐值轮换 (A→previous, B→current)
+T=00:35 (Day 2): 用户访问（距离上次活动 15 小时 35 分钟）
+
+  处理流程：
+  1. UID_B = SipHash(Salt_B, ...)
+  2. UID_A = SipHash(Salt_A, ...)
+  3. 查找：
+     find_session(UID_B) → ❌
+     find_session(UID_A) → ❌ 会话已超时（15 小时 > 30 分钟）
+
+  结果: ❌ 创建新会话 S2，使用当前事件的来源
+
+
+场景 3: 48 小时后访问（旧 salt 已删除）
+─────────────────────────────────────────────────────────────
+T=09:00 (Day 1, Salt=A): 创建会话 S1
+T=00:00 (Day 2): 盐值轮换
+T=00:00 (Day 3): 清理 48 小时前的 salt → Salt_A 被删除
+T=09:00 (Day 3): 用户访问
+
+  处理流程：
+  1. current salt = C, previous salt = B
+  2. UID_C = SipHash(Salt_C, ...)
+  3. UID_B = SipHash(Salt_B, ...)
+  4. 两个 ID 都找不到会话（超时 + salt 不匹配）
+
+  结果: ❌ 创建新会话，无法追溯 Salt_A 时期的活动
+```
+
+#### 3.5.2 边界决策表
+
+| 场景 | 距离上次活动 | 盐值状态 | 行为 | 归因结果 |
+|------|-------------|----------|------|----------|
+| 正常活动 | < 30 分钟 | 无轮换 | 复用会话 | 保持首次来源 |
+| 轮换后立即 | < 30 分钟 | current + previous 都有 | 复用会话 | 保持首次来源 |
+| 轮换后超时 | > 30 分钟 | current + previous 都有 | 新建会话 | 使用**当前**事件来源 |
+| 超过 48 小时 | 任意 | previous 已删除 | 新建会话 | 无法追溯旧来源 |
+
+### 3.6 互动事件与跨日场景边界
+
+#### 3.6.1 Engagement 事件的特殊处理
 
 **位置**: `lib/plausible/session/cache_store.ex:44-53`
 
@@ -911,71 +551,205 @@ defp handle_event(%{name: "engagement"} = event, found_session, _, _) do
 end
 ```
 
-**engagement 事件规则**:
-- 必须依附于已存在的会话
-- 没有对应会话时会被丢弃 (`:no_session_for_engagement`)
-- 仅用于刷新会话活跃时间，不创建新会话
+**关键特性**：
 
-### 3.6 归因边界总结
+| 特性 | 说明 |
+|------|------|
+| **不能创建新会话** | `engagement` 事件**永远不会**触发新会话创建 |
+| **必须依附现有会话** | 必须通过 `user_id` 或 `prev_user_id` 找到已有会话 |
+| **仅刷新时间戳** | 找到会话后，仅更新 `timestamp`（重置 30 分钟超时） |
+| **不修改其他字段** | 来源、pageviews、events 等都不变 |
+
+#### 3.6.2 Engagement 事件边界场景
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    事件归因边界规则                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  1. 来源优先级                                                    │
-│     utm_source > source > ref > Referer Header                  │
-│                                                                   │
-│  2. 会话边界                                                      │
-│     ┌──────────────────────────────────────────────────────┐    │
-│     │  30 分钟超时窗口                                        │    │
-│     │  ┌──────┐    ┌──────┐    ┌──────┐                   │    │
-│     │  │ Event│───▶│ Event│───▶│ Event│                   │    │
-│     │  └──────┘    └──────┘    └──────┘                   │    │
-│     │     ↑            ↑            ↑                        │    │
-│     │  同一会话，同一来源归因                                │    │
-│     └──────────────────────────────────────────────────────┘    │
-│                                                                   │
-│  3. 盐值轮换边界                                                  │
-│     Day 1 (Salt A)          Day 2 (Salt B)                      │
-│     ┌────────────┐          ┌────────────┐                      │
-│     │ User_ID:   │   Salt   │ User_ID:   │                      │
-│     │ 0xAAA111   │  轮换    │ 0xBBB222   │  ← 不同的 ID！       │
-│     └────────────┘          └────────────┘                      │
-│           ↑                         ↑                            │
-│      同一会话结束              视为新用户/新会话                  │
-│                                                                   │
-│  4. 归因模型                                                      │
-│     首次接触归因 (First-Touch)                                    │
-│     ┌──────────────────────────────────────────────────────┐    │
-│     │  Session Start                                          │    │
-│     │  来源: Google / utm_medium=cpc                         │    │
-│     │       ↓                                                 │    │
-│     │  Event 1 (pageview) → 归属于 Google Paid              │    │
-│     │       ↓                                                 │    │
-│     │  Event 2 (点击外部链接，但 30 分钟内)                   │    │
-│     │       ↓                                                 │    │
-│     │  Event 3 (pageview) → 仍归属于 Google Paid            │    │
-│     │                    (保持首次来源)                        │    │
-│     └──────────────────────────────────────────────────────┘    │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
+场景 1: 有活跃会话时发送 engagement
+─────────────────────────────────────────────────────────────
+T=0min: pageview → 创建会话 S1 (来源: Google Paid Search)
+T=5min: engagement (滚动深度: 50%, 停留时间: 30s)
+
+  处理：
+  1. find_session(user_id) → ✅ 找到 S1
+  2. refresh_session_cache(S1, new_timestamp)
+  3. S1.timestamp 更新为 T=5min（超时重置为 T=35min）
+
+  结果: ✅ 成功，会话保持活跃，来源归因不变
+
+
+场景 2: 无会话时发送 engagement
+─────────────────────────────────────────────────────────────
+用户首次访问就发送 engagement 事件（单页应用特殊行为）
+
+  处理：
+  1. find_session(user_id) → ❌ 未找到
+  2. find_session(prev_user_id) → ❌ 未找到
+  3. 返回 :no_session_for_engagement
+
+  结果: ❌ 事件被丢弃，drop_reason = :no_session_for_engagement
+
+
+场景 3: 会话超时后发送 engagement
+─────────────────────────────────────────────────────────────
+T=0min: pageview → 创建会话 S1
+T=40min: engagement (距离上次 40 分钟 > 30 分钟)
+
+  处理：
+  1. find_session(user_id) → ❌ 会话已超时
+  2. 返回 :no_session_for_engagement
+
+  结果: ❌ 事件被丢弃
+
+  重要: 即使同一用户，超时后 engagement 也不会创建新会话
+  需要先发送 pageview 或其他事件来创建新会话
+```
+
+#### 3.6.3 跨日场景完整示例
+
+```
+假设:
+- 盐值在 UTC 00:00 轮换
+- 用户 A: Chrome + IP=1.2.3.4
+- 用户 B: Safari + IP=5.6.7.8 (不同用户)
+
+═════════════════════════════════════════════════════════════
+
+Day 1, 23:40 (Salt = A)
+─────────────────────────────────────────────────────────────
+用户 A 点击 Google 广告:
+  URL: ?utm_source=google_ads&utm_medium=cpc
+
+创建会话 S_A1:
+  ├── user_id: SipHash(Salt_A, Chrome + 1.2.3.4 + ...) = UID_A1
+  ├── referrer_source: "Google"
+  ├── utm_source: "google_ads"
+  ├── utm_medium: "cpc"
+  ├── 渠道: "Paid Search"
+  └── 超时: Day 2, 00:10 (30 分钟后)
+
+═════════════════════════════════════════════════════════════
+
+Day 2, 00:00 (盐值轮换)
+─────────────────────────────────────────────────────────────
+Salt_A → previous
+Salt_B → current
+S_A1 仍在缓存中 (超时时间 00:10 未到)
+
+═════════════════════════════════════════════════════════════
+
+Day 2, 00:05 (Salt B current, Salt A previous)
+─────────────────────────────────────────────────────────────
+用户 A 继续浏览 (同一浏览器，同一 IP)
+点击 Facebook 链接，URL: ?utm_source=fb_ads
+
+处理流程：
+1. 生成两个 user_id:
+   - UID_B1 = SipHash(Salt_B, Chrome + 1.2.3.4 + ...)
+   - UID_A1 = SipHash(Salt_A, Chrome + 1.2.3.4 + ...)
+
+2. 查找会话：
+   find_session(UID_B1) → ❌ 未找到
+   find_session(UID_A1) → ✅ 找到 S_A1 (仅 5 分钟，< 30 分钟)
+
+3. 执行 update_session():
+   - 使用找到的旧会话 S_A1
+   - 传入新的 session_attributes (referrer_source="Facebook", utm_source="fb_ads")
+   - ❌ update_session 完全忽略这些新的来源信息！
+
+结果：
+会话 S_A1 的来源字段**保持不变**：
+  ├── referrer_source: "Google"    (仍是首次的)
+  ├── utm_source: "google_ads"     (仍是首次的)
+  ├── utm_medium: "cpc"             (仍是首次的)
+  └── 渠道: "Paid Search"           (仍是首次的)
+
+本次事件及后续事件都归属于 "Paid Search"
+
+═════════════════════════════════════════════════════════════
+
+Day 2, 00:15 (Salt B current, Salt A previous)
+─────────────────────────────────────────────────────────────
+用户 A 发送 engagement 事件（滚动深度 75%）
+
+处理流程：
+1. 生成两个 user_id: UID_B1, UID_A1
+2. 查找会话：
+   find_session(UID_B1) → ❌
+   find_session(UID_A1) → ✅ 找到 S_A1 (更新后的超时是 00:35)
+3. refresh_session_cache(S_A1, 00:15)
+4. S_A1.timestamp = 00:15，超时重置为 00:45
+
+结果: ✅ 成功，会话保持活跃，来源归因不变
+
+═════════════════════════════════════════════════════════════
+
+Day 2, 01:00 (超过 30 分钟无活动)
+─────────────────────────────────────────────────────────────
+用户 A 再次访问（同一浏览器，同一 IP）
+点击 Twitter 链接，URL: ?utm_source=twitter-ads
+
+处理流程：
+1. 生成两个 user_id: UID_B1, UID_A1
+2. 查找会话：
+   find_session(UID_B1) → ❌ 未找到
+   find_session(UID_A1) → ❌ 会话已超时 (00:45 < 01:00，超过 30 分钟)
+
+3. 创建新会话 S_A2，使用当前事件的来源：
+   ├── referrer_source: "Twitter"
+   ├── utm_source: "twitter-ads"
+   ├── utm_medium: nil
+   └── 渠道: "Paid Social"
+
+结果：
+- 创建新会话 S_A2，归属于 "Paid Social"
+- S_A1 已超时，无法再被更新
+- 两个会话独立归因，互不影响
+
+═════════════════════════════════════════════════════════════
+
+Day 3, 09:00 (48 小时后，Salt_A 已被删除)
+─────────────────────────────────────────────────────────────
+用户 A 再次访问（同一浏览器，同一 IP）
+直接访问，无来源参数
+
+处理流程：
+1. current salt = C, previous salt = B
+2. 生成两个 user_id: UID_C, UID_B
+3. 查找会话：
+   find_session(UID_C) → ❌
+   find_session(UID_B) → ❌
+
+4. 创建新会话 S_A3，使用当前事件的来源：
+   ├── referrer_source: nil
+   └── 渠道: "Direct"
+
+结果：
+- 创建新会话 S_A3，归属于 "Direct"
+- Salt_A 已被删除，无法追溯 Day 1 的活动
+- 这是隐私设计的预期行为：无法跨天长期追踪同一用户
 ```
 
 ---
 
-## 附录：关键文件位置索引
+## 4. 附录：关键代码位置索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
 | 事件处理管道 | `lib/plausible/ingestion/event.ex` | 130-151 |
 | 机器人检测 (UA) | `lib/plausible/ingestion/event.ex` | 256-276 |
+| 丢弃原因枚举 | `lib/plausible/ingestion/event.ex` | 24-41 |
 | User ID 生成 | `lib/plausible/ingestion/event.ex` | 553-579 |
+| 双盐值查找 | `lib/plausible/session/cache_store.ex` | 24-27 |
+| 会话更新逻辑 | `lib/plausible/session/cache_store.ex` | 95-123 |
+| Engagement 事件处理 | `lib/plausible/session/cache_store.ex` | 44-53 |
 | 盐值管理 | `lib/plausible/session/salts.ex` | 全文 |
-| 会话缓存存储 | `lib/plausible/session/cache_store.ex` | 全文 |
 | 来源解析 | `lib/plausible/ingestion/source.ex` | 全文 |
+| 付费来源检测 | `lib/plausible/ingestion/source.ex` | 13-16, 49-51 |
 | 渠道归因 | `lib/plausible/ingestion/acquisition.ex` | 全文 |
+| maybe_infer_medium | `lib/plausible/ingestion/event.ex` | 312-322 |
+| acquisition_channel 定义 | `lib/plausible/clickhouse_session_v2.ex` | 77 |
 | Shields 屏蔽 | `lib/plausible/shields.ex` | 全文 |
 | 请求构建 | `lib/plausible/ingestion/request.ex` | 全文 |
 | 机器人规则库 | `priv/ua_inspector/bot.bots.yml` | 全文 |
 | 自定义来源 | `priv/custom_sources.json` | 全文 |
+| 盐值轮换测试 | `test/plausible_web/controllers/api/external_controller_test.exs` | 1281-1295 |
+| 渠道分类测试 | `test/plausible/ingestion/acquisition_test.exs` | 全文 |
