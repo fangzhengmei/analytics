@@ -110,6 +110,552 @@ end
    - 处理 ClickHouse 返回的原始数据
    - 计算转化率、流失率等指标
 
+#### 3.3.2 真实漏斗查询接口的门禁条件
+
+在执行 `windowFunnel` 分析之前，系统会应用多层门禁条件来过滤事件数据。这些门禁条件对于结果的准确性至关重要。
+
+**完整的查询执行流程**：
+
+```elixir
+def funnel(_site, query, %Funnel{} = funnel) do
+  goals = Enum.map(funnel.steps, & &1.goal)
+
+  funnel_data =
+    query
+    |> Query.set(preloaded_goals: %{all: [], matching_toplevel_filters: goals})  # 第1层：设置预加载 Goals
+    |> Base.base_event_query()                                                  # 第2层：基础事件查询
+    |> funnel_query(funnel)                                                     # 第3层：Funnel 特定查询
+    |> ClickhouseRepo.all(query: query)
+  ...
+end
+```
+
+**第1层：预加载 Goals 设置**
+
+```elixir
+Query.set(preloaded_goals: %{all: [], matching_toplevel_filters: goals})
+```
+
+这一步将 Funnel 定义的所有 Goals 传递给查询上下文，用于后续的事件名称过滤。
+
+**第2层：基础事件查询门禁**
+
+`Base.base_event_query/1` 函数应用了核心的门禁条件：
+
+```elixir
+def base_event_query(query) do
+  events_q = query_events(query)
+
+  if TableDecider.events_join_sessions?(query) do
+    sessions_q =
+      from(
+        s in query_sessions(query),
+        select: %{session_id: s.session_id},
+        where: s.sign == 1,
+        group_by: s.session_id
+      )
+
+    from(
+      e in events_q,
+      join: sq in subquery(sessions_q),
+      on: e.session_id == sq.session_id
+    )
+  else
+    events_q
+  end
+end
+```
+
+**`query_events/1` 中的门禁条件**：
+
+```elixir
+defp query_events(query) do
+  q =
+    from(e in "events_v2",
+      where: ^SQL.WhereBuilder.build(:events, query),      # 门禁A：基础过滤
+      where: ^SQL.WhereBuilder.derived_name_filter(query)  # 门禁B：事件名称过滤
+    )
+
+  on_ee do
+    q = Plausible.Stats.Sampling.add_query_hint(q, query)  # 门禁C：采样提示
+  end
+
+  q
+end
+```
+
+**详细的门禁条件解析**：
+
+**门禁A：基础过滤 (WhereBuilder.build/2)**
+
+```elixir
+def build(table, query) do
+  base_condition = filter_site_time_range(table, query)
+
+  query.filters
+  |> Enum.map(&add_filter(table, query, &1))
+  |> Enum.reduce(base_condition, fn condition, acc -> dynamic([], ^acc and ^condition) end)
+end
+
+defp filter_site_time_range(table, query) do
+  dynamic([], ^filter_site_id(query) and ^filter_time_range(table, query))
+end
+```
+
+**门禁A1：Site ID 过滤**
+
+```elixir
+defp filter_site_id(query) do
+  case query.consolidated_site_ids do
+    nil ->
+      dynamic([x], x.site_id == ^query.site_id)  # 单站点：精确匹配
+
+    [_ | _] = ids ->
+      dynamic([x], fragment("? in ?", x.site_id, ^ids))  # 多站点：IN 匹配
+  end
+end
+```
+
+**作用**：确保只查询当前站点（或授权的多站点）的事件数据。
+
+**对结果准确性的影响**：
+- **防止跨站点数据污染**：如果没有这个门禁，一个站点的 Funnel 分析可能会包含其他站点的用户行为
+- **数据隔离**：确保多租户环境下的数据安全和准确性
+
+**门禁A2：时间范围过滤**
+
+```elixir
+defp filter_time_range(:events, query) do
+  {first_datetime, last_datetime} = utc_boundaries(query)
+  dynamic([e], e.timestamp >= ^first_datetime and e.timestamp <= ^last_datetime)
+end
+```
+
+**作用**：限制事件数据在用户选择的时间范围内。
+
+**对结果准确性的影响**：
+- **时间一致性**：确保分析的是用户指定时间段内的行为
+- **避免历史数据干扰**：旧数据不会影响当前分析结果
+
+**门禁B：事件名称过滤 (derived_name_filter/1)**
+
+```elixir
+def derived_name_filter(query) do
+  cond do
+    Plausible.Stats.Filters.filtering_on_dimension?(query.filters, "event:goal") ->
+      true  # 已有 Goal 过滤器，不额外限制
+
+    query.preloaded_goals.matching_toplevel_filters != [] ->
+      names = goal_event_names(query.preloaded_goals.matching_toplevel_filters)
+      dynamic([e], e.name in ^names)  # 限制为 Funnel 步骤涉及的事件类型
+
+    :time_on_page not in query.metrics and :scroll_depth not in query.metrics ->
+      dynamic([e], e.name != "engagement")  # 排除 engagement 事件（除非明确需要）
+
+    true ->
+      true
+  end
+end
+
+defp goal_event_names(goals) do
+  goals
+  |> Enum.map(fn goal ->
+    case Plausible.Goal.type(goal) do
+      :event -> goal.event_name   # 自定义事件：使用事件名
+      :page -> "pageview"          # 页面访问：固定为 "pageview"
+      :scroll -> "engagement"      # 滚动深度：固定为 "engagement"
+    end
+  end)
+  |> Enum.uniq()
+end
+```
+
+**作用**：根据 Funnel 定义的 Goals，只查询相关类型的事件。
+
+**对结果准确性的影响**：
+- **减少无关事件干扰**：如果 Funnel 步骤都是页面访问，那么自定义事件（如 "Purchase"）不会被纳入分析
+- **性能优化**：减少需要扫描的数据量
+- **防止误判**：特别是在严格顺序模式下，无关事件可能导致匹配中断
+
+**门禁C：额外的 Site ID 验证**
+
+在 `funnel_query/2` 中还有一层额外的 Site ID 验证：
+
+```elixir
+defp funnel_query(query, funnel_definition) do
+  q_events =
+    from(e in query,
+      select: %{user_id: e.user_id, _sample_factor: fragment("any(_sample_factor)")},
+      where: e.site_id == ^funnel_definition.site_id,  # 额外的 Site ID 验证
+      group_by: e.user_id,
+      order_by: [desc: fragment("step")]
+    )
+    |> select_funnel(funnel_definition)
+  ...
+end
+```
+
+**作用**：双重验证，确保只查询 Funnel 所属站点的数据。
+
+**对结果准确性的影响**：
+- **防御性编程**：即使前面的查询上下文被错误修改，这层验证也能防止跨站点数据
+- **数据一致性**：确保 Funnel 定义和查询数据属于同一站点
+
+**门禁条件汇总表**：
+
+| 门禁条件 | 实现位置 | 过滤逻辑 | 对结果准确性的影响 |
+|---------|---------|---------|-------------------|
+| Site ID 过滤 | `filter_site_id/1` | `site_id == query.site_id` | 防止跨站点数据污染，确保数据隔离 |
+| 时间范围过滤 | `filter_time_range/2` | `timestamp >= first_datetime AND timestamp <= last_datetime` | 确保分析的是指定时间段内的行为 |
+| 事件名称过滤 | `derived_name_filter/1` | `name IN [goal_event_names]` | 减少无关事件干扰，防止严格顺序模式下的误判 |
+| 额外 Site ID 验证 | `funnel_query/2` | `site_id == funnel_definition.site_id` | 双重验证，防御性编程 |
+
+**门禁条件缺失的风险**：
+
+1. **没有 Site ID 过滤**：
+   - 风险：一个站点的 Funnel 分析可能包含其他站点的用户数据
+   - 示例：站点 A 的"浏览产品→购买"Funnel 可能错误地包含站点 B 的购买事件
+
+2. **没有时间范围过滤**：
+   - 风险：分析结果可能包含历史数据，导致转化率虚高或虚低
+   - 示例：用户选择"过去7天"分析，但查询返回了过去30天的数据
+
+3. **没有事件名称过滤**：
+   - 风险：在严格顺序模式下，无关事件可能导致匹配中断
+   - 示例：Funnel 步骤是"页面A→页面B"，但用户在页面A之后触发了"Purchase"事件（不是步骤的一部分），在严格顺序模式下会被误判为中断
+
+4. **没有双重 Site ID 验证**：
+   - 风险：如果查询上下文被错误修改，可能导致数据泄露
+   - 示例：查询参数的 `site_id` 被篡改为其他站点的 ID
+
+#### 3.3.3 严格顺序判定前的事件过滤前提
+
+在理解 `strict_order` 模式的行为之前，必须明确：**`windowFunnel` 函数只在已经经过门禁条件过滤的事件序列中进行匹配**。
+
+**完整的事件处理流程**：
+
+```
+原始事件数据
+    ↓
+【门禁条件过滤】
+├── Site ID 匹配
+├── 时间范围匹配
+└── 事件名称匹配（基于 Funnel 步骤的 Goals）
+    ↓
+【过滤后的事件序列】
+    ↓
+【windowFunnel 匹配】
+├── 按 user_id 分组
+├── 按 timestamp 排序
+└── 应用 strict_order 或普通模式匹配
+    ↓
+【匹配结果】
+```
+
+**关键理解**：严格顺序模式的"中间事件"概念，**只针对已经经过过滤的事件**，而不是原始数据库中的所有事件。
+
+**事件过滤前提的详细分析**：
+
+**第一步：事件名称过滤的具体实现**
+
+从 `goal_condition/3` 函数可以看到不同类型 Goal 的匹配条件：
+
+```elixir
+def goal_condition(goal, imported? \\ false) do
+  type = Plausible.Goal.type(goal)
+  goal_condition(type, goal, imported?)
+end
+
+# 自定义事件 Goal
+defp goal_condition(:event, goal, _) do
+  name_condition = dynamic([e], e.name == ^goal.event_name)
+  
+  if Plausible.Goal.has_custom_props?(goal) do
+    custom_props_condition = build_custom_props_condition(goal.custom_props)
+    dynamic([e], ^name_condition and ^custom_props_condition)
+  else
+    name_condition
+  end
+end
+
+# 页面访问 Goal
+defp goal_condition(:page, goal, false = _imported?) do
+  name_condition = dynamic([e], e.name == "pageview")
+  pathname_condition = page_path_condition(goal.page_path, _imported? = false)
+  base_condition = dynamic([e], ^pathname_condition and ^name_condition)
+  
+  if Plausible.Goal.has_custom_props?(goal) do
+    custom_props_condition = build_custom_props_condition(goal.custom_props)
+    dynamic([e], ^base_condition and ^custom_props_condition)
+  else
+    base_condition
+  end
+end
+
+# 滚动深度 Goal
+defp goal_condition(:scroll, goal, false = _imported?) do
+  pathname_condition = page_path_condition(goal.page_path, _imported? = false)
+  name_condition = dynamic([e], e.name == "engagement")
+  
+  scroll_condition =
+    dynamic([e], e.scroll_depth <= 100 and e.scroll_depth >= ^goal.scroll_threshold)
+  
+  base_condition = dynamic([e], ^pathname_condition and ^name_condition and ^scroll_condition)
+  
+  if Plausible.Goal.has_custom_props?(goal) do
+    custom_props_condition = build_custom_props_condition(goal.custom_props)
+    dynamic([e], ^base_condition and ^custom_props_condition)
+  else
+    base_condition
+  end
+end
+```
+
+**这意味着**：
+
+1. **自定义事件 Goal**：只匹配 `name == goal.event_name` 的事件（可能还需要自定义属性匹配）
+2. **页面访问 Goal**：只匹配 `name == "pageview"` 且路径匹配的事件
+3. **滚动深度 Goal**：只匹配 `name == "engagement"` 且滚动深度达标的事件
+
+**第二步：过滤后事件序列的构成**
+
+假设我们有一个 Funnel：
+- 步骤 1：Goal A（页面访问 `/product`）
+- 步骤 2：Goal B（自定义事件 `AddToCart`）
+
+**门禁条件过滤后的事件序列只包含**：
+- `name == "pageview"` 且 `pathname == "/product"` 的事件（步骤 1 的匹配事件）
+- `name == "AddToCart"` 的事件（步骤 2 的匹配事件）
+
+**不会包含**：
+- 其他页面的 pageview 事件
+- 其他自定义事件（如 `Purchase`、`Signup`）
+- engagement 事件
+
+**第三步：严格顺序模式在过滤后序列中的行为**
+
+现在让我们重新理解严格顺序模式的"中间事件"概念。
+
+**示例场景**：
+
+Funnel 定义（2 步，严格顺序模式）：
+- 步骤 1：浏览产品页面（Goal：页面访问 `/product`）
+- 步骤 2：添加购物车（Goal：自定义事件 `AddToCart`）
+
+**用户实际行为序列（原始数据库）**：
+1. 10:00 - 访问首页（pageview, `/`）
+2. 10:01 - 访问产品页（pageview, `/product`）→ **步骤 1 匹配**
+3. 10:02 - 访问帮助页（pageview, `/help`）
+4. 10:03 - 点击购买按钮（自定义事件 `PurchaseClick`）
+5. 10:04 - 添加购物车（自定义事件 `AddToCart`）→ **步骤 2 匹配**
+
+**经过门禁条件过滤后的事件序列**：
+只保留：
+1. 10:01 - 访问产品页（pageview, `/product`）→ **步骤 1 匹配**
+2. 10:04 - 添加购物车（自定义事件 `AddToCart`）→ **步骤 2 匹配**
+
+过滤掉了：
+- 访问首页（不是步骤 1 的目标路径）
+- 访问帮助页（不是任何步骤的 Goal）
+- 点击购买按钮（不是步骤 2 的事件名）
+
+**严格顺序模式的判定**：
+
+在**过滤后的事件序列**中：
+- 事件 1（步骤 1）之后直接是事件 2（步骤 2）
+- **没有其他事件**！
+
+**结果**：用户被判定为到达步骤 2。
+
+**关键洞察**：
+
+**在非严格顺序模式下结果相同，但原因不同**：
+
+| 模式 | 过滤前序列 | 过滤后序列 | 判定结果 | 原因 |
+|------|-----------|-----------|---------|------|
+| 非严格顺序 | 5 个事件 | 2 个事件 | 步骤 2 | 中间事件被忽略 |
+| 严格顺序 | 5 个事件 | 2 个事件 | 步骤 2 | 过滤后没有中间事件 |
+
+**但如果 Funnel 包含多个同类型的 Goal**：
+
+让我们看一个更复杂的例子：
+
+Funnel 定义（3 步，严格顺序模式）：
+- 步骤 1：访问产品页 A（Goal：页面访问 `/product/A`）
+- 步骤 2：访问产品页 B（Goal：页面访问 `/product/B`）
+- 步骤 3：完成购买（Goal：自定义事件 `Purchase`）
+
+**用户实际行为序列**：
+1. 10:00 - 访问产品页 A（pageview, `/product/A`）→ **步骤 1 匹配**
+2. 10:01 - 访问产品页 C（pageview, `/product/C`）→ **不是任何步骤的 Goal**
+3. 10:02 - 访问产品页 B（pageview, `/product/B`）→ **步骤 2 匹配**
+4. 10:03 - 完成购买（自定义事件 `Purchase`）→ **步骤 3 匹配**
+
+**门禁条件过滤后的事件序列**：
+
+注意：所有 3 个步骤都是 Goal，且：
+- 步骤 1 和 2 都是"页面访问"类型，事件名都是 `"pageview"`
+- 步骤 3 是"自定义事件"类型，事件名是 `"Purchase"`
+
+**事件名称过滤**：
+```elixir
+goal_event_names([步骤1, 步骤2, 步骤3]) = ["pageview", "Purchase"]
+```
+
+**过滤后的事件序列**：
+1. 10:00 - 访问产品页 A（pageview, `/product/A`）→ **步骤 1 匹配**
+2. 10:01 - 访问产品页 C（pageview, `/product/C`）→ **事件名匹配，但不是任何步骤的路径**
+3. 10:02 - 访问产品页 B（pageview, `/product/B`）→ **步骤 2 匹配**
+4. 10:03 - 完成购买（自定义事件 `Purchase`）→ **步骤 3 匹配**
+
+**关键点**：访问产品页 C 的事件**没有被过滤掉**！因为：
+- 事件名是 `"pageview"`，在 `goal_event_names` 列表中
+- 门禁条件的事件名称过滤只看 `e.name`，不看具体的路径匹配
+
+**现在来看严格顺序模式的判定**：
+
+在 `windowFunnel` 函数内部：
+- 它会遍历**过滤后的事件序列**（4 个事件）
+- 但只有在**步骤条件匹配**时才会推进步骤计数
+
+让我们详细分析：
+
+**事件序列（过滤后）**：
+1. 10:00 - pageview, `/product/A`
+2. 10:01 - pageview, `/product/C`
+3. 10:02 - pageview, `/product/B`
+4. 10:03 - Purchase
+
+**严格顺序模式的匹配过程**：
+
+1. **处理事件 1**（pageview, `/product/A`）：
+   - 检查步骤 1 条件：`pathname == "/product/A"` ✓
+   - 步骤计数增加到 1
+   - 等待下一个步骤条件匹配
+
+2. **处理事件 2**（pageview, `/product/C`）：
+   - 检查当前期望的步骤 2 条件：`pathname == "/product/B"` ✗
+   - **这是一个"中间事件"**！（事件在过滤后的序列中，但不匹配当前期望的步骤条件）
+   - **严格顺序模式下，匹配中断**！
+   - 步骤计数保持为 1（不再推进）
+
+3. **处理事件 3**（pageview, `/product/B`）：
+   - 匹配已经中断，不再检查
+   - 步骤计数仍为 1
+
+4. **处理事件 4**（Purchase）：
+   - 匹配已经中断，不再检查
+   - 步骤计数仍为 1
+
+**最终结果**：用户只到达步骤 1！
+
+**对比非严格顺序模式**：
+
+在非严格顺序模式下：
+- 事件 2 不会导致匹配中断
+- 事件 3 会匹配步骤 2
+- 事件 4 会匹配步骤 3
+- **最终结果**：用户到达步骤 3
+
+**两种模式的本质差异**：
+
+| 模式 | 对"中间事件"的定义 | 处理方式 |
+|------|-------------------|---------|
+| 非严格顺序 | 只关心步骤条件的时间顺序 | 中间事件被忽略，继续匹配后续步骤 |
+| 严格顺序 | 任何不匹配当前期望步骤的事件 | 一旦出现，匹配立即中断 |
+
+**这里的"中间事件"是指**：
+在过滤后的事件序列中，出现在步骤 N 和步骤 N+1 之间的、**不匹配步骤 N+1 条件**的事件。
+
+**对结果准确性的影响**：
+
+**严格顺序模式可能导致的"误判"场景**：
+
+**场景 1：同类型 Goal 之间的其他同类事件**
+
+如上面的例子，用户在产品页 A 和产品页 B 之间访问了产品页 C。
+
+- **非严格顺序**：正确判定为到达步骤 3
+- **严格顺序**：错误地判定为只到达步骤 1
+
+**问题**：产品页 C 的访问是一个合理的用户行为，不应该被视为"中断"。
+
+**场景 2：页面访问 Goal 之间的页面浏览**
+
+Funnel：浏览产品页 → 查看购物车 → 完成购买
+
+用户行为：
+1. 浏览产品页 A（步骤 1）
+2. 浏览产品页 B（同类型，不是步骤）
+3. 查看购物车（步骤 2）
+4. 完成购买（步骤 3）
+
+- **非严格顺序**：正确判定为到达步骤 3
+- **严格顺序**：错误地判定为只到达步骤 1
+
+**场景 3：自定义事件 Goal 之间的其他自定义事件**
+
+Funnel：添加购物车 → 开始结账 → 完成购买
+
+用户行为：
+1. 添加购物车（步骤 1）
+2. 应用优惠券（自定义事件，不是步骤）
+3. 开始结账（步骤 2）
+4. 完成购买（步骤 3）
+
+- **非严格顺序**：正确判定为到达步骤 3
+- **严格顺序**：错误地判定为只到达步骤 1
+
+**严格顺序模式的正确使用场景**：
+
+**场景：多步骤表单提交**
+
+Funnel：表单步骤 1 → 表单步骤 2 → 表单步骤 3
+
+用户行为：
+1. 提交表单步骤 1（步骤 1）
+2. 提交表单步骤 2（步骤 2）
+3. 提交表单步骤 3（步骤 3）
+
+- **两种模式**：都正确判定为到达步骤 3
+
+**但如果用户回退**：
+1. 提交表单步骤 1（步骤 1）
+2. 回退到表单步骤 1（重新提交，步骤 1）
+3. 提交表单步骤 2（步骤 2）
+
+- **非严格顺序**：到达步骤 2
+- **严格顺序**：到达步骤 2（步骤 1 的重复匹配是否会中断？取决于具体实现）
+
+**严格顺序模式的设计意图**：
+
+根据 ClickHouse 源代码注释：
+> "When the 'strict_order' is set, it doesn't allow interventions of other events. In the case of 'A->B->D->C', it stops finding 'A->B->C' at the 'D' and the max event level is 2."
+
+**设计意图**：确保事件序列**完全按照指定顺序连续发生**，没有任何"干扰"事件。
+
+**但这与大多数业务场景的期望不符**：
+- 用户在购买过程中浏览其他产品是正常行为
+- 用户在结账过程中应用优惠券是正常行为
+- 这些不应该被视为"中断"
+
+**对结果准确性的影响总结**：
+
+| 因素 | 非严格顺序模式 | 严格顺序模式 |
+|------|--------------|-------------|
+| 同类型 Goal 之间的同类事件 | 正确匹配 | 可能误判为中断 |
+| 不同类型 Goal 之间的其他事件 | 正确匹配 | 正确（这些事件已被门禁过滤） |
+| 业务期望的用户行为 | 符合 | 可能不符合 |
+| 适用场景 | 大多数业务场景 | 极少数严格引导式流程 |
+
+**关键结论**：
+
+1. **门禁条件过滤是严格顺序判定的前提**：只有经过过滤的事件才会进入 `windowFunnel` 匹配
+2. **事件名称过滤的粒度较粗**：只看 `e.name`，不看具体的路径或自定义属性
+3. **严格顺序模式的"中间事件"概念容易被误解**：它指的是过滤后序列中不匹配当前步骤条件的事件
+4. **严格顺序模式可能导致误判**：特别是在同类型 Goal 之间有其他同类事件时
+5. **非严格顺序模式更符合大多数业务场景**：用户在步骤之间的其他正常行为不应该被视为"中断"
+
 ### 3.4 步骤归因深度解析
 
 步骤归因是 Funnel 分析的核心，决定了用户行为如何被映射到 Funnel 步骤中。本节将深入解析其工作原理。
@@ -211,488 +757,4 @@ fragment(
 **示例场景**：
 同样的用户 A 事件序列：
 1. 浏览产品（步骤 1）
-2. 浏览首页（其他事件）→ **匹配中断！**
-3. 添加购物车（步骤 2）
-4. 查看帮助（其他事件）
-5. 完成购买（步骤 3）
-
-**严格顺序判定结果**：用户 A 只到达了步骤 1，因为：
-- 步骤 1 之后立即出现了非预期事件"浏览首页"
-- 匹配过程在步骤 1 之后停止
-- 后续的步骤 2 和步骤 3 不再被考虑
-
-**实际业务影响**：
-
-| 场景 | 非严格顺序 | 严格顺序 | 适用业务场景 |
-|------|-----------|---------|-------------|
-| 电商购买流程 | 用户可以在浏览产品后继续浏览其他页面再回来购买 | 必须严格按照"浏览→加购→购买"连续执行 | 非严格顺序更适合大多数电商场景 |
-| 表单多步提交 | 不适用（表单通常有严格顺序） | 必须严格按照步骤 1→步骤 2→步骤 3 连续填写 | 严格顺序适合引导式流程 |
-| 游戏关卡 | 可以返回玩之前的关卡 | 必须按关卡顺序连续通过 | 视游戏设计而定 |
-
-**关键代码对比**：
-
-两种模式的唯一区别在于查询构造时是否传递 `'strict_order'` 参数：
-
-```elixir
-# 非严格顺序
-dynamic(
-  [q],
-  fragment("windowFunnel(?)(timestamp, ?)", @funnel_window_duration, ^window_funnel_steps)
-)
-
-# 严格顺序
-dynamic(
-  [q],
-  fragment(
-    "windowFunnel(?, 'strict_order')(timestamp, ?)",
-    @funnel_window_duration,
-    ^window_funnel_steps
-  )
-)
-```
-
-这个看似微小的差异，在 ClickHouse 内部会导致完全不同的匹配算法。
-
-#### 3.4.4 时间窗口对结果的影响
-
-**窗口大小定义**：
-
-```elixir
-@funnel_window_duration 86_400
-```
-
-Plausible 固定使用 86400 秒（1 天）作为时间窗口。这个参数对分析结果有重大影响。
-
-**窗口工作原理**：
-
-1. **窗口启动**：当用户触发第一个步骤的事件时，窗口开始计时
-2. **窗口持续**：窗口持续 86400 秒（从第一个匹配事件的时间戳开始）
-3. **窗口内匹配**：只有在窗口内发生的后续步骤才会被计入
-4. **多窗口处理**：如果用户在不同时间段有多个匹配序列，选择最长的那个
-
-**示例场景**：
-
-假设有一个 2 步 Funnel：浏览产品 → 完成购买
-
-**情况 1：所有步骤在窗口内**
-- 第 1 天 10:00：用户浏览产品（步骤 1，窗口启动）
-- 第 1 天 15:00：用户完成购买（步骤 2，在窗口内）
-- **结果**：用户到达步骤 2，转化率计入
-
-**情况 2：步骤 2 在窗口外**
-- 第 1 天 10:00：用户浏览产品（步骤 1，窗口启动）
-- 第 2 天 12:00：用户完成购买（步骤 2，已超过 24 小时窗口）
-- **结果**：用户只到达步骤 1，步骤 2 不计入
-
-**情况 3：多次访问，选择最长链**
-- 第 1 天 10:00：浏览产品（步骤 1，窗口 A 启动）
-- 第 1 天 11:00：浏览产品（步骤 1，窗口 B 启动）
-- 第 1 天 12:00：完成购买（步骤 2，在窗口 B 内）
-- **结果**：选择最长的链（窗口 B：步骤 1→步骤 2），用户到达步骤 2
-
-**窗口大小的业务含义**：
-
-1 天的窗口大小意味着：
-- **转化时效性**：系统认为用户应该在 1 天内完成转化
-- **短期行为分析**：适合分析短期的用户旅程
-- **跨天行为丢失**：如果用户在第 1 天浏览产品，第 2 天购买，这个转化不会被计入
-
-**潜在问题与优化方向**：
-
-当前固定窗口的局限性：
-1. **业务适配性差**：不同业务有不同的转化周期
-   - 电商购买：可能需要几小时到几天
-   - B2B 转化：可能需要几周甚至几个月
-   - 游戏内转化：可能只需要几分钟
-
-2. **无法对比分析**：用户无法看到不同时间窗口下的转化差异
-
-3. **与查询时间范围的关系**：
-   - Funnel 分析有两个时间概念：
-     1. **查询时间范围**：用户选择的分析时间段（如过去 30 天）
-     2. **转化窗口**：固定 1 天
-   - 这两个概念容易混淆，但完全不同
-
-**建议的优化方向**：
-- 允许用户自定义时间窗口（如 1 小时、1 天、7 天、30 天）
-- 在 UI 中明确区分"分析时间范围"和"转化时间窗口"
-- 提供不同窗口大小的对比分析功能
-
-### 3.5 结果计算与状态回填
-
-#### 3.5.1 原始数据处理
-
-ClickHouse 返回的原始数据格式是 `{step_index, visitor_count}`，其中：
-- `step_index`：用户到达的最深步骤（从 0 开始）
-- `visitor_count`：到达该步骤的用户数量
-
-**问题**：这种格式只告诉我们"有多少用户到达了步骤 N"，但没有告诉我们"有多少用户到达了步骤 M（M ≤ N）"。
-
-例如，如果 ClickHouse 返回：
-- {0, 100}：100 个用户未进入漏斗
-- {1, 200}：200 个用户到达了步骤 1（但未到步骤 2）
-- {2, 150}：150 个用户到达了步骤 2（但未到步骤 3）
-- {3, 50}：50 个用户到达了步骤 3
-
-这意味着：
-- 到达步骤 1 的总用户数 = 200 + 150 + 50 = 400
-- 到达步骤 2 的总用户数 = 150 + 50 = 200
-- 到达步骤 3 的总用户数 = 50
-
-**状态回填算法**：
-
-```elixir
-defp backfill_steps(funnel_result, funnel) do
-  funnel_result = Enum.into(funnel_result, %{})
-  max_step = Enum.max_by(funnel.steps, & &1.step_order).step_order
-
-  funnel
-  |> Map.fetch!(:steps)
-  |> Enum.reduce({nil, nil, []}, fn step, {total_visitors, visitors_at_previous, acc} ->
-    # 核心逻辑：累加当前步骤及后续所有步骤的用户数
-    visitors_at_step =
-      step.step_order..max_step
-      |> Enum.map(&Map.get(funnel_result, &1, 0))
-      |> Enum.sum()
-
-    # 累计当前用户数，用于下一次迭代
-    current_visitors = visitors_at_step
-
-    # 第一个步骤的用户数作为总基数
-    total_visitors = total_visitors || current_visitors
-
-    # 计算流失：上一步用户数 - 当前步骤用户数
-    dropoff = if visitors_at_previous, do: visitors_at_previous - current_visitors, else: 0
-
-    # 计算各种转化率指标
-    dropoff_percentage = percentage(dropoff, visitors_at_previous)
-    conversion_rate = percentage(current_visitors, total_visitors)
-    conversion_rate_step = percentage(current_visitors, visitors_at_previous)
-
-    # 构建步骤结果
-    step = %{
-      dropoff: dropoff,
-      dropoff_percentage: dropoff_percentage,
-      conversion_rate: conversion_rate,
-      conversion_rate_step: conversion_rate_step,
-      visitors: visitors_at_step,
-      label: to_string(step.goal)
-    }
-
-    {total_visitors, current_visitors, [step | acc]}
-  end)
-  |> elem(2)
-  |> Enum.reverse()
-end
-```
-
-#### 3.5.2 指标计算详解
-
-**五个核心指标**：
-
-1. **visitors（到达该步骤的访客数）**
-   - 含义：所有到达或超过该步骤的用户总数
-   - 计算：`sum(用户数 for 步骤 N to 最大步骤)`
-   - 示例：步骤 1 的 visitors = 到达步骤 1 的用户 + 到达步骤 2 的用户 + 到达步骤 3 的用户
-
-2. **dropoff（从上个步骤流失的访客数）**
-   - 含义：从上一个步骤流失的用户数量
-   - 计算：`上一步骤 visitors - 当前步骤 visitors`
-   - 示例：如果步骤 1 有 400 人，步骤 2 有 200 人，则 dropoff = 200
-
-3. **dropoff_percentage（流失率百分比）**
-   - 含义：流失用户占上一步骤用户的比例
-   - 计算：`dropoff / visitors_at_previous * 100%`
-   - 示例：200 人流失 / 400 人上一步 = 50% 流失率
-
-4. **conversion_rate（总转化率）**
-   - 含义：从第一个步骤到当前步骤的累计转化率
-   - 计算：`current_visitors / total_visitors * 100%`
-   - 示例：步骤 3 有 50 人 / 步骤 1 有 400 人 = 12.5% 总转化率
-
-5. **conversion_rate_step（步转化率）**
-   - 含义：从上一个步骤到当前步骤的单步转化率
-   - 计算：`current_visitors / visitors_at_previous * 100%`
-   - 示例：步骤 2 有 200 人 / 步骤 1 有 400 人 = 50% 步转化率
-
-**指标关系图**：
-
-```
-步骤 1 (400 人)
-├── 流失：0 人（第一步无流失）
-├── 总转化率：100%
-└── 步转化率：100%
-    ↓
-步骤 2 (200 人)
-├── 流失：200 人 (400-200)
-├── 流失率：50% (200/400)
-├── 总转化率：50% (200/400)
-└── 步转化率：50% (200/400)
-    ↓
-步骤 3 (50 人)
-├── 流失：150 人 (200-50)
-├── 流失率：75% (150/200)
-├── 总转化率：12.5% (50/400)
-└── 步转化率：25% (50/200)
-```
-
-### 3.6 API 层
-
-#### 3.6.1 API 控制器 (PlausibleWeb.Plugins.API.Controllers.Funnels)
-
-**文件位置**：`extra/lib/plausible_web/plugins/API/controllers/funnels.ex`
-
-提供 RESTful API 接口：
-
-1. **创建 Funnel**：`POST /api/funnels`
-   - 支持获取或创建（Get or Create）模式
-   - 验证请求体参数
-   - 检查权限
-
-2. **获取 Funnel 列表**：`GET /api/funnels`
-   - 支持分页（limit, after, before 参数）
-
-3. **获取单个 Funnel**：`GET /api/funnels/:id`
-   - 根据 ID 获取 Funnel 详情
-
-#### 3.6.2 API Schema (PlausibleWeb.Plugins.API.Schemas.Funnel)
-
-**文件位置**：`extra/lib/plausible_web/plugins/API/schemas/funnel.ex`
-
-定义 API 的数据结构和验证规则：
-- Funnel 对象包含 `id`, `name`, `steps` 字段
-- Steps 是 Goal 对象数组，最少 2 个，最多 8 个
-- 提供示例数据用于文档生成
-
-### 3.7 前端展示层
-
-#### 3.7.1 Funnel 配置表单 (PlausibleWeb.Live.FunnelSettings.Form)
-
-**文件位置**：`extra/lib/plausible_web/live/funnel_settings/form.ex`
-
-这是一个 Phoenix LiveComponent，用于创建和编辑 Funnel。
-
-**核心状态管理**：
-
-```elixir
-# 关键状态字段
-socket.assigns = %{
-  goals: goals,                    # 站点可用的所有 Goals
-  site: site,                      # 当前站点
-  evaluation_result: nil,          # 实时预览结果
-  form: form,                      # 表单数据
-  funnel: funnel,                  # 正在编辑的 Funnel（如为编辑模式）
-  strict_order?: false,            # 是否严格顺序
-  funnel_modified?: false,         # Funnel 是否已修改
-  selections_made: %{},            # 已选择的步骤映射："step-1" => %Goal{}
-  step_ids: [1, 2]                 # 步骤 ID 列表
-}
-```
-
-**动态步骤管理流程**：
-
-1. **初始化**：
-   - 加载站点所有 Goals
-   - 最少初始化 2 个步骤
-
-2. **添加步骤**：
-   ```elixir
-   def handle_event("add-step", _value, socket) do
-     step_ids = socket.assigns.step_ids
-     socket = assign(socket, funnel_modified?: true)
-     
-     if length(step_ids) < Funnel.max_steps() do
-       first_free_idx = find_sequence_break(step_ids)
-       new_ids = step_ids ++ [first_free_idx]
-       {:noreply, assign(socket, step_ids: new_ids)}
-     else
-       {:noreply, socket}
-     end
-   end
-   ```
-
-3. **删除步骤**：
-   - 从 `step_ids` 中移除
-   - 从 `selections_made` 中清除对应选择
-   - 触发重新评估
-
-4. **选择 Goal**：
-   - 更新 `selections_made` 映射
-   - 发送 `:evaluate_funnel` 消息触发实时预览
-
-**实时预览机制**：
-
-```elixir
-defp evaluate_funnel(
-       %{
-         assigns: %{
-           site: site,
-           selections_made: selections_made,
-           strict_order?: strict_order?
-         }
-       } = socket
-     ) do
-  with {:ok, {definition, query}} <-
-         build_ephemeral_funnel(site, selections_made, strict_order?: strict_order?),
-       {:ok, funnel} <- Plausible.Stats.funnel(site, query, definition) do
-    assign(socket, evaluation_result: funnel)
-  else
-    _ ->
-      socket
-  end
-end
-```
-
-**临时 Funnel 构建**：
-- 使用 `ephemeral_definition` 创建不保存到数据库的 Funnel
-- 使用上个月的数据进行预览计算
-- 当配置变化时自动重新计算
-
-#### 3.7.2 Funnel 图表组件 (Funnel React 组件)
-
-**文件位置**：`assets/js/dashboard/extra/funnel.js`
-
-**核心渲染逻辑**：
-
-**数据获取流程**：
-1. 从上下文获取站点信息和仪表板状态
-2. 根据 Funnel 名称查找对应的 Funnel ID
-3. 调用 API 获取分析结果
-4. 响应状态变化（如时间范围改变）
-
-**图表配置**：
-
-```javascript
-const config = {
-  plugins: [ChartDataLabels],
-  type: 'bar',
-  data: data,
-  options: {
-    responsive: true,
-    barThickness: calcBarThickness,
-    plugins: {
-      legend: { display: false },
-      tooltip: {
-        enabled: false,
-        mode: 'index',
-        intersect: true,
-        position: 'average',
-        external: FunnelTooltip(palette, funnel)  // 自定义工具提示
-      },
-      datalabels: {
-        formatter: formatDataLabel,  // 显示转化率
-        anchor: 'end',
-        align: 'end',
-        offset: calcOffset,
-        backgroundColor: palette.dataLabelBackground,
-        color: palette.dataLabelTextColor,
-        borderRadius: 4,
-        clip: true,
-        font: {
-          size: 12,
-          weight: 'normal',
-          lineHeight: 1.6,
-          family: fontFamily
-        },
-        textAlign: 'center',
-        padding: { top: 8, bottom: 8, right: 8, left: 8 }
-      }
-    },
-    scales: {
-      y: { display: false },
-      x: {
-        position: 'bottom',
-        display: true,
-        border: { display: false },
-        grid: { drawBorder: false, display: false },
-        ticks: {
-          padding: 8,
-          font: { weight: 'bold', family: fontFamily, size: 14 },
-          color: palette.stepNameLegendColor
-        }
-      }
-    }
-  }
-}
-```
-
-**数据结构**：
-
-```javascript
-const data = {
-  labels: funnel.steps.map((step) => step.label),
-  datasets: [
-    {
-      label: 'Visitors',
-      data: stepData,  // 每个步骤的访客数
-      backgroundColor: gradient,
-      hoverBackgroundColor: gradient,
-      borderRadius: 4,
-      stack: 'Stack 0'
-    },
-    {
-      label: 'Dropoff',
-      data: dropOffData,  // 每个步骤的流失数
-      backgroundColor: createDiagonalPattern(
-        palette.dropoffBackground,
-        palette.dropoffStripes
-      ),
-      hoverBackgroundColor: palette.dropoffBackground,
-      borderRadius: 4,
-      stack: 'Stack 0'
-    }
-  ]
-}
-```
-
-**响应式设计**：
-
-```javascript
-// 检测屏幕尺寸
-useEffect(() => {
-  const mediaQuery = window.matchMedia('(max-width: 768px)')
-  setSmallScreen(mediaQuery.matches)
-  const handleScreenChange = (e) => {
-    setSmallScreen(e.matches)
-  }
-  mediaQuery.addEventListener('change', handleScreenChange)
-  return () => {
-    mediaQuery.removeEventListener('change', handleScreenChange)
-  }
-}, [])
-
-// 条件渲染
-{isSmallScreen && (
-  <div className="mt-4">{renderBars(funnel, theme)}</div>
-)}
-{!isSmallScreen && (
-  <canvas className="" id="funnel" ref={canvasRef}></canvas>
-)}
-```
-
-**小屏幕渲染**：
-- 使用简单的条形图列表
-- 显示步骤名称、访客数
-- 不显示详细的流失率图表
-
-#### 3.7.3 视觉设计细节
-
-**渐变背景**：
-```javascript
-var gradient = ctx.createLinearGradient(900, 0, 900, 900)
-gradient.addColorStop(1, palette.dropoffBackground)
-gradient.addColorStop(0, palette.visitorsBackground)
-```
-
-**斜线图案（流失率）**：
-```javascript
-const createDiagonalPattern = (color1, color2) => {
-  let shape = document.createElement('canvas')
-  shape.width = 10
-  shape.height = 10
-  let c = shape.getContext('2d')
-
-  c.fillStyle = color1
-  c.strokeStyle = color2
-  c.fillRect(0, 0, shape.width, shape.height)
-
+2. 浏览首页（其他事件）→
