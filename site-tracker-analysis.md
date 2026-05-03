@@ -813,6 +813,492 @@ end
 
 ### 4.3 关键边界分支详解
 
+---
+
+## 🔴 附录 A: 最容易误判的边界口径详解
+
+### A.1 域名变更过渡期：数据层宽容 vs 验证层严格
+
+#### 问题背景
+
+用户可能会产生困惑：
+
+> "我刚刚把域名从 `old.com` 改成了 `new.com`，系统说 72 小时过渡期内新旧域名都能接收数据。但为什么验证时还会因为 '域名不匹配' 失败？"
+
+#### 核心矛盾：两层逻辑不一致
+
+| 层级 | 逻辑 | 是否考虑 `domain_changed_from` |
+|-----|------|-------------------------------|
+| **数据接收层** | 宽容：新旧域名都能接收 | ✅ 考虑 |
+| **验证层** | 严格：只匹配当前 `domain` | ❌ 不考虑 |
+
+#### 代码证据
+
+**数据接收层（宽容）** (`lib/plausible/site/cache.ex:95-103`):
+
+```elixir
+@impl true
+def unwrap_cache_keys(items) do
+  Enum.reduce(items, [], fn
+    {domain, nil, object}, acc ->
+      [{domain, object} | acc]  # 只有新域名
+
+    {domain, domain_changed_from, object}, acc ->
+      # ⭐ 关键：新旧域名都映射到同一个站点
+      [{domain, object}, {domain_changed_from, object} | acc]
+  end)
+end
+```
+
+**验证层（严格）** (`extra/lib/plausible/installation_support/verification/diagnostics.ex:87-122`):
+
+```elixir
+# 成功场景
+def interpret(
+      %__MODULE__{
+        test_event: %{
+          "normalizedBody" => %{
+            "domain" => domain  # 实际域名（从事件中提取）
+          },
+          "responseStatus" => response_status
+        },
+        service_error: nil
+      },
+      expected_domain,  # ⭐ 期望域名 = site.domain（新域名）
+      _url
+    )
+  when response_status in [200, 202] and
+         domain == expected_domain,  # ⭐ 严格相等！
+  do: success()
+
+# 域名不匹配场景
+def interpret(
+      %__MODULE__{
+        test_event: %{
+          "normalizedBody" => %{
+            "domain" => domain  # 假设是 old.com（旧域名）
+          },
+          "responseStatus" => response_status
+        },
+        ...
+      },
+      expected_domain,  # 假设是 new.com（新域名）
+      _url
+    )
+  when response_status in [200, 202] and
+         domain != expected_domain,  # old.com != new.com ❌
+  do:
+    error_unexpected_domain(selected_installation_type)
+    |> handled_error()
+```
+
+#### 完整状态机：域名变更过渡期
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    域名变更过渡期的双重标准问题                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                           域名变更前
+                    site.domain = "old.com"
+                    domain_changed_from = nil
+
+                              │
+                              ▼ 执行域名变更
+                              │   site.domain = "new.com"
+                              │   domain_changed_from = "old.com"
+                              │   domain_changed_at = <now>
+                              │
+            ┌─────────────────┴─────────────────┐
+            │                                     │
+            ▼                                     ▼
+┌───────────────────────┐           ┌───────────────────────┐
+│    数据接收层         │           │     验证层            │
+│   (事件 Ingestion)   │           │ (Verification Check)  │
+└───────────────────────┘           └───────────────────────┘
+            │                                     │
+            ▼                                     ▼
+┌───────────────────────┐           ┌───────────────────────┐
+│  查找站点逻辑:         │           │  域名比对逻辑:         │
+│                       │           │                       │
+│  site_cache 中查找:   │           │  严格相等检查:         │
+│  - "new.com" ✅ 找到   │           │  event.domain         │
+│  - "old.com" ✅ 找到   │           │  ==                   │
+│    (通过 domain_changed│           │  site.domain          │
+│     _from 映射)        │           │                       │
+│                       │           │  实际:                │
+│  ⭐ 新旧域名事件都    │           │  "old.com"            │
+│    能被正确接收        │           │  ==                   │
+│                       │           │  "new.com"            │
+│                       │           │  ⭐ 不相等！          │
+│                       │           │                       │
+│                       │           │  结果: "域名不匹配"    │
+│                       │           │       错误 ❌          │
+└───────────────────────┘           └───────────────────────┘
+```
+
+#### 设计取舍分析
+
+| 维度 | 决策 | 原因 | 影响 |
+|-----|------|------|------|
+| **数据层宽容** | 支持 `domain_changed_from` | 平滑迁移，不丢失数据 | 用户体验好 |
+| **验证层严格** | 只比较 `domain == expected_domain` | 强制用户完成迁移 | 过渡期内可能误判 |
+
+**为什么验证层不做同样的宽容？**
+
+从代码看，验证层的 `interpret/3` 函数**没有接收 `site` 对象**，只接收：
+- `diagnostics`（诊断数据）
+- `expected_domain`（字符串，来自 `site.domain`）
+- `url`（访问 URL）
+
+**设计取舍**：
+1. **简单性 > 过渡友好**：验证逻辑只需要一个字符串 `expected_domain`，不需要完整的 Site 对象
+2. **强制完成迁移**：过渡期是"宽限期"，不是"永久支持"，验证严格性可以推动用户尽快更新脚本
+3. **安全性**：验证的目的是确认"当前脚本配置正确"，而不是"历史上曾经正确"
+
+#### 用户视角的正确理解
+
+**用户应该知道**：
+
+| 场景 | 数据能否接收 | 验证能否通过 |
+|-----|-----------|------------|
+| 脚本发送 `new.com`（新域名） | ✅ 能 | ✅ 能通过 |
+| 脚本发送 `old.com`（旧域名） | ✅ 能（过渡期内） | ❌ 会失败（显示"域名不匹配"） |
+
+**过渡期结束后（72小时）**：
+- `domain_changed_from` 被清空
+- 旧域名事件**无法再接收**
+- 验证仍然严格比对
+
+#### 容易混淆的口径纠正
+
+| 错误表述 | 正确表述 |
+|---------|---------|
+| "过渡期内新旧域名**都支持**" | "过渡期内新旧域名**在数据层**都能接收，但**验证层**只认可当前域名" |
+| "验证失败说明脚本有问题" | "验证失败可能只是脚本还在发送旧域名，数据可能仍在正常接收" |
+| "数据能接收说明验证应该通过" | "数据接收和验证是两套独立逻辑，有不同的目标" |
+
+---
+
+### A.2 缓存清理重试：首次结果 vs 缓存重试的诊断分流
+
+#### 问题背景
+
+用户可能会困惑：
+
+> "为什么第一次验证失败，第二次（清缓存后）成功时，系统不显示 'Success!'，而是显示缓存问题警告？"
+
+#### 核心逻辑：三轮检查 + 分流决策
+
+**检查执行顺序** (`extra/lib/plausible/installation_support/verification/checks.ex:37-47`):
+
+```elixir
+checks = [
+  {Checks.Url, []},                              # 第 1 轮：URL 可达性
+  {Checks.VerifyInstallation, [...]},            # 第 2 轮：核心浏览器验证
+  {Checks.VerifyInstallationCacheBust, [...]}    # 第 3 轮：缓存重试
+]
+```
+
+**缓存重试触发条件** (`extra/lib/plausible/installation_support/checks/verify_installation_cache_bust.ex:22-41`):
+
+```elixir
+@impl true
+def perform(%State{url: url} = state, _opts) do
+  case InstallationSupport.Verification.Checks.interpret_diagnostics(state, telemetry?: false) do
+    # 情况 1：已经成功 → 不执行缓存重试
+    %InstallationSupport.Result{ok?: true} ->
+      state
+
+    # 情况 2：未处理错误（如服务内部错误）→ 不执行缓存重试
+    %InstallationSupport.Result{data: %{unhandled: true}} ->
+      state
+
+    # 情况 3：已知安装失败 → 执行缓存重试
+    _known_installation_failure ->
+      reset_diagnostics = %InstallationSupport.Verification.Diagnostics{
+        selected_installation_type: state.diagnostics.selected_installation_type
+      }
+
+      state
+      |> struct!(diagnostics: reset_diagnostics)  # ⭐ 重置诊断（清除前一轮结果）
+      |> struct!(url: InstallationSupport.URL.bust_url(url))  # URL 加随机参数
+      |> InstallationSupport.Checks.VerifyInstallation.perform([])  # 重新验证
+      |> put_diagnostics(diagnostics_are_from_cache_bust: true)  # ⭐ 打标记
+  end
+end
+```
+
+#### 诊断分流决策树
+
+**模式匹配优先级** (`extra/lib/plausible/installation_support/verification/diagnostics.ex:68-122`):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    诊断分流决策树（按优先级）                                        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                       收到诊断数据
+                             │
+                             ▼
+              ┌──────────────────────────────┐
+              │ 检查: diagnostics_are_from_  │
+              │        cache_bust == true?   │
+              │  (是否是缓存重试的结果?)      │
+              └──────────────────────────────┘
+                       │               │
+                  是 │               │ 否
+                       ▼               ▼
+          ┌───────────────┐   ┌──────────────────────────┐
+          │ 缓存重试后    │   │ 检查: domain 匹配?       │
+          │ 成功分支      │   │ response_status ∈ [200, │
+          │               │   │                  202]?   │
+          │ 即使成功也    │   └──────────────────────────┘
+          │ 视为"缓存问题"│              │               │
+          │               │          是 │               │ 否
+          │ 返回:        │              ▼               ▼
+          │ "We detected │    ┌───────────────┐   ┌───────────────┐
+          │  an issue    │    │  普通成功     │   │ 域名不匹配    │
+          │  with your   │    │               │   │ 或其他错误    │
+          │  site's      │    │ 返回:        │   │               │
+          │  cache"      │    │ "Success!"   │   │ 按错误类型    │
+          │               │    │               │   │ 返回对应错误  │
+          │ 用户提示:     │    │ ⭐ 这是真正  │   │               │
+          │ "请清除缓存"  │    │   的"成功"   │   │               │
+          │               │    └───────────────┘   └───────────────┘
+          │ ⭐ 这是"警告 │
+          │   级成功"     │
+          │   不是真正成功 │
+          └───────────────┘
+```
+
+#### 代码证据：分流逻辑
+
+**缓存重试后成功 = 缓存问题错误** (`diagnostics.ex:68-85`):
+
+```elixir
+# 优先级 1：缓存重试后成功（最优先匹配）
+def interpret(
+      %__MODULE__{
+        test_event: %{
+          "normalizedBody" => %{"domain" => domain},
+          "responseStatus" => response_status
+        },
+        service_error: nil,
+        diagnostics_are_from_cache_bust: true  # ⭐ 关键标记
+      },
+      expected_domain,
+      _url
+    )
+    when response_status in [200, 202] and
+           domain == expected_domain,
+    do: handled_error(@error_succeeds_only_after_cache_bust)  # ❌ 返回错误！
+```
+
+**普通成功 = 真正成功** (`diagnostics.ex:87-102`):
+
+```elixir
+# 优先级 2：普通成功（无缓存标记）
+def interpret(
+      %__MODULE__{
+        test_event: %{
+          "normalizedBody" => %{"domain" => domain},
+          "responseStatus" => response_status
+        },
+        service_error: nil
+        # ⭐ 没有 diagnostics_are_from_cache_bust 标记
+      },
+      expected_domain,
+      _url
+    )
+    when response_status in [200, 202] and
+           domain == expected_domain,
+    do: success()  # ✅ 真正的成功
+```
+
+#### 完整状态流转图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    缓存重试诊断分流完整状态机                                        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                        ┌──────────────────┐
+                        │   初始化检查     │
+                        │                  │
+                        │ State.url =      │
+                        │   "https://site" │
+                        │ State.diagnostics │
+                        │   = 空           │
+                        └────────┬─────────┘
+                                 │
+                                 ▼
+                        ┌──────────────────┐
+                        │ 第 1 轮检查      │
+                        │                  │
+                        │ Checks.Verify    │
+                        │   Installation   │
+                        │                  │
+                        │ URL: 无随机参数  │
+                        │ 标记: 无         │
+                        └────────┬─────────┘
+                                 │
+                                 ▼
+              ┌──────────────────┼──────────────────┐
+              │                  │                  │
+              ▼                  ▼                  ▼
+    ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+    │   成功        │   │  未处理错误   │   │  已知失败      │
+    │               │   │               │   │               │
+    │ ok?: true    │   │ unhandled:    │   │ 其他错误类型   │
+    │               │   │ true          │   │               │
+    └───────┬───────┘   └───────┬───────┘   └───────┬───────┘
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+    │ 不执行缓存    │   │ 不执行缓存    │   │ 执行缓存重试  │
+    │ 重试          │   │ 重试          │   │               │
+    │               │   │               │   │ 重置诊断      │
+    │ 直接返回      │   │ 直接返回      │   │ URL 加参数   │
+    │ "Success!"   │   │ 原始错误      │   │ 打标记:       │
+    │               │   │               │   │ cache_bust:   │
+    │ ⭐ 真正成功   │   │               │   │ true          │
+    └───────────────┘   └───────────────┘   └───────┬───────┘
+                                                        │
+                                                        ▼
+                                               ┌──────────────────┐
+                                               │ 第 2 轮检查      │
+                                               │                  │
+                                               │ Checks.Verify    │
+                                               │   Installation   │
+                                               │                  │
+                                               │ URL: 有随机参数  │
+                                               │ 标记: cache_bust │
+                                               └────────┬─────────┘
+                                                        │
+                                    ┌───────────────────┼───────────────────┐
+                                    │                   │                   │
+                                    ▼                   ▼                   ▼
+                           ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+                           │   成功        │   │  失败         │   │ 其他结果      │
+                           │               │   │               │   │               │
+                           │ 但有标记:     │   │ 用第二轮结果  │   │ 用第二轮结果  │
+                           │ cache_bust    │   │               │   │               │
+                           └───────┬───────┘   └───────┬───────┘   └───────┬───────┘
+                                   │                   │                   │
+                                   ▼                   ▼                   ▼
+                           ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+                           │ 返回:         │   │ 返回:         │   │ 返回:         │
+                           │ 缓存问题错误  │   │ 第二轮的错误  │   │ 第二轮结果    │
+                           │               │   │               │   │               │
+                           │ "We detected  │   │               │   │               │
+                           │  an issue     │   │               │   │               │
+                           │  with your    │   │               │   │               │
+                           │  site's cache"│   │               │   │               │
+                           │               │   │               │   │               │
+                           │ ⭐ 不是真正   │   │               │   │               │
+                           │   成功        │   │               │   │               │
+                           └───────────────┘   └───────────────┘   └───────────────┘
+```
+
+#### 设计取舍分析
+
+| 设计决策 | 原因 | 用户体验影响 |
+|---------|------|------------|
+| **缓存重试后成功 = 错误** | 避免报告"成功"但实际是缓存问题 | 用户看到警告，会去清除缓存 |
+| **第二轮诊断完全替换第一轮** | 简化逻辑，只看最终结果 | 第一轮的具体错误信息丢失 |
+| **只有"已知失败"才触发缓存重试** | 不浪费资源重试服务错误 | 服务错误不会被缓存重试掩盖 |
+
+**为什么缓存重试后成功不视为"成功"？**
+
+从模块文档可以看到设计意图 (`verify_installation_cache_bust.ex:1-12`):
+
+```elixir
+@moduledoc """
+If the output of previous checks can not be interpreted as successful,
+as a last resort, we try to bust the cache of the site under test...
+
+The idea is to make sure that any issues we detect will be about the latest version of their website.
+
+We also want to avoid reporting a successful installation if it took a special cache-busting action to make it work.
+"""
+```
+
+**核心原则**：
+> "我们不希望报告'成功安装'，如果需要特殊的缓存破坏操作才能使其工作。"
+
+这意味着：
+- **真正的成功**：第一次检查就成功（说明真实用户访问也会成功）
+- **缓存后成功**：需要清除缓存才能工作（真实用户可能还在访问缓存的旧版本）
+
+#### 测试用例验证
+
+从测试用例可以验证这一逻辑 (`checks_test.exs:380-436`):
+
+```elixir
+describe "VerifyInstallation & VerifyInstallationCacheBust" do
+  test "returns error when it 'succeeds', but only after cache bust" do
+    # 模拟：第一次失败，第二次（缓存后）成功
+    # ...
+    
+    assert_matches %Result{
+                     ok?: false,  # ⭐ 注意：ok? 是 false！
+                     errors: [^any(:string, ~r/.*cache.*/)],  # 提到缓存
+                     recommendations: [
+                       %{
+                         text: ^any(:string, ~r/.*cache.*/),
+                         url: "https://plausible.io/docs/troubleshoot-integration#have-you-cleared-the-cache-of-your-site"
+                       }
+                     ]
+                   } = run_checks(verification_stub) |> Checks.interpret_diagnostics()
+  end
+end
+```
+
+#### 容易混淆的口径纠正
+
+| 错误表述 | 正确表述 |
+|---------|---------|
+| "验证成功了，但显示缓存问题" | "验证没有**真正成功**，只是在清除缓存后才通过，这被视为'缓存问题错误'" |
+| "ok?: true 就是成功" | "ok?: true 只表示**普通成功**，缓存后成功的 ok? 是 false" |
+| "第二轮结果会合并第一轮" | "第二轮诊断**完全替换**第一轮，第一轮的具体错误信息会丢失" |
+| "任何失败都会触发缓存重试" | "只有**已知安装失败**才会重试，服务内部错误（unhandled）不会重试" |
+
+---
+
+## 附录 B: 关键状态节点速查
+
+### B.1 域名变更过渡期关键状态
+
+| 状态变量 | 来源 | 含义 |
+|---------|------|------|
+| `site.domain` | 用户修改 | 当前生效的新域名 |
+| `site.domain_changed_from` | 变更时设置 | 变更前的旧域名 |
+| `site.domain_changed_at` | 变更时设置 | 变更时间（用于计算 72 小时） |
+| `expected_domain` (验证) | `site.domain` | 验证时的期望域名（只有新域名） |
+
+**判定顺序**：
+1. 数据层：`domain == site.domain OR domain == site.domain_changed_from`
+2. 验证层：`domain == site.domain`（**严格相等**）
+
+### B.2 缓存重试关键状态
+
+| 状态变量 | 来源 | 含义 |
+|---------|------|------|
+| `diagnostics_are_from_cache_bust` | 缓存重试时设置 | 标记当前诊断是否来自缓存重试 |
+| `State.diagnostics` | 每次检查后更新 | 当前诊断数据（缓存重试会重置） |
+| `State.url` | 缓存重试时修改 | 访问 URL（缓存重试会加随机参数） |
+
+**判定顺序**（模式匹配优先级）：
+1. **缓存重试后成功** → 缓存问题错误（`handled_error`）
+2. **普通成功** → 真正成功（`success`）
+3. **域名不匹配** → 对应安装类型的错误
+4. **其他失败** → 按错误类型处理
+
+---
+
+### 4.3 关键边界分支详解（续）
+
 #### 分支 1: 自定义 URL 输入
 
 **触发条件**：
