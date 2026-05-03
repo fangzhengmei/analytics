@@ -656,7 +656,1142 @@ from(s in subquery(native_q),
    - 定期检查数据清理任务的执行情况
    - 对于大型系统，考虑单独监控 ClickHouse 的 mutations 队列
 
-## 9. 结论
+## 9. 旧数据访问路径深度分析
+
+本节详细分析从查询请求进入到前端提示显示的完整数据访问路径，包括参数解析、导入数据判定、查询构建合并以及 skip reason 的传递机制。
+
+### 9.1 参数解析流程
+
+查询参数解析是整个数据访问路径的起点，由 `Plausible.Stats.ApiQueryParser` 模块负责。
+
+#### 9.1.1 解析入口与流程
+
+**1. 主解析函数 `parse/2`**
+- 位置：`lib/plausible/stats/api_query_parser.ex:25-46`
+- 流程：
+  1. 首先通过 `JSONSchema.validate(params)` 进行 JSON Schema 验证
+  2. 依次解析各个参数组件：
+     - `parse_input_date_range/1`：解析日期范围
+     - `parse_metrics/1`：解析指标列表
+     - `parse_filters/1`：解析过滤条件
+     - `parse_dimensions/1`：解析维度列表
+     - `parse_order_by/1`：解析排序条件
+     - `parse_pagination/1`：解析分页参数
+     - `parse_include/1`：解析 include 参数（关键！）
+  3. 构建 `ParsedQueryParams` 结构体
+
+#### 9.1.2 Include 参数解析（关键路径）
+
+**1. 默认 Include 配置**
+```elixir
+@default_include %Plausible.Stats.QueryInclude{
+  imports: false,
+  imports_meta: false,
+  time_labels: false,
+  total_rows: false,
+  trim_relative_date_range: false,
+  compare: nil,
+  compare_match_day_of_week: false,
+  legacy_time_on_page_cutoff: nil
+}
+```
+- 位置：`lib/plausible/stats/api_query_parser.ex:8-17`
+- **关键设计**：`imports` 默认值为 `false`，这意味着默认情况下不包含导入数据
+- **设计取舍**：
+  - **理由1（性能）**：导入数据合并需要额外的查询和连接操作，默认禁用可提高性能
+  - **理由2（一致性）**：避免用户意外看到可能已过期的历史数据
+  - **理由3（兼容性）**：保持与旧版本行为的一致性
+
+**2. `parse_include/1` 函数**
+- 位置：`lib/plausible/stats/api_query_parser.ex:299-326`
+- 流程：
+  1. 检查 include 参数是否为 map 类型
+  2. 遍历 map 中的每个键值对
+  3. 验证键是否在 `@allowed_include_keys` 列表中
+  4. 将字符串键转换为原子键
+  5. 使用 `struct!(@default_include, parsed_include_params)` 合并默认值与用户值
+
+**3. 允许的 Include 键**
+```elixir
+@allowed_include_keys Enum.map(Map.keys(@default_include), &Atom.to_string/1)
+```
+- 包括：`imports`、`imports_meta`、`time_labels`、`total_rows` 等
+
+**4. 前端如何请求包含导入数据**
+- 前端需要在 API 请求中显式传递 `include: { imports: true }`
+- 这通常由 `dashboardState.with_imported` 状态控制
+
+### 9.2 导入数据判定逻辑
+
+参数解析完成后，系统在 `QueryBuilder.build/3` 中构建查询并决定是否包含导入数据。
+
+#### 9.2.1 Query 构建流程
+
+**1. `QueryBuilder.build/3` 函数**
+- 位置：`lib/plausible/stats/query_builder.ex:29-67`
+- 关键步骤：
+  1. 解析段（segments）过滤器
+  2. 调用 `do_build/3` 构建基础查询
+  3. 应用一系列验证：
+     - `validate_order_by/1`：验证排序
+     - `validate_custom_props_access/2`：验证自定义属性访问
+     - `validate_case_sensitive_filter_modifier/1`：验证大小写敏感修饰符
+     - `validate_toplevel_only_filter_dimension/1`：验证仅顶层维度
+     - `validate_time_dimension_granularity/1`：验证时间维度粒度
+     - `validate_special_metrics_filters/1`：验证特殊指标过滤器
+     - `validate_behavioral_filters/1`：验证行为过滤器
+     - `validate_filtered_goals_exist/2`：验证过滤的目标存在
+     - `validate_revenue_metrics_access/2`：验证收入指标访问
+     - `validate_metrics/1`：验证指标
+     - `validate_include/1`：验证 include
+  4. **关键步骤**：调用 `Query.put_imported_opts(query, site)` 设置导入选项
+  5. （企业版）应用采样阈值
+
+#### 9.2.2 导入数据判定核心逻辑
+
+**1. `put_imported_opts/2` 函数**
+- 位置：`lib/plausible/stats/query.ex:149-170`
+- 这是决定是否包含导入数据的核心函数
+
+**2. 完整判定流程**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    put_imported_opts/2 执行流程                   │
+├─────────────────────────────────────────────────────────────────┤
+│  1. 获取用户请求: requested? = query.include.imports              │
+│     └─ 来自 API 参数 include.imports                               │
+│                                                                 │
+│  2. 检查站点参数: if site && schema_supports_interval?(query)    │
+│     ├─ 分支A: 条件不满足 → 不处理导入数据                          │
+│     │   └─ 可能原因: 无站点信息 或 时间间隔不支持                   │
+│     │                                                             │
+│     └─ 分支B: 条件满足 → 继续检查                                  │
+│         ├─ 预加载站点的 completed_imports                          │
+│         ├─ 设置 imports_exist = any_completed_imports?(site)     │
+│         └─ 设置 imports_in_range = get_imports_in_range(site, query) │
+│                                                                 │
+│  3. 计算 skip_imported_reason = get_skip_imported_reason(query)  │
+│     └─ 见下文详细分析                                               │
+│                                                                 │
+│  4. 最终决定:                                                      │
+│     include_imported = requested? && is_nil(skip_imported_reason)│
+│     └─ 只有用户请求 且 无跳过原因 才会包含导入数据                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.2.3 Skip Reason 判定逻辑详解
+
+**1. `get_skip_imported_reason/1` 函数**
+- 位置：`lib/plausible/stats/query.ex:191-210`
+- 使用 `cond` 宏按顺序检查条件，**第一个匹配的条件获胜**
+
+**2. 四种 Skip Reason 详解**
+
+| 优先级 | Skip Reason | 触发条件 | 设计含义 |
+|--------|-------------|----------|----------|
+| 1 (最高) | `:unsupported_interval` | `"time:minute" in query.dimensions or "time:hour" in query.dimensions` | 时间粒度过细，导入数据不支持 |
+| 2 | `:no_imported_data` | `not query.imports_exist` | 站点根本没有已完成的导入 |
+| 3 | `:out_of_range` | `query.imports_in_range == []` | 有导入但不在查询时间范围内 |
+| 4 (最低) | `:unsupported_query` | `not Imported.schema_supports_query?(query)` | 查询类型不支持导入数据 |
+
+**3. 各 Skip Reason 深度分析**
+
+**Reason 1: `:unsupported_interval`（时间间隔不支持）**
+
+- **触发条件**：查询维度包含 `time:minute` 或 `time:hour`
+- **位置**：`lib/plausible/stats/query.ex:28-31` 的 `schema_supports_interval?/1` 函数
+- **设计取舍**：
+  - **为什么不支持**：
+    - 导入数据是按天预聚合的（`imported_*` 表使用 `date` 字段）
+    - 分钟级和小时级数据在导入时丢失了细粒度信息
+    - 无法从日聚合数据反推出小时/分钟级数据
+  - **边界情况**：
+    - 查询 `time:day`、`time:week`、`time:month` 都支持
+    - 但 `time:hour` 和 `time:minute` 直接拒绝
+  - **用户提示**：
+    ```elixir
+    @imports_warnings %{
+      unsupported_interval:
+        "Imported stats are not included because the time dimension (i.e. the interval) is too short."
+    }
+    ```
+    位置：`lib/plausible/stats/query_result.ex:18-24`
+
+**Reason 2: `:no_imported_data`（无导入数据）**
+
+- **触发条件**：`query.imports_exist` 为 false
+- **如何设置 `imports_exist`**：
+  ```elixir
+  struct!(query,
+    imports_exist: Plausible.Imported.any_completed_imports?(site),
+    imports_in_range: get_imports_in_range(site, query)
+  )
+  ```
+  位置：`lib/plausible/stats/query.ex:156-159`
+- **`any_completed_imports?/1` 实现**：
+  ```elixir
+  def any_completed_imports?(site) do
+    get_completed_imports(site) != []
+  end
+  ```
+  位置：`lib/plausible/imported.ex:54-57`
+- **设计含义**：
+  - 快速检查是否有任何已完成的导入
+  - 避免不必要的后续检查
+  - 边界：只检查 `completed` 状态的导入，`pending` 和 `importing` 状态不算
+
+**Reason 3: `:out_of_range`（导入数据超出范围）**
+
+- **触发条件**：`query.imports_in_range == []`
+- **如何设置 `imports_in_range`**：
+  ```elixir
+  defp get_imports_in_range(site, query) do
+    in_range = Plausible.Imported.completed_imports_in_query_range(site, query)
+    
+    in_comparison_range =
+      if query.include.compare do
+        comparison_query = Comparisons.get_comparison_query(query)
+        Plausible.Imported.completed_imports_in_query_range(site, comparison_query)
+      else
+        []
+      end
+    
+    in_comparison_range ++ in_range
+  end
+  ```
+  位置：`lib/plausible/stats/query.ex:177-189`
+- **特殊情况**：实时查询 (`:realtime` 或 `:realtime_30m`) 直接返回空列表
+  ```elixir
+  defp get_imports_in_range(_site, %__MODULE__{input_date_range: period})
+       when period in [:realtime, :realtime_30m] do
+    []
+  end
+  ```
+  位置：`lib/plausible/stats/query.ex:172-175`
+- **设计取舍**：
+  - 实时数据本质上是"现在"的数据，导入数据是历史数据
+  - 两者时间范围不可能重叠，所以直接跳过
+- **`completed_imports_in_query_range/2` 实现**：
+  ```elixir
+  def completed_imports_in_query_range(%Site{} = site, %Query{} = query) do
+    date_range = Query.date_range(query)
+    
+    site
+    |> get_completed_imports()
+    |> Enum.reject(fn site_import ->
+      Date.after?(site_import.start_date, date_range.last) or
+        Date.before?(site_import.end_date, date_range.first)
+    end)
+  end
+  ```
+  位置：`lib/plausible/imported.ex:81-91`
+- **判定逻辑**：
+  - 导入的 `start_date` 在查询结束日期 **之后** → 超出范围（未来）
+  - 导入的 `end_date` 在查询开始日期 **之前** → 超出范围（过去）
+  - **否则** → 在范围内
+
+**Reason 4: `:unsupported_query`（查询类型不支持）**
+
+- **触发条件**：`not Imported.schema_supports_query?(query)`
+- **位置**：`lib/plausible/stats/imported/imported.ex:24-26` 的 `schema_supports_query?/1` 函数
+- **实现**：
+  ```elixir
+  def schema_supports_query?(query) do
+    length(Imported.Base.decide_tables(query)) > 0
+  end
+  ```
+- **核心**：调用 `decide_tables/1` 函数，如果返回空列表则不支持
+
+#### 9.2.4 `decide_tables/1` 深度分析
+
+这是决定查询类型是否支持导入数据的核心函数，位置：`lib/plausible/stats/imported/base.ex:77-208`
+
+**1. 主决策流程**
+
+```elixir
+def decide_tables(query) do
+  behavioral_filters = dimensions_used_in_filters(query.filters, behavioral_filters: :only)
+  
+  cond do
+    # 条件1: 行为过滤器
+    length(behavioral_filters) > 0 ->
+      []
+    
+    # 条件2: 自定义属性查询
+    custom_prop_query?(query) ->
+      do_decide_custom_prop_table(query)
+    
+    # 条件3: 普通查询
+    true ->
+      do_decide_tables(query)
+  end
+end
+```
+
+**2. 条件1：行为过滤器（直接拒绝）**
+
+- **什么是行为过滤器**：`has_done` 和 `has_not_done` 操作符
+- **为什么拒绝**：
+  - 行为过滤器需要检查用户会话的事件序列
+  - 导入数据是预聚合的，丢失了原始事件序列信息
+  - 无法从聚合数据判断"用户是否做了 X 然后做了 Y"
+- **设计取舍**：
+  - 这是一个功能限制，而非性能问题
+  - 边界：只要有任何行为过滤器，整个查询都不支持导入数据
+
+**3. 条件2：自定义属性查询（严格限制）**
+
+- **什么是自定义属性查询**：
+  - 维度或过滤器包含 `event:props:url` 或 `event:props:path`
+  - 检查函数 `custom_prop_query?/1`：
+    ```elixir
+    defp custom_prop_query?(query) do
+      dimensions_used_in_filters(query.filters)
+      |> Enum.concat(query.dimensions)
+      |> Enum.any?(&(&1 in @imported_custom_props))
+    end
+    ```
+    位置：`lib/plausible/stats/imported/base.ex:93-97`
+
+- **支持的自定义属性**：
+  ```elixir
+  def imported_custom_props do
+    # NOTE: Keep up to date with `Plausible.Props.internal_keys/1`,
+    # but _ignore_ unsupported keys. Currently, `search_query` is
+    # not supported in imported queries.
+    Enum.map(~w(url path), &("event:props:" <> &1))
+  end
+  ```
+  位置：`lib/plausible/imported.ex:46-52`
+- **注意**：`search_query` 不支持导入查询
+
+- **`do_decide_custom_prop_table/1` 决策逻辑**：
+  位置：`lib/plausible/stats/imported/base.ex:99-150`
+  
+  **必须同时满足两个条件**：
+  
+  **条件A：必须的事件/目标名称过滤器**
+  ```elixir
+  has_required_event_or_goal_name_filter? =
+    query.filters
+    |> Enum.flat_map(fn
+      [:is, "event:name", event_names | _rest] -> event_names
+      [:is, "event:goal", goal_names | _rest] -> goal_names
+      _ -> []
+    end)
+    |> Enum.any?(fn event_or_goal_name ->
+      event_or_goal_name in Plausible.Event.SystemEvents.special_events_for_prop_key(prop_key)
+    end)
+  ```
+  - 必须有 `event:name` 或 `event:goal` 过滤器
+  - 过滤值必须是"特殊事件"（与特定 prop 相关的系统事件）
+  
+  **条件B：无不受支持的过滤器**
+  ```elixir
+  has_unsupported_filters? =
+    query.filters
+    |> dimensions_used_in_filters()
+    |> Enum.any?(&(&1 not in [property, "event:name", "event:goal"]))
+  ```
+  - 除了自定义属性本身、`event:name`、`event:goal` 之外，不能有其他过滤器
+
+  **设计取舍**：
+  - **为什么限制**：
+    - 导入数据的自定义属性存储在 `imported_custom_events` 表的 `link_url` 和 `path` 字段
+    - 这些字段只与特定事件类型相关
+    - 无法支持任意组合的过滤
+  - **边界**：
+    - 只能是单维度查询（或无维度）
+    - 维度只能是 `event:goal`、`event:name` 或时间维度
+
+**4. 条件3：普通查询决策逻辑**
+
+位置：`lib/plausible/stats/imported/base.ex:152-208`
+
+**子情况A：无过滤器、无维度**
+```elixir
+defp do_decide_tables(%Query{filters: [], dimensions: []}), do: ["imported_visitors"]
+```
+- 使用 `imported_visitors` 表
+- 这是最简单的汇总查询
+
+**子情况B：无过滤器、单维度 `event:goal`**
+```elixir
+defp do_decide_tables(%Query{filters: [], dimensions: ["event:goal"]}) do
+  ["imported_pages", "imported_custom_events"]
+end
+```
+- 目标维度需要同时查询页面目标和事件目标
+- 使用两个表：`imported_pages`（页面目标）和 `imported_custom_events`（事件目标）
+
+**子情况C：有过滤器、单维度 `event:goal`**
+位置：`lib/plausible/stats/imported/base.ex:158-180`
+
+决策逻辑：
+```elixir
+filter_dimensions = dimensions_used_in_filters(query.filters)
+filter_goals = query.preloaded_goals.matching_toplevel_filters
+
+any_event_goals? = Enum.any?(filter_goals, fn goal -> Plausible.Goal.type(goal) == :event end)
+any_pageview_goals? = Enum.any?(filter_goals, fn goal -> Plausible.Goal.type(goal) == :page end)
+
+any_event_name_filters? = "event:name" in filter_dimensions or any_event_goals?
+any_page_filters? = "event:page" in filter_dimensions or any_pageview_goals?
+
+any_other_filters? = Enum.any?(filter_dimensions, &(&1 not in ["event:page", "event:name", "event:goal"]))
+
+cond do
+  any_other_filters? -> []  # 其他过滤器 → 不支持
+  any_event_name_filters? and not any_page_filters? -> ["imported_custom_events"]
+  any_page_filters? and not any_event_name_filters? -> ["imported_pages"]
+  true -> []  # 混合或无 → 不支持
+end
+```
+
+**设计取舍**：
+- 页面目标和事件目标在导入数据中存储在不同的表
+- 无法同时查询两种类型的目标（除非没有过滤器）
+- 如果有其他类型的过滤器（如 `visit:source`），直接不支持
+
+**子情况D：其他普通查询**
+位置：`lib/plausible/stats/imported/base.ex:182-208`
+
+决策逻辑：
+```elixir
+table_candidates =
+  dimensions_used_in_filters(query.filters)
+  |> Enum.concat(query.dimensions)
+  |> Enum.reject(&(&1 in @queriable_time_dimensions or &1 == "event:goal"))
+  |> Enum.flat_map(fn
+    "visit:screen" -> ["visit:device"]  # screen 映射到 device
+    dimension -> [dimension]
+  end)
+  |> Enum.map(&@property_to_table_mappings[&1])
+
+filter_goal_table_candidates =
+  query.preloaded_goals.matching_toplevel_filters
+  |> Enum.map(&Plausible.Goal.type/1)
+  |> Enum.map(fn
+    :event -> "imported_custom_events"
+    :page -> "imported_pages"
+    :scroll -> nil
+  end)
+
+case Enum.uniq(table_candidates ++ filter_goal_table_candidates) do
+  [] -> ["imported_visitors"]  # 无明确维度 → 使用 visitors 表
+  [nil] -> []  # 只有滚动目标 → 不支持
+  [candidate] -> [candidate]  # 单一表 → 支持
+  _ -> []  # 多个表 → 不支持（无法跨表 JOIN 聚合数据）
+end
+```
+
+**关键设计限制**：
+- **单一表限制**：只能从一个导入表查询
+- **为什么**：
+  - 导入数据是按维度分离存储的（每个维度一个表）
+  - 表之间没有通用的 JOIN 键（除了 date 和 site_id）
+  - 跨维度聚合会导致数据重复计算
+- **边界情况**：
+  - `visit:screen` 映射到 `visit:device`，使用 `imported_devices` 表
+  - 滚动目标（`:scroll`）不支持导入数据
+
+### 9.3 查询构建与合并路径
+
+当 `include_imported` 为 true 时，系统需要构建并合并原生数据和导入数据的查询。
+
+#### 9.3.1 SQL 查询构建入口
+
+**1. `SQL.QueryBuilder.build/2` 函数**
+- 位置：`lib/plausible/stats/sql/query_builder.ex:17-28`
+- 流程：
+  1. 调用 `QueryOptimizer.split/1` 分割查询（可能生成多个子查询）
+  2. 对每个子查询调用 `build_table_query/3`
+  3. 调用 `join_query_results/2` 合并子查询结果
+  4. 应用排序、分页、总行数选择
+
+**2. `build_table_query/3` 函数**
+- 位置：`lib/plausible/stats/sql/query_builder.ex:34-72`
+- 这是实际构建单表查询的地方
+
+**3. 事件表查询构建（`:events` 类型）**
+位置：`lib/plausible/stats/sql/query_builder.ex:34-53`
+
+```elixir
+defp build_table_query(:events, site, events_query) do
+  q =
+    from(
+      e in "events_v2",
+      where: ^SQL.WhereBuilder.build(:events, events_query),
+      where: ^SQL.WhereBuilder.derived_name_filter(events_query),
+      select: ^select_event_metrics(events_query)
+    )
+
+  on_ee do
+    q = Plausible.Stats.Sampling.add_query_hint(q, events_query)
+  end
+
+  q
+  |> join_sessions_if_needed(events_query)
+  |> build_group_by(:events, events_query)
+  |> merge_imported(site, events_query)  # 关键：合并导入数据
+  |> SQL.SpecialMetrics.add(site, events_query)
+  |> TimeOnPage.merge_legacy_time_on_page(events_query)
+end
+```
+
+**4. 会话表查询构建（`:sessions` 类型）**
+位置：`lib/plausible/stats/sql/query_builder.ex:55-72`
+
+类似事件表，也会调用 `merge_imported/3`
+
+#### 9.3.2 `merge_imported/3` 合并逻辑详解
+
+位置：`lib/plausible/stats/imported/imported.ex:218-311`
+
+**1. 入口检查**
+```elixir
+def merge_imported(q, _, %Query{include_imported: false}), do: q
+```
+- 如果 `include_imported` 为 false，直接返回原生查询
+- 这是一个快速退出路径
+
+**2. 无维度查询（聚合查询）**
+位置：`lib/plausible/stats/imported/imported.ex:220-235`
+
+```elixir
+def merge_imported(q, site, %Query{dimensions: []} = query) do
+  q = paginate_optimization(q, query)
+
+  imported_q =
+    site
+    |> Imported.Base.query_imported(query)
+    |> select_imported_metrics(query)
+    |> paginate_optimization(query)
+
+  from(
+    s in subquery(q),
+    cross_join: i in subquery(imported_q),
+    select: %{}
+  )
+  |> select_joined_metrics(query)
+end
+```
+
+**设计要点**：
+- 使用 `cross_join`（笛卡尔积）
+- 因为两个查询都是单一行的聚合结果
+- 指标通过 `select_joined_metrics/2` 相加
+
+**3. 单维度 `event:goal` 查询（特殊处理）**
+位置：`lib/plausible/stats/imported/imported.ex:237-287`
+
+```elixir
+def merge_imported(q, site, %Query{dimensions: ["event:goal"]} = query) do
+  goal_join_data = Plausible.Stats.Goals.goal_join_data(query)
+
+  Imported.Base.decide_tables(query)
+  |> Enum.map(fn
+    "imported_custom_events" ->
+      # 处理自定义事件目标
+      Imported.Base.query_imported("imported_custom_events", site, query)
+      |> where([i], i.visitors > 0)
+      |> select_merge_as([i], %{
+        dim0: fragment("indexOf(?, ?)", type(^goal_join_data.event_names_imports, {:array, :string}), i.name)
+      })
+      |> select_imported_metrics(query)
+      |> group_by([], selected_as(:dim0))
+      |> where([], selected_as(:dim0) != 0)
+
+    "imported_pages" ->
+      # 处理页面目标
+      Imported.Base.query_imported("imported_pages", site, query)
+      |> where([i], i.visitors > 0)
+      |> where(...)  # 复杂的页面正则匹配逻辑
+      |> join(:inner, [_i], index in fragment("indices"), hints: "ARRAY", on: true)
+      |> group_by([_i, index], index)
+      |> select_merge_as([_i, index], %{dim0: fragment("CAST(?, 'UInt64')", index)})
+      |> select_imported_metrics(query)
+  end)
+  |> Enum.reduce(q, fn imports_q, q ->
+    naive_dimension_join(q, imports_q, query)
+  end)
+end
+```
+
+**设计要点**：
+- 目标查询需要同时处理页面目标和事件目标
+- 使用 `indexOf` 函数匹配目标名称到索引
+- 页面目标使用正则表达式匹配
+- 通过 `naive_dimension_join/3` 简单按维度值连接
+
+**4. 普通维度查询**
+位置：`lib/plausible/stats/imported/imported.ex:289-311`
+
+```elixir
+def merge_imported(q, site, query) do
+  if schema_supports_query?(query) do
+    q = paginate_optimization(q, query)
+
+    imported_q =
+      site
+      |> Imported.Base.query_imported(query)
+      |> where([i], i.visitors > 0)
+      |> group_imported_by(query)
+      |> select_imported_metrics(query)
+      |> paginate_optimization(query)
+
+    from(s in subquery(q),
+      full_join: i in subquery(imported_q),
+      on: ^QueryBuilder.build_group_by_join(query),
+      select: %{}
+    )
+    |> select_joined_dimensions(query)
+    |> select_joined_metrics(query)
+  else
+    q  # 不支持，返回原生查询
+  end
+end
+```
+
+**设计要点**：
+- 使用 `full_join`（全连接）
+- 连接条件由 `build_group_by_join/1` 构建（按所有维度值匹配）
+- 维度和指标分别通过专门函数选择
+
+#### 9.3.3 基础导入查询构建
+
+**1. `query_imported/2` 函数**
+位置：`lib/plausible/stats/imported/base.ex:56-75`
+
+```elixir
+def query_imported(site, query) do
+  [table] = decide_tables(query)
+  query_imported(table, site, query)
+end
+
+def query_imported(table, site, query) do
+  import_ids = Imported.complete_import_ids(site)
+  # Assumption: dates in imported table are in user-local timezone.
+  %{first: date_from, last: date_to} = Query.date_range(query)
+
+  from(i in table,
+    where: i.site_id == ^site.id,
+    where: i.import_id in ^import_ids,
+    where: i.date >= ^date_from,
+    where: i.date <= ^date_to,
+    where: ^Plausible.Stats.Imported.SQL.WhereBuilder.build(query),
+    select: %{}
+  )
+end
+```
+
+**关键过滤条件**：
+1. `site_id`：站点匹配
+2. `import_id`：只查询已完成的导入（包括遗留导入的 `import_id = 0`）
+3. `date` 范围：查询时间范围内的数据
+4. 额外的 WHERE 条件：由 `WhereBuilder.build/1` 生成
+
+**2. `complete_import_ids/1` 函数**
+位置：`lib/plausible/imported.ex:67-79`
+
+```elixir
+def complete_import_ids(site) do
+  imports = get_completed_imports(site)
+  has_legacy? = Enum.any?(imports, fn %{legacy: legacy?} -> legacy? end)
+  ids = Enum.map(imports, fn %{id: id} -> id end)
+
+  # account for legacy imports as well
+  if has_legacy? do
+    [0 | ids]
+  else
+    ids
+  end
+end
+```
+
+**设计要点**：
+- 遗留导入（`legacy: true`）使用特殊的 `import_id = 0`
+- 这是为了兼容旧版本系统中没有 `import_id` 字段的导入数据
+
+#### 9.3.4 维度和指标选择
+
+**1. 导入数据分组**
+位置：`lib/plausible/stats/imported/sql/expression.ex:187-194`
+
+```elixir
+def group_imported_by(q, query) do
+  Enum.reduce(query.dimensions, q, fn dimension, q ->
+    q
+    |> select_group_fields(dimension, shortname(query, dimension), query)
+    |> filter_group_values(dimension)
+    |> group_by([], selected_as(^shortname(query, dimension)))
+  end)
+end
+```
+
+**2. 维度字段选择**
+位置：`lib/plausible/stats/imported/sql/expression.ex:196-304`
+
+不同维度有不同的处理逻辑：
+- `visit:source/referrer`：空值替换为 `"Direct / None"`
+- `event:page`：直接使用 `page` 字段
+- `visit:device/browser/channel`：空值替换为 `"(not set)"`
+- UTM 维度：过滤空值
+- 地理位置：过滤无效值（`"ZZ"` 国家、空地区、0 城市）
+- 时间维度：
+  - `time:month`：`toStartOfMonth(date)`
+  - `time:week`：`weekstart_not_before` 函数
+  - `time:day/hour`：直接使用 `date` 字段
+
+**3. 指标选择**
+位置：`lib/plausible/stats/imported/sql/expression.ex:18-186`
+
+**设计要点**：
+- 不同的表可能有不同的字段名
+- 例如：
+  - `imported_exit_pages` 的访问量使用 `exits` 字段
+  - `imported_entry_pages` 的访问量使用 `entrances` 字段
+  - 普通表使用 `visits` 字段
+- 指标通常使用 `sum()` 聚合
+
+**4. 合并维度和指标**
+位置：`lib/plausible/stats/imported/sql/expression.ex:306-466`
+
+**维度合并**：
+```elixir
+defp select_joined_dimension(q, _dimension, key) do
+  select_merge_as(q, [s, i], %{
+    key => fragment("if(empty(?), ?, ?)", field(s, ^key), field(i, ^key), field(s, ^key))
+  })
+end
+```
+- 优先使用原生数据的维度值（如果非空）
+- 否则使用导入数据的维度值
+
+**指标合并**：
+```elixir
+defp joined_metric(:visitors, _query) do
+  wrap_alias([s, i], %{visitors: s.visitors + i.visitors})
+end
+```
+- 简单相加两个数据源的指标值
+- 比率指标（bounce_rate、visit_duration 等）需要复杂的加权计算
+
+#### 9.3.5 分页优化（高基数维度）
+
+位置：`lib/plausible/stats/imported/imported.ex:331-372`
+
+**1. 优化条件**：
+```elixir
+defp paginate_optimization(q, query) do
+  if is_map(query.pagination) and can_order_by?(query) do
+    n = (query.pagination.limit + query.pagination.offset) * 100
+    
+    q
+    |> QueryBuilder.build_order_by(query)
+    |> limit(^n)
+  else
+    q
+  end
+end
+```
+
+**2. 无法优化的指标**：
+```elixir
+@cannot_optimize_metrics [
+  :exit_rate,
+  :scroll_depth,
+  :percentage,
+  :bounce_rate,
+  :conversion_rate,
+  :group_conversion_rate,
+  :time_on_page
+]
+```
+
+**设计取舍**：
+- **为什么优化**：
+  - 高基数维度（如页面路径）可能有数百万条记录
+  - FULL JOIN 两个大表非常慢
+- **如何优化**：
+  - 分别对两个数据集应用 `LIMIT N * 100`
+  - 只合并前 N 项
+- **权衡**：
+  - 这是有损优化
+  - 真正的前 N 项可能来自任一子查询的前 C 项之外
+  - 但在实践中，前几项通常在两个数据源中都排名靠前
+
+### 9.4 Skip Reason 到前端的传递路径
+
+当 `skip_imported_reason` 被设置后，它需要通过多层传递最终到达前端并显示给用户。
+
+#### 9.4.1 查询结果元数据构建
+
+**1. `QueryResult.from/1` 函数**
+- 位置：`lib/plausible/stats/query_result.ex:47-55`
+- 这是构建 API 响应的入口
+
+**2. `meta/1` 函数**
+位置：`lib/plausible/stats/query_result.ex:57-71`
+
+```elixir
+defp meta(%QueryRunner{} = runner) do
+  %{}
+  |> add_imports_meta(runner.main_query)  # 关键：添加导入元数据
+  |> add_metric_warnings_meta(runner.main_query)
+  |> add_empty_metrics_meta(runner.main_query)
+  |> add_time_labels_meta(runner)
+  # ... 其他元数据
+  |> Enum.sort_by(&elem(&1, 0))
+end
+```
+
+**3. `add_imports_meta/2` 函数**
+位置：`lib/plausible/stats/query_result.ex:73-85`
+
+```elixir
+defp add_imports_meta(meta, %Query{include: include} = query) do
+  if include.imports or include.imports_meta do
+    %{
+      imports_included: query.include_imported,
+      imports_skip_reason: query.skip_imported_reason,
+      imports_warning: @imports_warnings[query.skip_imported_reason]
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.merge(meta)
+  else
+    meta
+  end
+end
+```
+
+**设计要点**：
+- 只有当 `include.imports` 或 `include.imports_meta` 为 true 时才添加这些元数据
+- `imports_warning` 是预定义的用户友好消息
+- 使用 `Map.reject` 过滤掉 `nil` 值
+
+**4. 预定义警告消息**
+位置：`lib/plausible/stats/query_result.ex:18-24`
+
+```elixir
+@imports_warnings %{
+  unsupported_query:
+    "Imported stats are not included in the results because query parameters are not supported. " <>
+      "For more information, see: https://plausible.io/docs/stats-api#filtering-imported-stats",
+  unsupported_interval:
+    "Imported stats are not included because the time dimension (i.e. the interval) is too short."
+}
+```
+
+**注意**：
+- `:no_imported_data` 和 `:out_of_range` 没有预定义警告消息
+- 这是设计决定：这些是"正常"情况，不需要警告用户
+- 只有 `:unsupported_query` 和 `:unsupported_interval` 需要显示警告
+
+#### 9.4.2 API Controller 层传递
+
+**1. 统一查询 API（`query/2`）**
+位置：`lib/plausible_web/controllers/api/stats_controller.ex:40-57`
+
+```elixir
+def query(conn, params) do
+  site = conn.assigns.site
+  now = conn.private[:now]
+
+  with {:ok, %ParsedQueryParams{} = params} <- Dashboard.QueryParser.parse(params, now: now),
+       {:ok, %Query{} = query} <- QueryBuilder.build(site, params, debug_metadata(conn)) do
+    query =
+      if query.include.time_labels do
+        Query.set_include(query, :time_label_result_indices, true)
+      else
+        query
+      end
+
+    json(conn, Plausible.Stats.query(site, query))  # 直接返回 QueryResult
+  else
+    {:error, %QueryError{message: message}} -> bad_request(conn, message)
+  end
+end
+```
+
+- 统一 API 直接返回 `QueryResult`，包含完整的 `meta` 字段
+
+**2. 细分统计 API（如 `sources/2`）**
+位置：`lib/plausible_web/controllers/api/stats_controller.ex:59-97`
+
+```elixir
+def sources(conn, params) do
+  # ... 构建查询 ...
+  
+  %{results: results, meta: meta} = Stats.breakdown(site, query, metrics, pagination)
+  
+  # ... 转换结果 ...
+  
+  if params["csv"] do
+    # ... CSV 导出 ...
+  else
+    json(conn, %{
+      results: res,
+      meta: Stats.Breakdown.formatted_date_ranges(query),
+      skip_imported_reason: meta[:imports_skip_reason]  # 显式提取
+    })
+  end
+end
+```
+
+**设计要点**：
+- 细分 API 不返回完整的 `meta` 对象
+- 只显式提取 `meta[:imports_skip_reason]` 字段
+- 这是为了保持 API 响应格式的兼容性
+- **边界**：细分 API 不传递 `imports_warning`，只传递 `skip_imported_reason`
+
+**3. 所有细分 API 的一致性**
+在 `stats_controller.ex` 中，以下函数都有相同的模式：
+- `sources/2`（第 94 行）
+- `channels/2`（第 134 行）
+- `pages/2`（第 344 行）
+- `entry_pages/2`（第 379 行）
+- `exit_pages/2`（第 414 行）
+- `countries/2`（第 449 行）
+- `regions/2`（第 484 行）
+- `cities/2`（第 519 行）
+- `devices/2`（第 652 行）
+- `browsers/2`（第 695 行）
+- `operating_systems/2`（第 744 行）
+- `custom_events/2`（第 857 行）
+- `conversions/2`（第 908 行）
+- `props/2`（第 946 行）
+- `goals/2`（第 993 行）
+- `utm_mediums/2`（第 1031 行）
+- `utm_sources/2`（第 1078 行）
+- `utm_campaigns/2`（第 1116 行）
+- `utm_contents/2`（第 1154 行）
+- `utm_terms/2`（第 1232 行）
+
+**模式**：
+```elixir
+json(conn, %{
+  results: ...,
+  meta: ...,
+  skip_imported_reason: meta[:imports_skip_reason]
+})
+```
+
+#### 9.4.3 外部 API Controller 传递
+
+**1. `external_stats_controller.ex` 中的处理**
+位置：`lib/plausible_web/controllers/api/external_stats_controller.ex:264-381`
+
+```elixir
+# 处理 imports_warning
+case meta[:imports_warning] do
+  nil -> conn
+  warning -> put_resp_header(conn, "x-warning", warning)
+end
+
+# 处理 imports_skip_reason
+case meta[:imports_skip_reason] do
+  nil -> conn
+  reason -> put_resp_header(conn, "x-imports-skip-reason", Atom.to_string(reason))
+end
+```
+
+**设计要点**：
+- 外部 API 使用 HTTP 响应头传递元数据
+- `x-warning` 头包含用户友好的警告消息
+- `x-imports-skip-reason` 头包含机器可读的原因代码
+- 这是外部 API 与内部 API 的主要区别
+
+#### 9.4.4 前端接收与处理
+
+**1. API 响应解析**
+以 `sources/index.js` 为例，位置：`assets/js/dashboard/stats/sources/index.js:184-248`
+
+```javascript
+const afterFetchData = useCallback((apiResponse) => {
+  setLoading(false)
+  if (apiResponse) {
+    setSkipImportedReason(apiResponse.skip_imported_reason)  // 提取 skip reason
+    if (apiResponse.results && apiResponse.results.length > 0) {
+      setMoreLinkState(MoreLinkState.READY)
+    } else {
+      setMoreLinkState(MoreLinkState.HIDDEN)
+    }
+  } else {
+    setLoading(false)
+    setMoreLinkState(MoreLinkState.HIDDEN)
+  }
+}, [])
+```
+
+**2. 状态管理**
+```javascript
+const [skipImportedReason, setSkipImportedReason] = useState(null)
+```
+
+**3. 警告组件显示**
+位置：`assets/js/dashboard/stats/imported-query-unsupported-warning.js`
+
+```javascript
+export default function ImportedQueryUnsupportedWarning({
+  loading,
+  skipImportedReason,
+  altCondition,
+  message
+}) {
+  const { dashboardState } = useDashboardStateContext()
+  const portalRef = useRef(null)
+  const tooltipMessage =
+    message || 'Imported data is excluded due to applied filters'
+  
+  const show =
+    dashboardState &&
+    dashboardState.with_imported &&  # 用户请求了导入数据
+    skipImportedReason === 'unsupported_query' &&  # 原因是 unsupported_query
+    dashboardState.period !== 'realtime'  # 不是实时查询
+
+  // ... 渲染逻辑
+}
+```
+
+**设计要点**：
+- **只显示 `unsupported_query` 原因**：
+  - `:no_imported_data`：用户没有导入数据，不需要警告
+  - `:out_of_range`：用户选择的时间范围内没有导入数据，正常情况
+  - `:unsupported_interval`：时间粒度过细，前端通常有其他提示
+  - `:unsupported_query`：查询参数不支持，需要提示用户
+- **需要用户请求了导入数据**：`dashboardState.with_imported` 必须为 true
+- **不是实时查询**：实时查询本来就不支持导入数据
+
+**4. 渲染逻辑**
+```javascript
+if (show || altCondition) {
+  return (
+    <FadeIn show={!loading} className="h-4.5">
+      <Tooltip info={tooltipMessage} containerRef={portalRef}>
+        <ExclamationCircleIcon className="mb-1 size-4.5 text-gray-500 dark:text-gray-400" />
+      </Tooltip>
+    </FadeIn>
+  )
+} else {
+  return null
+}
+```
+
+- 显示一个感叹号图标
+- 鼠标悬停时显示工具提示消息
+- 默认消息：`"Imported data is excluded due to applied filters"`
+
+### 9.5 关键分支设计取舍与边界情况总结
+
+#### 9.5.1 设计取舍总览
+
+| 决策点 | 选择 | 理由 | 权衡 |
+|--------|------|------|------|
+| 默认 `imports: false` | 禁用 | 性能、一致性、兼容性 | 用户需要显式请求 |
+| 预聚合存储 | 按维度分表 | 查询性能 | 无法跨维度 JOIN |
+| 单一表限制 | 只查一个表 | 数据正确性 | 限制查询灵活性 |
+| 分页优化 | LIMIT N*100 | 性能 | 有损，可能丢失边缘项 |
+| 行为过滤器 | 不支持 | 数据特性 | 功能限制 |
+| 自定义属性 | 严格限制 | 数据存储方式 | 功能限制 |
+| skip reason 显示 | 只显示 unsupported_query | 用户体验 | 其他原因无提示 |
+
+#### 9.5.2 边界情况详解
+
+**1. 实时查询边界**
+```elixir
+defp get_imports_in_range(_site, %__MODULE__{input_date_range: period})
+     when period in [:realtime, :realtime_30m] do
+  []
+end
+```
+- 实时查询永远不会包含导入数据
+- 这是设计决定：实时数据是"现在"的，导入数据是历史的
+
+**2. 遗留导入边界**
+```elixir
+if has_legacy? do
+  [0 | ids]
+else
+  ids
+end
+```
+- 遗留导入使用 `import_id = 0`
+- 这是为了兼容旧版本系统
+- 边界：在 `delete_imported_stats!/2` 中也有特殊处理
+
+**3. 目标查询边界**
+- 无过滤器 + `event:goal` 维度 → 支持（两个表）
+- 有过滤器 + `event:goal` 维度 → 只能是纯页面或纯事件目标
+- 混合目标类型 → 不支持
+
+**4. 时间维度边界**
+- `time:day/week/month` → 支持
+- `time:hour/minute` → 不支持
+- 边界：`schema_supports_interval?/1` 是第一个检查条件
+
+**5. 分页优化边界**
+- 有分页参数 + 可排序 → 应用优化
+- 无可排序指标 → 不应用优化
+- 比率指标（bounce_rate 等）→ 不应用优化
+
+#### 9.5.3 完整数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         旧数据访问完整数据流                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 用户操作                                                                 │
+│     └─ 前端设置 dashboardState.with_imported = true                         │
+│                                                                             │
+│  2. API 请求                                                                 │
+│     └─ 传递 include: { imports: true } 参数                                 │
+│                                                                             │
+│  3. 参数解析 (ApiQueryParser)                                               │
+│     ├─ parse_include/1 → 验证并转换参数                                    │
+│     └─ @default_include 中 imports: false 被覆盖为 true                    │
+│                                                                             │
+│  4. 查询构建 (QueryBuilder)                                                 │
+│     ├─ do_build/3 → 构建基础 Query 结构体                                   │
+│     └─ put_imported_opts/2 → 关键决策点                                    │
+│         ├─ 检查 schema_supports_interval? → time:hour/minute?              │
+│         ├─ 检查 imports_exist → 有已完成导入？                              │
+│         ├─ 检查 imports_in_range → 导入在查询范围内？                        │
+│         ├─ 检查 schema_supports_query? → decide_tables 返回空？             │
+│         └─ 设置 skip_imported_reason 和 include_imported                    │
+│                                                                             │
+│  5. SQL 构建 (SQL.QueryBuilder)                                             │
+│     ├─ build_table_query → 构建原生数据查询                                 │
+│     └─ merge_imported/3 → 条件合并                                          │
+│         ├─ include_imported == false → 直接返回                              │
+│         └─ include_imported == true → FULL JOIN 两个子查询                   │
+│             ├─ 构建 imported_q (imported_* 表)                              │
+│             ├─ 应用 paginate_optimization (如有)                            │
+│             └─ select_joined_dimensions + select_joined_metrics            │
+│                                                                             │
+│  6. 结果构建 (QueryResult)                                                   │
+│     └─ add_imports_meta/2 → 添加到 meta 字段                                │
+│         ├─ imports_included: true/false                                     │
+│         ├─ imports_skip_reason: reason | nil                                │
+│         └─ imports_warning: message | nil                                    │
+│                                                                             │
+│  7. API 响应 (StatsController)                                              │
+│     ├─ 统一 API → 直接返回完整 meta                                          │
+│     └─ 细分 API → 只提取 skip_imported_reason                               │
+│                                                                             │
+│  8. 前端处理                                                                 │
+│     ├─ afterFetchData → 保存 skipImportedReason 状态                        │
+│     └─ ImportedQueryUnsupportedWarning → 条件显示                           │
+│         ├─ 检查 with_imported == true                                       │
+│         ├─ 检查 skipImportedReason == 'unsupported_query'                   │
+│         └─ 显示感叹号图标 + 工具提示                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 10. 结论
 
 Plausible Analytics 系统设计了一套完善的数据保留策略、导入导出流程和历史数据查询兼容机制，通过以下核心原则实现了高效的数据生命周期管理：
 
@@ -664,5 +1799,12 @@ Plausible Analytics 系统设计了一套完善的数据保留策略、导入导
 2. **格式一致，双向兼容**：导入和导出使用相同的表结构，确保数据可自由迁移
 3. **异步操作，批量处理**：利用 ClickHouse 的特性，实现高效的大规模数据操作
 4. **元数据驱动，灵活管理**：通过详细的元数据记录，支持导入的全生命周期管理
+5. **精细判定，透明反馈**：通过多层 skip reason 机制，精确判定不包含导入数据的原因，并通过 API 和前端反馈给用户
 
 这套机制不仅满足了当前的业务需求，也为未来的功能扩展和性能优化奠定了坚实的基础。通过遵循最佳实践和持续改进，系统可以更好地支持用户的数据分析需求。
+
+**新增的关键洞察**：
+- **默认禁用导入数据**是性能和一致性的平衡选择
+- **单一表限制**是数据正确性的保障，但也限制了查询灵活性
+- **skip reason 的四层判定**（时间间隔 → 存在性 → 范围 → 查询类型）是精心设计的优先级
+- **前端只显示 `unsupported_query`** 是用户体验的精细化设计：其他原因要么是"正常"情况，要么有其他提示机制
