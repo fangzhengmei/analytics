@@ -98,6 +98,7 @@ end
 |------|--------|------|
 | `sign` | 1 | ClickHouse MergeTree 签名（1表示新增） |
 | `session_id` | 随机UInt64 | 唯一会话标识 |
+| `user_id` | event.user_id | 用户标识（使用当前盐值生成） |
 | `start` | 事件时间 | 会话开始时间 |
 | `timestamp` | 事件时间 | 最后活动时间 |
 | `duration` | 0 | 会话时长（秒） |
@@ -181,6 +182,35 @@ utc_time_range =
   |> DateTimeRange.to_timezone("Etc/UTC")
 ```
 
+**时间窗口起止边界定义**（`lib/plausible/stats/datetime_range.ex:23-58`）：
+
+| 输入类型 | 起始边界 | 结束边界 | 时区归属 |
+|---------|---------|---------|----------|
+| `Date` 范围 | `00:00:00 | `23:59:59` | 站点时区 |
+| `DateTime` 范围 | 原值（秒截断） | 原值（秒截断） | 输入时区 |
+
+```elixir
+def new!(%Date{} = first, last, timezone) do
+  first =
+    case DateTime.new(first, ~T[00:00:00], timezone) do
+      {:ok, datetime} -> datetime
+      {:gap, _just_before, just_after} -> just_after
+      {:ambiguous, _first_datetime, second_datetime} -> second_datetime
+    end
+  ...
+end
+
+def new!(%Date{} = last, timezone) do
+  last =
+    case DateTime.new(last, ~T[23:59:59], timezone) do
+      {:ok, datetime} -> datetime
+      {:gap, just_before, _just_after} -> just_before
+      {:ambiguous, first_datetime, _second_datetime} -> first_datetime
+    end
+  ...
+end
+```
+
 **UTC边界计算**（`lib/plausible/stats/time.ex:8-28`）：
 
 ```elixir
@@ -198,25 +228,65 @@ def utc_boundaries(%Query{
 end
 ```
 
-### 2.2 时间维度粒度
+### 2.2 自动时间分桶口径
 
-**支持的时间维度**（`lib/plausible/stats/sql/expression.ex:52-162`）：
+**自动粒度选择规则**（`lib/plausible/stats/query_optimizer.ex:95-102`）：
 
-| 时间维度 | 粒度 | 适用场景 | 特殊处理 |
-|---------|------|---------|---------|
-| `time:minute` | 分钟 | 实时监控 | 仅支持≤30小时范围 |
-| `time:hour` | 小时 | 日内分析 | 支持涂抹机制 |
-| `time:day` | 天 | 日常报告 | 按站点时区截断 |
-| `time:week` | 周 | 周度趋势 | 周起始日期对齐 |
-| `time:month` | 月 | 月度报告 | 月初对齐 |
+系统根据查询时间范围自动选择时间分桶粒度：
 
-**会话时间涂抹（Smearing）机制**（`lib/plausible/stats/table_decider.ex:123-141`）：
+| 时间范围 | 自动选择维度 | 分桶规则 |
+|---------|-------------|----------|
+| ≤ 48 小时 | `time:hour` | 按小时截断（`toStartOfHour`） |
+| ≤ 40 天 | `time:day` | 按天截断（`toDate`） |
+| ≤ 52 周 | `time:week` | 按周截断（周一为起始） |
+| > 52 周 | `time:month` | 按月截断（月初为起始） |
+
+```elixir
+defp resolve_time_dimension(first, last) do
+  cond do
+    DateTime.diff(last, first, :hour) <= 48 -> "time:hour"
+    DateTime.diff(last, first, :day) <= 40 -> "time:day"
+    Plausible.Times.diff(last, first, :week) <= 52 -> "time:week"
+    true -> "time:month"
+  end
+end
+```
+
+**各时间维度的分桶实现**（`lib/plausible/stats/sql/expression.ex:52-162`）：
+
+| 时间维度 | SQL 分桶函数 | 时区处理 | 说明 |
+|---------|-------------|---------|------|
+| `time:minute` | `toStartOfMinute(toTimeZone(timestamp, timezone))` | 站点时区 | 实时监控粒度 |
+| `time:hour` | `toStartOfHour(toTimeZone(timestamp, timezone))` | 站点时区 | 日内分析，支持涂抹 |
+| `time:day` | `toDate(toTimeZone(timestamp, timezone))` | 站点时区 | 日常报告 |
+| `time:week` | `weekstart_not_before(..., date_range.first)` | 站点时区 | 周起始对齐查询起始日期 |
+| `time:month` | `toStartOfMonth(toTimeZone(timestamp, timezone))` | 站点时区 | 月初对齐 |
+
+**周起始对齐逻辑**：
+
+周维度有特殊的对齐逻辑，确保周桶与查询起始日期对齐：
+
+```elixir
+def select_dimension(q, key, "time:week", _table, query) do
+  date_range = Query.date_range(query)
+
+  select_merge_as(q, [t], %{
+    key =>
+      weekstart_not_before(
+        to_timezone(t.timestamp, ^query.timezone),
+        ^date_range.first
+      )
+  })
+end
+```
+
+### 2.3 会话时间涂抹（Smearing）机制
 
 **问题背景**：
 - 一个会话可能跨越多个时间边界（如从 14:55 到 15:10）
 - 简单按 `session.start` 或 `session.timestamp` 分组会导致统计偏差
 
-**解决方案**（`lib/plausible/stats/table_decider.ex:127-137`）：
+**涂抹触发条件**（`lib/plausible/stats/table_decider.ex:127-137`）：
 
 ```elixir
 @smearable_metrics [:visitors, :visits]
@@ -242,7 +312,8 @@ end
 
 **SQL实现**（`lib/plausible/stats/sql/expression.ex:117-133`）：
 
-使用 ClickHouse 的 `timeSlots` 函数将会话时间切分为15分钟槽位：
+使用 ClickHouse 的 `timeSlots` 函数将会话时间切分为槽位：
+
 ```elixir
 defmacrop time_slots(query, period_in_seconds, first, last) do
   quote do
@@ -267,12 +338,20 @@ defmacrop time_slots(query, period_in_seconds, first, last) do
 end
 ```
 
+**涂抹边界处理**：
+
+| 参数 | 计算方式 | 说明 |
+|------|---------|------|
+| 开始时间 | `greatest(session.start, query.first)` | 取会话开始和查询开始的较大值 |
+| 结束时间 | `least(session.timestamp, query.last)` | 取会话结束和查询结束的较小值 |
+| 槽位间隔 | 15分钟（hour）或 60秒（minute） | 支持非整小时时区 |
+
 **时区注意事项**：
 - ClickHouse 的 `timeSlots` 基于 Unix 时间戳，**无时区感知**
 - 对于非整小时偏移的时区（如 Asia/Katmandu, GMT+5:45），使用15分钟槽位
 - 后续通过 `toStartOfHour` 合并为小时级统计
 
-### 2.3 部分时间桶处理
+### 2.4 部分时间桶处理
 
 **实时数据的部分桶标记**（`lib/plausible/stats/time.ex:123-153`）：
 
@@ -300,17 +379,17 @@ def partial_time_labels(time_labels, query) do
 end
 ```
 
-### 2.4 时间标签生成
+### 2.5 时间标签生成
 
 **各维度的时间标签**（`lib/plausible/stats/time.ex:48-121`）：
 
-| 维度 | 标签格式 | 示例 |
-|------|---------|------|
-| `time:minute` | `YYYY-MM-DD HH:MM:00` | `2024-01-15 14:30:00` |
-| `time:hour` | `YYYY-MM-DD HH:00:00` | `2024-01-15 14:00:00` |
-| `time:day` | `YYYY-MM-DD` | `2024-01-15` |
-| `time:week` | `YYYY-MM-DD`（周一） | `2024-01-15` |
-| `time:month` | `YYYY-MM-DD`（月初） | `2024-01-01` |
+| 维度 | 标签格式 | 示例 | 时区归属 |
+|------|---------|------|----------|
+| `time:minute` | `YYYY-MM-DD HH:MM:00` | `2024-01-15 14:30:00` | 站点时区 |
+| `time:hour` | `YYYY-MM-DD HH:00:00` | `2024-01-15 14:00:00` | 站点时区 |
+| `time:day` | `YYYY-MM-DD` | `2024-01-15` | 站点时区 |
+| `time:week` | `YYYY-MM-DD`（周一） | `2024-01-15` | 站点时区，对齐查询起始 |
+| `time:month` | `YYYY-MM-DD`（月初） | `2024-01-01` | 站点时区 |
 
 ---
 
@@ -345,46 +424,97 @@ end
 | `root_domain` | 根域名 | 高 |
 | `salt` | 每日轮换盐值 | **每日变化** |
 
-### 3.2 盐值轮换机制
+### 3.2 盐值管理机制
 
-**双盐值设计**（`lib/plausible/session/cache_store.ex:24-25`）：
+**双盐值设计**（`lib/plausible/session/salts.ex`）：
 
 系统维护两个盐值以确保平滑过渡：
+
+```elixir
+def refresh(name, now) do
+  salts = Repo.all(from s in "salts", select: s.salt, order_by: [desc: s.id], limit: 2)
+
+  state =
+    case salts do
+      [current, prev] ->
+        %{previous: prev, current: current}
+
+      [current] ->
+        %{previous: nil, current: current}
+
+      [] ->
+        new = generate_and_persist_new_salt(now)
+        %{previous: nil, current: new}
+    end
+  ...
+end
+
+defp clean_old_salts(now) do
+  h48_ago = DateTime.shift(now, hour: -48)
+  Repo.delete_all(from s in "salts", where: s.inserted_at < ^h48_ago)
+end
+```
+
+**盐值生命周期**：
+
+| 状态 | 持续时间 | 说明 |
+|------|---------|------|
+| `current` | 约1天 | 用于生成新事件的 `user_id` |
+| `previous` | 约1天 | 用于盐值切换时的会话查找 |
+| 清理 | 超过48小时 | 从数据库删除 |
+
+### 3.3 跨盐值会话衔接机制
+
+**双盐值会话查找**（`lib/plausible/session/cache_store.ex:24-25`）：
+
+这是理解跨盐值会话衔接的核心逻辑：
 
 ```elixir
 found_session =
   find_session(event, event.user_id) || find_session(event, prev_user_id)
 ```
 
-**盐值获取逻辑**（`lib/plausible/ingestion/event.ex:383-396`）：
+**事件处理中的盐值生成**（`lib/plausible/ingestion/event.ex:414-425`）：
 
 ```elixir
-defp put_salts(%__MODULE__{} = event, _context) do
-  %{event | salts: Plausible.Session.Salts.fetch()}
-end
+defp register_session(%__MODULE__{} = event, context) do
+  ...
+  previous_user_id =
+    generate_user_id(
+      event.request,
+      event.domain,
+      event.clickhouse_event.hostname,
+      event.salts.previous  # 使用前一个盐值
+    )
 
-defp put_user_id(%__MODULE__{} = event, _context) do
-  update_event_attrs(event, %{
-    user_id:
-      generate_user_id(
-        event.request,
-        event.domain,
-        event.clickhouse_event_attrs.hostname,
-        event.salts.current  # 使用当前盐值
-      )
-  })
+  case Plausible.Ingestion.Persistor.persist_event(event, previous_user_id, persistor_opts) do
+    ...
+  end
 end
 ```
 
-**盐值轮换影响**：
+**跨盐值会话衔接的实际行为**：
 
-| 场景 | 行为 | 结果 |
-|------|------|------|
-| 同一天内 | 使用 `current` 盐值 | 同一访客生成相同 `user_id` |
-| 盐值切换日 | 先用 `current` 查找，再用 `previous` | 尽可能保持会话连续性 |
-| 次日 | 新 `current` 盐值 | **同一访客生成不同 `user_id`** |
+假设盐值从 S1 轮换到 S2，同一访客持续活动：
 
-### 3.3 新老访客区分的实际状态
+| 时间点 | 盐值状态 | 事件 `user_id` | 会话 `user_id` | 行为 |
+|--------|----------|----------------|----------------|------|
+| T1（S1期间） | `current=S1`, `previous=nil` | U1（S1生成） | U1（S1生成） | 创建新会话，存储 U1 |
+| T2（盐值刚轮换后） | `current=S2`, `previous=S1` | U2（S2生成） | U1（保持不变） | 先找 U2 失败，再找 U1 成功，会话延续，`session.user_id 保持 U1 |
+| T3（S2期间） | `current=S2`, `previous=S1` | U2（S2生成） | U1（保持不变） | 同一会话延续，事件用 U2，会话用 U1 |
+
+**关键发现：事件表与会话表的 `user_id` 不一致**：
+
+当会话跨盐值延续时：
+
+| 数据表 | `user_id` 来源 | 存储值 |
+|---------|----------------|--------|
+| `events_v2` | 每次事件生成时的 `current` 盐值 | U2（S2生成） |
+| `sessions_v2` | 会话**创建时**的盐值 | U1（S1生成） |
+
+**这导致 `visitors` 指标在不同查询路径下可能不一致！**
+
+### 3.4 新老访客区分的实际状态
 
 **重要发现：v2 模型无显式新访客标记**
 
@@ -422,10 +552,11 @@ end
 | 限制因素 | 影响 |
 |---------|------|
 | **盐值每日轮换** | 同一访客跨天会有不同 `user_id`，无法追踪长期历史 |
+| **跨盐值会话 `user_id` 不一致** | 事件表和会话表的 `user_id` 可能不同，影响判定 |
 | **无持久化存储** | 每次查询需要全表扫描历史数据，性能极低 |
 | **IP/UA变化** | 网络环境变化导致 `user_id` 变化，误判为新访客 |
 
-### 3.4 访客统计的实际口径
+### 3.5 访客统计的实际口径
 
 **当前实现的访客统计**（`lib/plausible/stats/sql/expression.ex:302-312`）：
 
@@ -467,7 +598,7 @@ end
 - **不区分**新访客和老访客
 - `uniq(user_id)` 只是去重计数，不是"独立访客"在传统意义上的新老区分
 
-### 3.5 实时访客统计
+### 3.6 实时访客统计
 
 **当前访客计算**（`lib/plausible/stats/current_visitors.ex:6-19`）：
 
@@ -533,11 +664,37 @@ end
 - `retention_rate`
 - `cohort_*` 类指标
 
-### 4.2 基于现有数据结构的潜在留存计算
+### 4.2 留存窗口定义（理论框架）
+
+**留存分析的核心概念**：
+
+| 概念 | 定义 | 时区归属 |
+|------|------|----------|
+| **基准日（Cohort Date） | 用户首次访问的日期 | 站点时区 |
+| **N日窗口** | 从基准日开始的N天内 | 站点时区 |
+| **回访判定** | 用户在N日内是否有活动 | 站点时区 |
+
+**时间窗口边界（理论）：
+
+```
+基准日（Day 0）：
+  起始：`toDate(first_visit_timestamp) in 站点时区
+  结束：同日期 23:59:59 站点站点 站点 站点站点 站点
+
+N日留存窗口（Day N）：
+  起始：基准日 + N天 00:00:00 站点时区
+  结束：基准日 + N天 23:59:59 站点站点 站点站点 站点站点 站点站点
+
+示例：3日留存率
+  基准日：2024-01-01 00:00:00 到 2024-01-01 23:59:59 站点时区
+  回访窗口：2024-01-04 00:00:00 到 2024-01-04 23:59:59 站点站点站点站点站点站点
+```
+
+### 4.3 基于现有数据结构的潜在留存计算
 
 如需实现留存分析，可基于现有数据进行**二次计算**。以下是理论上的实现方式：
 
-#### 4.2.1 同期群（Cohort）分析框架
+#### 4.3.1 同期群（Cohort）分析框架
 
 **同期群定义**：按首次访问时间分组
 
@@ -548,8 +705,9 @@ end
 **但存在的问题**：
 - 无 `first_visit_date` 字段
 - `user_id` 每日变化，无法长期追踪
+- 跨盐值会话 `user_id` 不一致
 
-#### 4.2.2 单日新老访客区分（理论实现）
+#### 4.3.2 单日新老访客区分（理论实现）
 
 ```elixir
 # 伪代码：单日新老访客统计
@@ -580,7 +738,7 @@ def daily_new_returning_visitors(site_id, date) do
 end
 ```
 
-#### 4.2.3 留存率计算（理论实现）
+#### 4.3.3 留存率计算（理论实现）
 
 ```elixir
 # 伪代码：N日留存率
@@ -618,30 +776,37 @@ def retention_rate(site_id, cohort_date, days_later) do
 end
 ```
 
-### 4.3 盐值轮换对留存分析的根本性影响
+### 4.4 盐值轮换对留存分析的根本性影响
 
 **核心问题说明**：
 
 ```
-场景：同一访客连续3天访问站点
+场景：同一访客连续3天访问站点，且会话持续活动（30分钟内）
 
-第1天（盐值 S1）：
-  user_id = SipHash(S1, UA + IP + ...) = U1
-  活动记录：events_v2 中存储 U1
+第1天（盐值 S1，创建会话）：
+  事件 user_id = SipHash(S1, UA + IP + ...) = U1
+  会话 user_id = U1（创建时 S1）
+  活动记录：events_v2 存储 U1，sessions_v2 存储 U1
 
-第2天（盐值 S2）：
-  user_id = SipHash(S2, UA + IP + ...) = U2  (≠ U1)
-  活动记录：events_v2 中存储 U2
-  ← 系统会尝试用 S1 查找会话，但新事件用 S2 生成
+盐值轮换 S1 → S2，会话通过双盐值查找延续
+
+第2天（盐值 S2，会话延续）：
+  事件 user_id = SipHash(S2, UA + IP + ...) = U2（≠ U1）
+  会话 user_id = U1（保持不变）
+  活动记录：events_v2 存储 U2，sessions_v2 存储 U1
+  ← 两个表的 user_id 不一致！
 
 第3天（盐值 S3）：
-  user_id = SipHash(S3, UA + IP + ...) = U3  (≠ U1, ≠ U2)
-  活动记录：events_v2 中存储 U3
+  事件 user_id = SipHash(S3, UA + IP + ...) = U3（≠ U1, ≠ U2）
+  会话 user_id = 取决于是否跨盐值延续情况
+  活动记录：events_v2 存储 U3，sessions_v2 存储 会话创建时的盐值
 
 留存分析（查询第1天访客在第3天是否回访）：
-  第1天 user_id 集合：{U1}
-  第3天 user_id 集合：{U3}
-  交集：{}（空集）
+  第1天 events_v2 user_id 集合：{U1}
+  第1天 sessions_v2 user_id 集合：{U1}
+  第3天 events_v2 user_id 集合：{U3}
+  第3天 sessions_v2 user_id 集合：取决于会话是否延续
+  交集：{}（空集）或部分交集
   结果：0% 留存率 ← 严重低估！
 ```
 
@@ -649,20 +814,22 @@ end
 
 | 分析类型 | 可行性 | 准确性 | 说明 |
 |---------|--------|--------|------|
-| 单日访客统计 | ✅ 完全支持 | ✅ 准确 | `uniq(user_id)` 单日内稳定 |
+| 单日访客统计（同盐值） | ✅ 完全支持 | ✅ 准确 | `uniq(user_id)` 单日内稳定 |
 | 日内会话分析 | ✅ 完全支持 | ✅ 准确 | 30分钟超时规则 |
+| 盐值切换日访客统计 | ⚠️ 有条件支持 | ⚠️ 可能不一致 | 跨盐值会话两表 user_id 不一致 |
 | 跨天新老区分 | ⚠️ 需二次计算 | ❌ 不准确 | 盐值轮换导致 `user_id` 变化 |
 | N日留存率 | ❌ 无法准确计算 | ❌ 无意义 | 跨天 `user_id` 无关联性 |
 | 同期群分析 | ❌ 无法准确计算 | ❌ 无意义 | 无法追踪长期访客 |
 
-### 4.4 访客统计的有效口径
+### 4.5 访客统计的有效口径
 
 **当前系统可准确计算的指标**：
 
 | 指标 | 计算方式 | 时间范围 | 准确性 |
 |------|---------|---------|--------|
 | **实时访客** | 过去N分钟 `uniq(user_id)` | 分钟级 | ✅ 准确 |
-| **日访客** | 当天 `uniq(user_id)` | 自然日 | ✅ 准确 |
+| **日访客（events_v2）** | 当天 `uniq(user_id)` 事件表 | 自然日 | ✅ 准确 |
+| **日访客（sessions_v2）** | 当天 `uniq(user_id)` 会话表 | 自然日 | ⚠️ 盐值切换日可能不一致 |
 | **日会话** | 当天 `uniq(session_id)` 或 `sum(sign)` | 自然日 | ✅ 准确 |
 | **页面浏览** | `countIf(name='pageview')` | 任意 | ✅ 准确 |
 | **跳出率** | `sum(is_bounce * sign) / sum(sign)` | 任意 | ✅ 准确 |
@@ -672,11 +839,12 @@ end
 
 | 指标 | 问题 | 建议 |
 |------|------|------|
+| 盐值切换日访客趋势 | 两表 `user_id` 可能不一致 | 理解数据局限性，以事件表为准 |
 | 跨天访客趋势 | 盐值轮换可能导致波动 | 仅作趋势参考，不作精确对比 |
 | 周/月访客统计 | 同上 | 理解数据局限性 |
 | 任何形式的"新老访客" | 无持久化标记 | 不建议使用，或需自定义实现 |
 
-### 4.5 设计初衷与权衡
+### 4.6 设计初衷与权衡
 
 **隐私优先设计**：
 
@@ -759,7 +927,90 @@ defp metric_partitioner(query, metric) when metric in [:visitors, :visits] do
 end
 ```
 
-### 5.3 跨维度查询兼容性
+### 5.3 visitors 指标的多统计路径分析
+
+**`visitors` 指标的三种统计路径**：
+
+| 统计路径 | 触发条件 | 计算方式 | `user_id` 来源 |
+|---------|----------|-------------|
+| **路径A：事件表 | 有 `event:*` 维度/过滤 | `uniq(e.user_id)` | 每次事件的 `current` 盐值 |
+| **路径B：会话表** | 有 `visit:*` 维度/过滤 | `uniq(s.user_id)` | 会话**创建时**的盐值 |
+| **路径C：会话表涂抹** | `time:minute`/`time:hour` 维度 | `uniq(s.user_id)` 跨时间槽 | 会话创建时的盐值 |
+
+**三种路径的详细对比**：
+
+#### 路径A：事件表统计
+
+**触发场景**：
+- 使用 `event:page`、`event:hostname`、`event:props:*` 等维度
+- 过滤条件涉及 `event:*` 维度
+
+**SQL实现**（`lib/plausible/stats/sql/expression.ex:302-306`）：
+```elixir
+def event_metric(:visitors, _query) do
+  wrap_alias([e], %{
+    visitors: scale_sample(fragment("uniq(?)", e.user_id))
+  })
+end
+```
+
+**`user_id` 来源**：
+- 每个事件写入时的 `current` 盐值生成
+- 跨盐值会话的事件会使用不同盐值
+
+#### 路径B：会话表统计
+
+**触发场景**：
+- 使用 `visit:entry_page`、`visit:exit_page` 等必须从会话表查询的维度
+- 仅会话指标（如 `bounce_rate`）
+
+**SQL实现**（`lib/plausible/stats/sql/expression.ex:462-466`）：
+```elixir
+def session_metric(:visitors, _query) do
+  wrap_alias([s], %{
+    visitors: scale_sample(fragment("uniq(?)", s.user_id))
+  })
+end
+```
+
+**`user_id` 来源**：
+- 会话**创建时**的盐值
+- 跨盐值延续的会话保持创建时的 `user_id`
+
+#### 路径C：会话表涂抹统计
+
+**触发场景**：
+- 使用 `time:minute` 或 `time:hour` 维度
+- 未过滤 `event:goal`
+
+**特殊处理**：
+- 使用 `timeSlots` 函数展开会话时间
+- 每个时间槽位都计入 `uniq`
+- 但 `user_id` 仍是会话创建时的值
+
+**三种路径的一致性分析
+
+**同一天内（无盐值轮换）**：
+
+| 场景 | 路径A（事件表） | 路径B（会话表） | 一致性 |
+|------|---------------|-----------------|--------|
+| 同一访客同一盐值） | U1（U1（U1 | U1 | ✅ 一致 |
+| 同一会话 | U1 | U1 | ✅ 一致 |
+
+**盐值切换日（有跨盐值会话）**：
+
+| 场景 | 路径A（事件表） | 路径B（会话表） | 一致性 |
+|------|----------------|-----------------|--------|
+| 会话创建于S1，事件在S2 | U2（S2生成） | U1（S1生成） | ❌ **不一致** |
+| 新会话创建于S2 | U2（S2生成） | U2（S2生成） | ✅ 一致 |
+
+**跨天对比（盐值轮换）**：
+
+| 场景 | 路径A（事件表） | 路径B（会话表） | 说明 |
+|------|----------------|-----------------|------|
+| 同一访客跨天 | 不同 `user_id` | 不同 `user_id` | ✅ 一致（都无法追踪） |
+
+### 5.4 跨维度查询兼容性
 
 **兼容性验证**（`lib/plausible/stats/table_decider.ex:44-77`）：
 
@@ -797,7 +1048,7 @@ end
 | 事件指标（`scroll_depth`） | 会话维度（`visit:country`） | ❌ 错误 |
 | 通用指标（`visitors`） | 任一维度 | ✅ 允许 |
 
-### 5.4 自动维度过滤
+### 5.5 自动维度过滤
 
 **空值过滤规则**（`lib/plausible/stats/breakdown.ex:141-160`）：
 
@@ -827,7 +1078,7 @@ end
 - 提高跨维度报告的可比性
 - 避免空值主导统计结果
 
-### 5.5 表选择决策逻辑
+### 5.6 表选择决策逻辑
 
 **查询分区策略**（`lib/plausible/stats/table_decider.ex:87-121`）：
 
@@ -890,7 +1141,7 @@ end
                             └──────────┘  └─────────────────┘
 ```
 
-### 5.6 指标计算一致性
+### 5.7 指标计算一致性
 
 **核心指标的SQL实现**（`lib/plausible/stats/sql/expression.ex`）：
 
@@ -976,41 +1227,56 @@ end
 3. **除零保护**：使用 `ifNotFinite` 处理除零情况
 4. **类型转换**：使用 `toUInt32` 确保整数结果
 
-### 5.7 访客指标在不同维度下的一致性
+### 5.8 一致性与差异场景汇总
 
-**`visitors` 指标的多源计算**：
+**visitors 指标一致性场景**：
 
-`visitors` 指标可从两个表计算，但口径一致：
+| 场景 | 路径A（事件表） | 路径B（会话表） | 一致性 | 原因 |
+|------|----------------|-----------------|--------|------|
+| 同一天内，无盐值轮换 | ✅ 准确 | ✅ 准确 | ✅ 一致 | 同一盐值生成 |
+| 盐值切换日，新会话 | ✅ 准确 | ✅ 准确 | ✅ 一致 | 新盐值生成 |
+| 盐值切换日，跨盐值会话 | U2（新盐值） | U1（旧盐值） | ❌ **不一致** | 事件用新盐值，会话用旧盐值 |
+| 跨天对比（不同盐值） | 无法追踪 | 无法追踪 | ✅ 一致（都无意义） | 盐值轮换导致 user_id 变化 |
 
-| 数据源 | 计算方式 | 适用场景 |
-|--------|---------|---------|
-| `events_v2` | `uniq(user_id)` | 有事件维度/过滤时 |
-| `sessions_v2` | `uniq(user_id)` | 有会话维度/过滤时 |
-| `sessions_v2`（涂抹） | 跨时间槽位去重 | `time:minute`/`time:hour` 维度时 |
+**不同维度组合下的统计路径选择**：
 
-**一致性保证**：
+| 指标 | 维度 | 过滤器 | 统计路径 | 说明 |
+|------|------|--------|----------|------|
+| `visitors` | `time:day` | 无 | 会话表（路径B） | 无事件维度，选择会话表 |
+| `visitors` | `event:page` | 无 | 事件表（路径A） | 事件维度，选择事件表 |
+| `visitors` | `time:hour` | 无 | 会话表涂抹（路径C） | 小时维度触发涂抹 |
+| `visitors` | `visit:country` | `event:page = '/home' | 双表查询（路径A+B） | 事件过滤+会话维度，分别查询 |
 
-1. **同一时间窗口**：
-   - 两个表的 `user_id` 来自同一事件处理管道
-   - 去重逻辑相同（`uniq()`）
+**双表查询的结果合并**：
 
-2. **涂抹机制的特殊处理**：
-   - 仅在 `time:minute` 或 `time:hour` 维度触发
-   - 目的是更准确地统计跨时间边界的会话
-   - 不会改变 `user_id` 的基础定义
+当查询涉及事件侧和会话侧的组合时：
 
-3. **盐值轮换的全局影响**：
-   - 所有维度、所有表都使用相同的盐值生成 `user_id`
-   - 同一天内，不同维度下的 `visitors` 统计具有一致性
-   - 跨天时，所有维度都会受到盐值轮换的相同影响
+```
+查询示例：
+  指标: visitors
+  维度: visit:country
+  过滤: event:page = '/home'
 
-**不一致场景**：
+执行流程：
+1. 事件侧过滤（事件侧：`event:page` 过滤器）
+   → 事件侧查询：`events_v2`，过滤 `pathname = '/home'`，计算 `uniq(user_id)`
 
-| 场景 | 问题 | 说明 |
-|------|------|------|
-| 跨天对比 | 盐值轮换 | 同一访客有不同 `user_id`，导致访客数"虚增" |
-| 涂抹 vs 非涂抹 | 时间边界处理 | 小时/分钟维度的统计方式不同，但更准确 |
-| 采样数据 | 采样因子 | 需使用 `scale_sample` 确保一致性 |
+2. 会话侧维度（会话侧：`visit:country` 维度）
+   → 会话侧查询：`sessions_v2`，按 `country` 分组，计算 `uniq(user_id)`
+
+3. 结果合并
+   → 注意：两表的 `user_id` 在盐值切换日可能不一致！
+```
+
+**时间维度的特殊处理**：
+
+| 时间维度 | 涂抹触发 | 统计路径 | 说明 |
+|---------|---------|----------|------|
+| `time:minute` | ✅ 触发 | 会话表涂抹（路径C） | 15分钟槽位展开 |
+| `time:hour` | ✅ 触发 | 会话表涂抹（路径C） | 15分钟槽位后合并小时 |
+| `time:day` | ❌ 不触发 | 会话表（路径B） | 按天截断 |
+| `time:week` | ❌ 不触发 | 会话表（路径B） | 按周截断对齐查询起始 |
+| `time:month` | ❌ 不触发 | 会话表（路径B） | 按月截断 |
 
 ---
 
@@ -1037,6 +1303,8 @@ end
 | 用户ID生成 | `lib/plausible/ingestion/event.ex` | 553-567 |
 | 盐值获取 | `lib/plausible/ingestion/event.ex` | 383-396 |
 | 双盐值会话查找 | `lib/plausible/session/cache_store.ex` | 24-25 |
+| 前一个盐值 user_id 生成 | `lib/plausible/ingestion/event.ex` | 414-425 |
+| 盐值管理 | `lib/plausible/session/salts.ex` | - |
 | 实时访客统计 | `lib/plausible/stats/current_visitors.ex` | 6-19 |
 | 访客指标定义 | `lib/plausible/stats/metrics.ex` | 12-26 |
 | 事件表访客计数 | `lib/plausible/stats/sql/expression.ex` | 302-306 |
@@ -1047,7 +1315,9 @@ end
 
 | 功能 | 文件路径 | 行号 |
 |------|---------|------|
+| 时间范围构建 | `lib/plausible/stats/datetime_range.ex` | 23-58 |
 | UTC边界计算 | `lib/plausible/stats/time.ex` | 8-28 |
+| 自动时间维度选择 | `lib/plausible/stats/query_optimizer.ex` | 95-102 |
 | 时间维度检测 | `lib/plausible/stats/time.ex` | 38-43 |
 | 时间标签生成 | `lib/plausible/stats/time.ex` | 48-121 |
 | 部分桶识别 | `lib/plausible/stats/time.ex` | 123-153 |
@@ -1055,6 +1325,7 @@ end
 | 时区转换 | `lib/plausible/stats/query_builder.ex` | 165-169 |
 | timeSlots宏 | `lib/plausible/stats/sql/expression.ex` | 30-50 |
 | 小时维度涂抹 | `lib/plausible/stats/sql/expression.ex` | 117-133 |
+| 周维度对齐 | `lib/plausible/stats/sql/expression.ex` | 72-95 |
 
 ### 6.4 维度一致性相关
 
@@ -1068,6 +1339,7 @@ end
 | 自动过滤维度 | `lib/plausible/stats/breakdown.ex` | 141-160 |
 | 事件表指标 | `lib/plausible/stats/sql/expression.ex` | 290-411 |
 | 会话表指标 | `lib/plausible/stats/sql/expression.ex` | 413-498 |
+| 查询优化器 | `lib/plausible/stats/query_optimizer.ex` | - |
 
 ### 6.5 数据模型
 
@@ -1135,87 +1407,33 @@ end
     └───────────────────┘           └───────────────────┘
 ```
 
-### 附录C：多表查询决策
+### 附录C：跨盐值会话衔接
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         查询分析                                  │
-│  指标: visitors, bounce_rate                                     │
-│  维度: time:hour, visit:country                                  │
-│  过滤: event:page = '/home'                                      │
+│                    跨盐值会话衔接流程                               │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────────┐
-              │         组件分类                   │
-┌─────────────┴─────────────┬─────────────────────┴───────────┐
-│          事件侧           │            会话侧                  │
-│  • event:page 过滤器      │  • bounce_rate 指标              │
-│  • (visitors 可从任意表)  │  • visit:country 维度            │
-│                          │  • time:hour (涂抹触发)           │
-└──────────────────────────┴───────────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────────┐
-              │         执行两个查询               │
-┌─────────────┴─────────────┬─────────────────────┴───────────┐
-│     events_v2 查询        │      sessions_v2 查询            │
-│  • visitors (uniq)        │  • visitors (涂抹)               │
-│  • pageviews 过滤应用      │  • bounce_rate                   │
-│                          │  • time:hour 维度                  │
-└──────────────────────────┴───────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │   结果合并返回   │
-                    └─────────────────┘
-```
 
-### 附录D：指标口径总览
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        指标口径总览                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐│
-│  │   会话指标      │    │   事件指标      │    │   访客指标      ││
-│  │  (sessions_v2) │    │  (events_v2)   │    │   (双表均可)    ││
-│  └─────────────────┘    └─────────────────┘    └─────────────────┘│
-│  │                  │    │                  │    │                  ││
-│  │ • bounce_rate    │    │ • pageviews      │    │ • visitors     ││
-│  │ • visit_duration │    │ • events         │    │ • visits       ││
-│  │ • views_per_visit│    │ • time_on_page   │    │                ││
-│  │ • exit_rate      │    │ • scroll_depth   │    │  ⚠️ 限制:      ││
-│  │                  │    │                  │    │  • 盐值每日轮换 ││
-│  │ ✅ 跨天稳定      │    │ ✅ 跨天稳定      │    │  • 无新老区分   ││
-│  │ ✅ 基于 sign 聚合│    │ ✅ 简单计数      │    │  • 无留存追踪   ││
-│  └──────────────────┘    └──────────────────┘    └──────────────────┘│
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 修订历史
-
-| 版本 | 日期 | 修订内容 |
-|------|------|---------|
-| 1.0 | 2024-01 | 初始版本，基于代码库分析 |
-| 2.0 | 2024-01 | 补充访客识别、新老区分、留存指标分析；明确盐值轮换的影响 |
-
----
-
-**报告生成依据**：
-- 代码库版本：当前工作目录 `g:\fangzheng\solo-dogfeeding\code\21076-analytics`
-- 分析日期：2026-05-03
-- 分析范围：Elixir 源代码，含测试文件引用
-
-**关键发现总结**：
-
-1. ✅ **会话边界清晰**：30分钟无活动超时，基于内存缓存 + ClickHouse CollapsingMergeTree
-2. ✅ **时间统计完善**：支持多粒度时间维度，小时/分钟级有涂抹机制处理跨边界会话
-3. ⚠️ **访客识别有局限**：`user_id` 基于盐值每日轮换，设计目标是隐私保护而非长期追踪
-4. ❌ **无内置新老访客区分**：v2 模型无 `new_visitor` 字段，需二次计算且不准确
-5. ❌ **无内置留存指标**：代码库无 `retention`/`cohort` 相关实现，且盐值轮换使跨天追踪无意义
-6. ✅ **维度一致性良好**：事件/会话维度分类清晰，有严格的兼容性检查和表选择策略
+时间线：
+─────────────────────────────────────────────────────────────────►
+        T1                          T2                          T3
+        │                           │                           │
+        ▼                           ▼                           ▼
+┌───────────────┐         ┌─────────────────┐         ┌───────────────┐
+│  盐值 S1     │         │  盐值 S2        │         │  盐值 S3        │
+│  期间        │         │  期间             │         │  期间             │
+└───────────────┘         └─────────────────┘         └───────────────┘
+        │                           │                           │
+        ▼                           ▼                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  同一访客持续活动（30分钟内无超时）                              │
+│                                                                 │
+│  T1 (S1期间)：                                                  │
+│    事件 user_id = U1 (S1生成)                                    │
+│    会话 user_id = U1 (创建时)                                   │
+│    events_v2: U1                                               │
+│    sessions_v2: U1                                              │
+│                                                                 │
+│  T2 (S2期间，会话延续)：                                        │
+│    事件 user_id = U2 (S2生成)  ← 新盐值                         │
+│    会话 user_id = U1 (保持不变)  ← 旧盐值
