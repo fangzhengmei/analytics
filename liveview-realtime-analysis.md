@@ -2,7 +2,7 @@
 
 ## 概述
 
-本报告详细分析了 Plausible Analytics 系统中实时访客指标的刷新机制，**重点区分了两条独立的实时查询链路**，纠正了窗口计算的归属，明确了成本计数链路与实时访客数的关系，并标清了直接数据源和旁路监控。
+本报告详细分析了 Plausible Analytics 系统中实时访客指标的刷新机制，**重点区分了两条独立的实时查询链路**，纠正了窗口计算的归属，明确了成本计数链路与实时访客数的关系，**逐项分析了实时看板各模块的时间窗口与刷新触发条件**，并补充了缓存时效与全局刷新节奏的配合关系。
 
 ---
 
@@ -173,359 +173,227 @@ end
 
 ---
 
-## 2. 窗口计算归属纠正
+## 2. 实时看板各模块分析
 
-### 2.1 之前的误解
+### 2.1 实时看板模块全景
 
-之前的分析可能存在以下误解：
-- ❌ 认为所有实时窗口计算都在 `query_builder.ex` 中
-- ❌ 认为 `current_visitors.ex` 使用了 `query_builder.ex` 的窗口计算
-- ❌ 混淆了两条链路的窗口大小
-
-### 2.2 正确的归属关系
-
-#### 2.2.1 归属一：实时访客接口的窗口计算
-
-**归属模块**: `lib/plausible/stats/current_visitors.ex`
-
-**实现细节**:
-```elixir
-def current_visitors(site, duration \\ Duration.new!(minute: -5)) do
-  first_datetime =
-    NaiveDateTime.utc_now()
-    |> NaiveDateTime.shift(duration)  # 默认: -5分钟
-    |> NaiveDateTime.truncate(:second)
-  # ... 查询
-end
-```
-
-**特点**:
-- ✅ 默认窗口：5 分钟 (`Duration.new!(minute: -5)`)
-- ✅ 可自定义：通过 `duration` 参数调整
-- ✅ 独立实现：不依赖 `QueryBuilder`
-- ✅ 滑动窗口：每次查询基于 `NaiveDateTime.utc_now()` 重新计算
-
-#### 2.2.2 归属二：实时看板的窗口计算
-
-**归属模块**: `lib/plausible/stats/query_builder.ex`
-
-**实现细节**:
-```elixir
-defp build_datetime_range(input_date_range, _site, _relative_date, now)
-     when input_date_range in [:realtime, :realtime_30m] do
-  duration_minutes =
-    case input_date_range do
-      :realtime -> 5          # 理论值，实际不使用
-      :realtime_30m -> 30     # 实际使用值
-    end
-
-  first_datetime = DateTime.shift(now, minute: -duration_minutes)
-  last_datetime = DateTime.shift(now, second: 5)  # +5秒缓冲
-
-  DateTimeRange.new!(first_datetime, last_datetime)
-end
-```
-
-**特点**:
-- ✅ `:realtime` → 5 分钟 (理论定义，实际查询不使用)
-- ✅ `:realtime_30m` → 30 分钟 (实际查询使用)
-- ✅ 统一接口：与其他时间周期 (day, month, year 等) 使用相同的构建逻辑
-- ✅ 时间缓冲：`last_datetime = now + 5 seconds` 确保最新数据被包含
-
-### 2.3 为什么有两套独立实现？
-
-#### 设计原因分析
-
-| 维度 | 实时访客接口 | 实时看板 |
-|-----|------------|---------|
-| **响应时间要求** | 极快 (导航栏指示器需要即时响应) | 较快 (页面加载可接受短暂延迟) |
-| **查询复杂度** | 极简单 (仅 `uniq(user_id)`) | 复杂 (多维度、多指标、筛选) |
-| **缓存策略** | 可独立优化 | 依赖通用缓存机制 |
-| **演化历史** | 早期简单实现 | 后期统一查询框架 |
-
-#### 技术债务考虑
-
-两套独立实现可能带来的问题：
-1. **维护成本**：需要同时维护两套窗口逻辑
-2. **行为差异**：5分钟 vs 30分钟窗口可能导致用户困惑
-3. **代码复用**：无法共享查询优化和 bug 修复
-
----
-
-## 3. 成本计数链路与实时访客数的关系
-
-### 3.1 成本计数链路的真实用途
-
-**成本计数链路** (`lib/plausible/ingestion/counters.ex` 及其子模块) 是一个**旁路监控系统**，**完全不用于实时访客数的计算**。
-
-#### 3.1.1 链路架构
-
-```
-事件摄入管道 (Plausible.Ingestion.Event)
-    ↓ 发射 telemetry 事件
-Telemetry 事件: [:plausible, :ingestion, :event, :buffered/:dropped]
-    ↓
-TelemetryHandler 捕获事件 [telemetry_handler.ex:18-64]
-    ↓
-Buffer.aggregate/5 聚合计数 [buffer.ex]
-    ↓ 每 10 秒刷新
-Counters.handle_cycle/2 刷新缓冲区 [counters.ex:66-99]
-    ↓ 异步插入
-AsyncInsertRepo.insert_all(Record, records)
-    ↓
-ClickHouse ingest_counters 表 [record.ex:10-17]
-```
-
-#### 3.1.2 核心实现
-
-**Telemetry 事件订阅** (`lib/plausible/ingestion/counters/telemetry_handler.ex:12-15`):
-```elixir
-@event_dropped Event.telemetry_event_dropped()
-@event_buffered Event.telemetry_event_buffered()
-
-@telemetry_events [@event_dropped, @event_buffered]
-```
-
-**事件处理** (`lib/plausible/ingestion/counters/telemetry_handler.ex:52-64`):
-```elixir
-def handle_event(
-      @event_buffered,
-      _measurements,
-      %{
-        domain: domain,
-        request_timestamp: timestamp,
-        tracker_script_version: tracker_script_version
-      },
-      buffer
-    ) do
-  Counters.Buffer.aggregate(buffer, "buffered", domain, timestamp, tracker_script_version)
-  :ok
-end
-```
-
-**数据结构** (`lib/plausible/ingestion/counters/record.ex:10-17`):
-```elixir
-schema "ingest_counters" do
-  field :event_timebucket, :utc_datetime
-  field :site_id, Ch, type: "Nullable(UInt64)"
-  field :domain, Ch, type: "LowCardinality(String)"
-  field :metric, Ch, type: "LowCardinality(String)"
-  field :value, Ch, type: "UInt64"
-  field :tracker_script_version, Ch, type: "UInt16"
-end
-```
-
-#### 3.1.3 收集的指标
-
-| Metric 名称 | 含义 | 触发条件 |
-|------------|------|---------|
-| `buffered` | 成功缓冲的事件数 | 事件被成功写入摄入管道 |
-| `dropped_#{reason}` | 因特定原因丢弃的事件数 | 事件被丢弃 (如 `dropped_robot`, `dropped_rate_limited` 等) |
-
-### 3.2 实时访客数的真实数据源
-
-**实时访客数**的计算**完全依赖 `events_v2` 表**，与 `ingest_counters` 表没有任何关系。
-
-#### 3.2.1 直接数据源
-
-**表名**: `events_v2`
-
-**查询条件** (`current_visitors.ex:12-18`):
-```elixir
-from e in "events_v2",
-  where: ^Plausible.Sites.site_id_query_filter(site),  # 按站点过滤
-  where: e.timestamp >= ^first_datetime,                # 时间窗口 (默认5分钟)
-  where: e.name != "engagement",                         # 排除互动事件
-  select: uniq(e.user_id)                                # 统计唯一用户数
-```
-
-#### 3.2.2 为什么 events_v2 是直接数据源？
-
-| 原因 | 说明 |
-|-----|------|
-| **数据完整性** | `events_v2` 存储了所有原始事件数据 |
-| **实时性** | 事件摄入后近实时写入 `events_v2` |
-| **准确性** | `uniq(user_id)` 直接基于原始事件计算，无聚合误差 |
-| **灵活性** | 可根据需要调整时间窗口和过滤条件 |
-
-### 3.3 两条链路的关系图解
+实时看板包含以下核心模块，各模块有不同的时间窗口转换和刷新触发条件：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           事件摄入管道                                      │
+│                           实时看板页面结构                                  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│   用户访问 → 跟踪脚本 → 事件接收 → 事件处理 → 写入 events_v2 表          │
-│                                              │                            │
-│                                              │ 发射 telemetry 事件         │
-│                                              ▼                            │
-│                                    ┌─────────────────┐                   │
-│                                    │ Telemetry 事件  │                   │
-│                                    │ (旁路监控)       │                   │
-│                                    └────────┬────────┘                   │
-│                                             │                             │
-│                                             ▼                             │
-│                                    ┌─────────────────┐                   │
-│                                    │  Counters 链路   │                   │
-│                                    │ (成本计数/监控)  │                   │
-│                                    └────────┬────────┘                   │
-│                                             │                             │
-│                                             ▼                             │
-│                                    ┌─────────────────┐                   │
-│                                    │ ingest_counters │                   │
-│                                    │ 表 (旁路存储)    │                   │
-│                                    └─────────────────┘                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                      Top Stats (顶部统计)                          │   │
+│  │  • Current visitors (当前访客数) - 特殊处理                        │   │
+│  │  • Visitors (访客数)                                              │   │
+│  │  • Pageviews (页面浏览量)                                         │   │
+│  │  • 其他指标 (依筛选条件而定)                                        │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                      Main Graph (主图表)                           │   │
+│  │  • 访客趋势图表                                                    │   │
+│  │  • 支持多种指标切换                                                │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌───────────────────────┬───────────────────────────────────────────┐ │
+│  │   Sources (来源)      │       Pages (页面)                        │ │
+│  │   • Top Sources       │       • Top Pages                         │ │
+│  │   • Top Channels      │       • Entry Pages                       │ │
+│  │   • Top Referrers     │       • Exit Pages                        │ │
+│  └───────────────────────┴───────────────────────────────────────────┘ │
+│                                                                         │
+│  ┌───────────────────────┬───────────────────────────────────────────┐ │
+│  │   Locations (地理位置) │       Devices (设备)                      │ │
+│  │   • Countries         │       • Browsers                          │ │
+│  │   • Regions           │       • Operating Systems                 │ │
+│  │   • Cities            │       • Screen Sizes                      │ │
+│  └───────────────────────┴───────────────────────────────────────────┘ │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                      Behaviours (行为)                             │   │
+│  │  • Props (自定义属性)                                             │   │
+│  │  • Conversions (转化) - 仅当有目标筛选时显示                        │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           查询层                                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   ┌─────────────────────────┐         ┌─────────────────────────┐    │
-│   │  实时访客接口链路        │         │  实时看板通用查询链路      │    │
-│   │  (Current Visitors)     │         │  (Realtime Dashboard)    │    │
-│   ├─────────────────────────┤         ├─────────────────────────┤    │
-│   │                         │         │                         │    │
-│   │  API: /current-visitors │         │  API: /query, /breakdown│    │
-│   │  窗口: current_visitors │         │  窗口: query_builder    │    │
-│   │        .ex (5分钟)       │         │        .ex (30分钟)      │    │
-│   │                         │         │                         │    │
-│   └───────────┬─────────────┘         └───────────┬─────────────┘    │
-│               │                                     │                    │
-│               └─────────────────┬───────────────────┘                    │
-│                                 │                                          │
-│                                 ▼                                          │
-│                        ┌─────────────────┐                               │
-│                        │   events_v2 表   │                               │
-│                        │  (直接数据源)     │                               │
-│                        └─────────────────┘                               │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-
-关键关系:
-✓ 实时访客接口 ←→ events_v2 (直接查询)
-✓ 实时看板 ←→ events_v2 (通过 QueryBuilder 查询)
-✗ 实时访客数 ←→ ingest_counters (无任何关系！)
-✓ counters 链路 ←→ 旁路监控 (仅用于监控摄入管道健康)
 ```
 
-### 3.4 关键结论
+### 2.2 模块时间窗口转换分析
 
-| 结论 | 说明 |
-|-----|------|
-| ✅ **实时访客数不使用 counters 数据** | `ingest_counters` 表与实时访客计算完全无关 |
-| ✅ **events_v2 是唯一直接数据源** | 两条实时查询链路都直接查询 `events_v2` 表 |
-| ✅ **counters 是旁路监控系统** | 仅用于监控事件摄入管道的健康状况 |
-| ✅ **counters 指标含义不同** | 统计的是"事件数"，不是"访客数" |
-| ⚠️ **容易混淆的命名** | `Counters` 模块名可能让人误解为与访客计数有关 |
+#### 2.2.1 关键转换机制
+
+**前端周期转换规则**：
+- 用户选择 `period = "realtime"`（显示用）
+- 实际查询时转换为 `date_range = "realtime_30m"`（30分钟窗口）
+
+**转换位置**：
+- `fetch-main-graph.ts:32` - 主图表
+- `fetch-top-stats.ts:136` - 顶部统计
+
+#### 2.2.2 各模块时间窗口对照表
+
+| 模块 | 文件位置 | 是否转换为 realtime_30m | 实际窗口大小 | 说明 |
+|-----|---------|------------------------|-------------|------|
+| **Top Stats (顶部统计)** | `fetch-top-stats.ts:136` | ✅ 是 | 30 分钟 | 显式转换 `date_range = DashboardPeriod.realtime_30m` |
+| **Main Graph (主图表)** | `fetch-main-graph.ts:32` | ✅ 是 | 30 分钟 | 显式转换 `date_range = DashboardPeriod.realtime_30m` |
+| **Sources (来源)** | 通用查询机制 | ✅ 是 | 30 分钟 | 通过统一 Query 机制，使用 `dashboardState.period` |
+| **Pages (页面)** | 通用查询机制 | ✅ 是 | 30 分钟 | 通过统一 Query 机制，使用 `dashboardState.period` |
+| **Locations (地理位置)** | 通用查询机制 | ✅ 是 | 30 分钟 | 通过统一 Query 机制，使用 `dashboardState.period` |
+| **Devices (设备)** | 通用查询机制 | ✅ 是 | 30 分钟 | 通过统一 Query 机制，使用 `dashboardState.period` |
+| **Behaviours (行为)** | 通用查询机制 | ✅ 是 | 30 分钟 | 通过统一 Query 机制，使用 `dashboardState.period` |
+
+**关键发现**：
+> 所有实时看板模块在查询时**都使用 30 分钟窗口**（`realtime_30m`），而不是用户界面上显示的 "realtime"。
+
+### 2.3 Top Stats 模块特殊处理
+
+#### 2.3.1 Current Visitors 特殊处理
+
+**位置**: `fetch-top-stats.ts:19-35`
+
+```typescript
+export function topStatsQueries(
+  dashboardState: DashboardState,
+  metrics: Metric[]
+): [StatsQuery, StatsQuery | null] {
+  let currentVisitorsQuery = null
+
+  if (isRealTimeDashboard(dashboardState)) {
+    currentVisitorsQuery = createStatsQuery(dashboardState, {
+      metrics: ['visitors']
+    })
+
+    currentVisitorsQuery.filters = []  // 清除筛选器
+  }
+  const topStatsQuery = constructTopStatsQuery(dashboardState, metrics)
+
+  return [topStatsQuery, currentVisitorsQuery]
+}
+```
+
+**特殊处理说明**：
+- 在实时看板中，`Current visitors` 指标使用**单独的查询**
+- 该查询**清除了所有筛选器**（`filters = []`）
+- 但**仍会使用 30 分钟窗口**（通过后续的 `date_range` 转换）
+
+#### 2.3.2 指标选择逻辑
+
+**位置**: `fetch-top-stats.ts:77-112`
+
+```typescript
+export function chooseMetrics(
+  site: Pick<PlausibleSite, 'revenueGoals'>,
+  dashboardState: DashboardState
+): Metric[] {
+  // ...
+  if (
+    isRealTimeDashboard(dashboardState) &&
+    hasConversionGoalFilter(dashboardState)
+  ) {
+    return ['visitors', 'events']
+  } else if (isRealTimeDashboard(dashboardState)) {
+    return ['visitors', 'pageviews']
+  }
+  // ... 其他周期的指标选择
+}
+```
+
+**实时看板指标选择**：
+- 无筛选器：`['visitors', 'pageviews']`
+- 有目标筛选器：`['visitors', 'events']`
+
+#### 2.3.3 时间窗口转换
+
+**位置**: `fetch-top-stats.ts:135-137`
+
+```typescript
+if (isRealTimeDashboard(dashboardState)) {
+  statsQuery.date_range = DashboardPeriod.realtime_30m
+}
+```
+
+**关键**：无论主查询还是 `Current visitors` 子查询，**最终都会使用 30 分钟窗口**。
+
+### 2.4 Main Graph 模块
+
+#### 2.4.1 时间窗口转换
+
+**位置**: `fetch-main-graph.ts:31-33`
+
+```typescript
+if (isRealTimeDashboard(dashboardState)) {
+  statsQuery.date_range = DashboardPeriod.realtime_30m
+}
+```
+
+#### 2.4.2 实时看板特殊显示
+
+**位置**: `main-graph.tsx:574-589`
+
+```typescript
+case Interval.minute: {
+  if (period === DashboardPeriod.realtime) {
+    const minutesAgo = totalBuckets - bucketIndex
+    return `-${minutesAgo}m`  // 显示为 "-Xm" 格式
+  }
+  // ... 其他周期的显示逻辑
+}
+```
+
+**显示特点**：
+- 实时看板使用 `minute` 时间间隔
+- X 轴标签显示为 `-Xm`（如 "-1m", "-2m"），表示"X分钟前"
+- 实际查询使用 30 分钟窗口
+
+### 2.5 其他模块 (Sources, Pages, Locations, Devices, Behaviours)
+
+这些模块使用**统一的查询机制**，时间窗口由 `dashboardState.period` 决定。
+
+#### 2.5.1 周期判断
+
+**位置**: `util/filters.js:141-143`
+
+```javascript
+export function isRealTimeDashboard(dashboardState) {
+  return dashboardState?.period === 'realtime'
+}
+```
+
+#### 2.5.2 实时看板特殊逻辑
+
+**位置**: `stats/behaviours/index.js:436-438`
+
+```javascript
+function isRealtime() {
+  return dashboardState.period === 'realtime'
+}
+```
+
+**用途**：
+- 控制某些 UI 元素的显示/隐藏
+- 控制某些功能的启用/禁用
+
+### 2.6 实时看板 vs 非实时看板对比
+
+| 维度 | 实时看板 (period=realtime) | 非实时看板 (period=day/month/等) |
+|-----|---------------------------|---------------------------------|
+| **实际查询窗口** | 30 分钟 (realtime_30m) | 对应周期的时间范围 |
+| **时间间隔** | minute (分钟级) | 依周期而定 (hour, day, week 等) |
+| **X 轴标签** | "-Xm" (X分钟前) | 日期/时间格式 |
+| **可用指标** | visitors, pageviews/events | 更多指标 (bounce_rate, visit_duration 等) |
+| **闪烁圆点** | 显示 pulsating-circle | 不显示 |
+| **比较模式** | 禁用 | 可用 |
 
 ---
 
-## 4. 直接数据源 vs 旁路监控
+## 3. 刷新触发条件分析
 
-### 4.1 直接数据源：events_v2 表
+### 3.1 全局刷新机制
 
-#### 4.1.1 表用途
-存储所有原始事件数据，是**所有业务指标的唯一真实来源**。
-
-#### 4.1.2 使用场景
-
-| 使用场景 | 链路 | 查询方式 |
-|---------|------|---------|
-| 实时访客数 | 实时访客接口 | `current_visitors.ex` 直接查询 |
-| 实时看板指标 | 实时看板通用查询 | `QueryBuilder` 构建查询 |
-| 历史报表 | 所有历史查询 | 统一查询机制 |
-| 自定义报表 | API 查询 | 统一查询机制 |
-
-#### 4.1.3 数据特点
-
-| 特点 | 说明 |
-|-----|------|
-| **数据完整性** | 包含所有原始事件字段 |
-| **实时性** | 近实时写入 (摄入后立即可查) |
-| **数据量** | 巨大 (每个页面浏览、事件都产生记录) |
-| **查询成本** | 较高 (需要扫描大量数据) |
-| **存储成本** | 较高 (需要保留历史数据) |
-
-### 4.2 旁路监控：ingest_counters 表
-
-#### 4.2.1 表用途
-存储**摄入管道的内部监控指标**，用于：
-- 监控事件摄入速率
-- 追踪事件丢弃原因
-- 分析跟踪脚本版本分布
-- 容量规划和性能优化
-
-#### 4.2.2 不使用场景
-
-| ❌ 不用于 | 原因 |
-|----------|------|
-| 实时访客数 | 统计的是事件数，不是访客数 |
-| 业务指标报表 | 数据粒度和维度不匹配 |
-| 转化率计算 | 缺少用户级别的追踪 |
-| 漏斗分析 | 缺少事件序列信息 |
-
-#### 4.2.3 数据特点
-
-| 特点 | 说明 |
-|-----|------|
-| **聚合粒度** | 分钟级聚合 (`event_timebucket`) |
-| **数据量** | 小得多 (聚合后的数据) |
-| **维度** | domain, metric, tracker_script_version |
-| **查询目的** | 监控、告警、容量规划 |
-| **存储引擎** | SummingMergeTree (支持自动聚合) |
-
-### 4.3 为什么需要旁路监控？
-
-#### 4.3.1 架构设计考虑
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        主数据流 (业务指标)                              │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   事件摄入 → events_v2 表 → 业务查询 (实时访客、报表等)                │
-│                                                                      │
-│   特点:                                                              │
-│   • 数据完整                                                         │
-│   • 查询灵活                                                         │
-│   • 成本较高 (存储和查询)                                             │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────┐
-│                        旁路数据流 (监控指标)                            │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   事件摄入 → telemetry 事件 → 内存聚合 → ingest_counters 表 → 监控    │
-│                                                                      │
-│   特点:                                                              │
-│   • 数据聚合 (分钟级)                                                 │
-│   • 查询高效                                                         │
-│   • 成本低廉                                                         │
-│   • 不影响主数据流                                                    │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-#### 4.3.2 旁路监控的优势
-
-| 优势 | 说明 |
-|-----|------|
-| **不影响主路径** | 通过 telemetry 事件异步收集，不阻塞事件摄入 |
-| **成本可控** | 内存聚合 + 批量写入 + SummingMergeTree 自动聚合 |
-| **实时监控** | 10 秒刷新周期，近实时反映管道健康状况 |
-| **维度丰富** | 支持按 domain、metric、tracker_script_version 分析 |
-| **故障排查** | `dropped_#{reason}` 指标帮助定位事件丢弃原因 |
-
----
-
-## 5. 页面状态更新机制
-
-### 5.1 实时访客组件的更新机制
-
-#### 5.1.1 全局定时器
+#### 3.1.1 全局定时器
 
 **位置**: `assets/js/dashboard/util/realtime-update-timer.js`
 
@@ -540,286 +408,257 @@ export function start() {
 }
 ```
 
-#### 5.1.2 组件事件监听
+#### 3.1.2 事件驱动架构
 
-**位置**: `assets/js/dashboard/stats/current-visitors.js`
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    全局刷新机制                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  realtime-update-timer.js (定时器模块)                       │
+│              │                                              │
+│              │ 每 30 秒                                     │
+│              ▼                                              │
+│  ┌───────────────────────┐                                 │
+│  │  全局 'tick' 事件       │                                 │
+│  └───────────┬───────────┘                                 │
+│              │                                              │
+│    ┌─────────┼─────────┐                                   │
+│    │         │         │                                   │
+│    ▼         ▼         ▼                                   │
+│  ┌─────┐ ┌─────┐ ┌─────┐                                 │
+│  │组件A│ │组件B│ │组件C│  (组件自主决定是否响应)            │
+│  └─────┘ └─────┘ └─────┘                                 │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 各模块刷新触发条件
+
+#### 3.2.1 CurrentVisitors 组件 (导航栏指示器)
+
+**位置**: `current-visitors.js`
 
 ```javascript
 useEffect(() => {
-  document.addEventListener('tick', updateCount)
-
+  document.addEventListener('tick', updateCount)  // 监听全局 tick 事件
   return () => {
     document.removeEventListener('tick', updateCount)
   }
 }, [updateCount])
+
+useEffect(() => {
+  updateCount()  // 组件挂载或状态变化时刷新
+}, [dashboardState, updateCount])
 ```
 
-#### 5.1.3 更新触发条件
+**刷新触发条件**：
 
-| 触发条件 | 实现位置 | 说明 |
-|---------|---------|------|
-| 全局 `tick` 事件 | `useEffect` 监听 | 每 30 秒自动触发 |
-| 仪表板状态变化 | `useEffect` 依赖 `dashboardState` | 筛选器、时间范围变化时 |
-| 组件挂载 | 第二个 `useEffect` | 首次渲染时获取初始数据 |
-
-### 5.2 事件驱动架构的优势
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                    事件驱动架构                              │
-├────────────────────────────────────────────────────────────┤
-│                                                            │
-│   定时器模块 (realtime-update-timer.js)                   │
-│              │                                             │
-│              │ 每 30 秒                                    │
-│              ▼                                             │
-│   ┌─────────────────────┐                                 │
-│   │ 全局 'tick' 事件     │                                 │
-│   └──────────┬──────────┘                                 │
-│              │                                             │
-│     ┌────────┼────────┐                                   │
-│     │        │        │                                   │
-│     ▼        ▼        ▼                                   │
-│   ┌─────┐ ┌─────┐ ┌─────┐                               │
-│   │组件1│ │组件2│ │组件3│  (解耦：组件之间互不感知)       │
-│   └─────┘ └─────┘ └─────┘                               │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
-
-**优势**:
-1. **解耦**：定时器与更新逻辑完全分离
-2. **可扩展**：新组件只需监听 `tick` 事件即可
-3. **统一控制**：更新频率在一处配置
-4. **易于测试**：可以手动触发 `tick` 事件进行测试
-
----
-
-## 6. 完整架构总结
-
-### 6.1 系统架构全景图
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              前端层                                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────────────┐        ┌──────────────────────┐                 │
-│  │ CurrentVisitors 组件  │        │   实时看板组件        │                 │
-│  │ (导航栏指示器)        │        │   (所有图表/表格)     │                 │
-│  ├──────────────────────┤        ├──────────────────────┤                 │
-│  │ • 监听 'tick' 事件   │        │ • 依赖各自刷新机制    │                 │
-│  │ • 30秒自动刷新       │        │ • 使用 period 参数    │                 │
-│  │ • 调用专用 API       │        │ • 调用通用查询 API    │                 │
-│  └──────────┬───────────┘        └──────────┬───────────┘                 │
-│             │                                 │                              │
-│             ▼                                 ▼                              │
-│  ┌───────────────────────────────────────────────────────────────┐         │
-│  │                    全局定时器 (30秒)                            │         │
-│  │              realtime-update-timer.js                          │         │
-│  └───────────────────────────────────────────────────────────────┘         │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              API 层                                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────────────────────┐    ┌──────────────────────────────┐     │
-│  │ GET /api/stats/{domain}/     │    │ 通用查询端点                  │     │
-│  │     current-visitors         │    │ /api/stats/query, /breakdown  │     │
-│  ├──────────────────────────────┤    ├──────────────────────────────┤     │
-│  │ • 专用端点                   │    │ • 统一查询框架                │     │
-│  │ • 无参数                     │    │ • 支持 period=realtime_30m   │     │
-│  │ • 返回单个整数               │    │ • 支持复杂筛选和聚合          │     │
-│  └──────────────┬───────────────┘    └──────────────┬───────────────┘     │
-│                 │                                     │                      │
-│                 ▼                                     ▼                      │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │                    StatsController                                      │ │
-│  │  • current_visitors/2 → Stats.current_visitors/1                       │ │
-│  │  • query/2, breakdown/2 → QueryBuilder.build/3                        │ │
-│  └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              业务逻辑层                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────────────────────┐    ┌──────────────────────────────┐     │
-│  │  Stats.current_visitors/1    │    │    QueryBuilder.build/3      │     │
-│  │  (stats.ex:30-32)            │    │    (query_builder.ex)        │     │
-│  ├──────────────────────────────┤    ├──────────────────────────────┤     │
-│  │ • 代理到 CurrentVisitors      │    │ • 统一查询构建               │     │
-│  │ • 默认 5 分钟窗口             │    │ • 处理 :realtime_30m        │     │
-│  │ • 支持自定义 duration         │    │ • 30 分钟窗口               │     │
-│  └──────────────┬───────────────┘    └──────────────┬───────────────┘     │
-│                 │                                     │                      │
-│                 ▼                                     ▼                      │
-│  ┌──────────────────────────────┐    ┌──────────────────────────────┐     │
-│  │ CurrentVisitors.             │    │    统一 Query 执行            │     │
-│  │   current_visitors/2         │    │                               │     │
-│  │ (current_visitors.ex)        │    │                               │     │
-│  ├──────────────────────────────┤    ├──────────────────────────────┤     │
-│  │ • 独立窗口计算 (5分钟)        │    │ • query_builder 窗口计算      │     │
-│  │ • 直接写 Ecto 查询           │    │ • 30分钟窗口                  │     │
-│  │ • 不使用 QueryBuilder        │    │ • 完整的查询构建流程          │     │
-│  └──────────────┬───────────────┘    └──────────────┬───────────────┘     │
-│                 │                                     │                      │
-│                 └─────────────────┬───────────────────┘                      │
-│                                   │                                            │
-│                                   ▼                                            │
-│                        ┌──────────────────────┐                              │
-│                        │   events_v2 表        │                              │
-│                        │   (直接数据源)        │                              │
-│                        └──────────────────────┘                              │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              旁路监控层 (独立)                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │                         事件摄入管道                                     │ │
-│  │  Plausible.Ingestion.Event                                             │ │
-│  └───────────────────────────────┬───────────────────────────────────────┘ │
-│                                  │                                            │
-│                                  │ 发射 telemetry 事件                        │
-│                                  ▼                                            │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │                   TelemetryHandler (telemetry_handler.ex)              │ │
-│  │  • 监听 [:plausible, :ingestion, :event, :buffered/:dropped]          │ │
-│  │  • 调用 Buffer.aggregate/5                                              │ │
-│  └───────────────────────────────┬───────────────────────────────────────┘ │
-│                                  │                                            │
-│                                  ▼                                            │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │                   Counters.Buffer (buffer.ex)                          │ │
-│  │  • 内存聚合计数                                                         │ │
-│  │  • 按 timebucket、metric、domain 维度聚合                               │ │
-│  └───────────────────────────────┬───────────────────────────────────────┘ │
-│                                  │                                            │
-│                                  │ 每 10 秒刷新                               │
-│                                  ▼                                            │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │                   Counters.handle_cycle/2 (counters.ex:66-99)         │ │
-│  │  • 刷新缓冲区                                                            │ │
-│  │  • 转换为分钟级时间桶                                                    │ │
-│  │  • 异步插入到数据库                                                      │ │
-│  └───────────────────────────────┬───────────────────────────────────────┘ │
-│                                  │                                            │
-│                                  ▼                                            │
-│  ┌───────────────────────────────────────────────────────────────────────┐ │
-│  │                   ingest_counters 表 (record.ex)                       │ │
-│  │  • SummingMergeTree 引擎                                                │ │
-│  │  • 自动聚合                                                              │ │
-│  │  • 仅用于监控，不用于业务指标                                             │ │
-│  └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 关键数据对照表
-
-| 数据项 | 实时访客接口链路 | 实时看板通用查询链路 | 成本计数链路 |
-|-------|-----------------|---------------------|-------------|
-| **直接数据源** | `events_v2` | `events_v2` | 无 (旁路) |
-| **存储表** | 无 (直接查询) | 无 (直接查询) | `ingest_counters` |
-| **窗口大小** | 5 分钟 (默认) | 30 分钟 | 分钟级聚合 |
-| **窗口计算位置** | `current_visitors.ex` | `query_builder.ex` | `counters.ex` |
-| **刷新频率** | 30 秒 (前端) | 依赖组件 | 10 秒 (后端刷新) |
-| **聚合方式** | `uniq(user_id)` | 多种指标 | `SummingMergeTree` |
-| **用途** | 当前在线访客数 | 实时看板所有指标 | 摄入管道监控 |
-
-### 6.3 常见误区澄清
-
-| 误区 | 真相 |
-|-----|------|
-| ❌ `current_visitors.ex` 使用 `query_builder.ex` 的窗口计算 | ✅ 两套完全独立的实现 |
-| ❌ 实时访客数使用 `ingest_counters` 表的数据 | ✅ 直接查询 `events_v2` 表 |
-| ❌ `realtime` 和 `realtime_30m` 是同一回事 | ✅ 前端显示用 `realtime`，实际查询用 `realtime_30m` (30分钟) |
-| ❌ 成本计数链路用于业务指标 | ✅ 仅用于监控摄入管道健康状况 |
-| ❌ 所有实时查询都走统一 QueryBuilder | ✅ 实时访客接口是独立实现 |
-
----
-
-## 7. 代码位置速查
-
-### 7.1 实时访客接口链路
-
-| 功能 | 文件路径 | 行号 |
-|-----|---------|------|
-| 控制器端点 | `lib/plausible_web/controllers/api/stats_controller.ex` | 1236-1239 |
-| Stats 模块代理 | `lib/plausible/stats.ex` | 30-32 |
-| 核心查询实现 | `lib/plausible/stats/current_visitors.ex` | 6-19 |
-| 前端组件 | `assets/js/dashboard/stats/current-visitors.js` | 12-81 |
-| 全局定时器 | `assets/js/dashboard/util/realtime-update-timer.js` | 1-8 |
-
-### 7.2 实时看板通用查询链路
-
-| 功能 | 文件路径 | 行号 |
-|-----|---------|------|
-| 前端周期定义 | `assets/js/dashboard/dashboard-time-periods.ts` | 28-43 |
-| 前端周期转换 | `assets/js/dashboard/stats/graph/fetch-main-graph.ts` | 32 |
-| 后端周期解析 | `lib/plausible/stats/dashboard/query_parser.ex` | 41 |
-| 统一窗口计算 | `lib/plausible/stats/query_builder.ex` | 88-100 |
-
-### 7.3 成本计数链路 (旁路监控)
-
-| 功能 | 文件路径 | 行号 |
-|-----|---------|------|
-| 主模块 | `lib/plausible/ingestion/counters.ex` | 1-130 |
-| 缓冲刷新逻辑 | `lib/plausible/ingestion/counters.ex` | 66-99 |
-| Telemetry 处理器 | `lib/plausible/ingestion/counters/telemetry_handler.ex` | 18-64 |
-| 数据结构定义 | `lib/plausible/ingestion/counters/record.ex` | 10-17 |
-| 缓冲模块 | `lib/plausible/ingestion/counters/buffer.ex` | 完整文件 |
-
----
-
-## 8. 总结
-
-### 8.1 核心结论
-
-1. **两条独立的实时查询链路**：
-   - 实时访客接口链路：专用、简单、5分钟窗口、独立实现
-   - 实时看板通用查询链路：通用、复杂、30分钟窗口、统一 QueryBuilder
-
-2. **窗口计算归属明确**：
-   - `current_visitors.ex` 有自己独立的窗口计算（默认5分钟）
-   - `query_builder.ex` 中的窗口计算用于实时看板（30分钟）
-   - 两套实现完全独立，没有依赖关系
-
-3. **成本计数链路是旁路监控**：
-   - 与实时访客数计算**完全无关**
-   - 仅用于监控事件摄入管道的健康状况
-   - 数据存储在 `ingest_counters` 表，不用于业务指标
-
-4. **直接数据源是 events_v2 表**：
-   - 两条实时查询链路都直接查询 `events_v2` 表
-   - `ingest_counters` 是旁路存储，仅用于监控
-
-### 8.2 设计权衡
-
-| 设计决策 | 优势 | 劣势 |
+| 触发条件 | 类型 | 说明 |
 |---------|------|------|
-| 两套独立实时链路 | 实时访客接口简单高效 | 维护成本高，行为可能不一致 |
-| 旁路监控架构 | 不影响主路径，成本可控 | 需要维护额外的监控系统 |
-| 30秒刷新频率 | 平衡实时性和资源消耗 | 对于某些场景可能不够实时 |
-| 5分钟 vs 30分钟窗口 | 各场景针对性优化 | 用户可能困惑于差异 |
+| 全局 `tick` 事件 | 定时 | 每 30 秒自动刷新 |
+| `dashboardState` 变化 | 状态 | 筛选器、时间范围等变化时 |
+| 组件挂载 | 生命周期 | 首次渲染时获取初始数据 |
 
-### 8.3 未来优化建议
+**链路类型**：实时访客接口链路（独立 API）
 
-1. **统一窗口计算**：考虑将实时访客接口迁移到统一的 QueryBuilder 框架
-2. **明确窗口差异**：在 UI 中明确显示不同实时视图的窗口大小
-3. **监控告警**：利用 `ingest_counters` 数据建立自动告警机制
-4. **性能优化**：考虑为高频的实时访客查询添加缓存层
+#### 3.2.2 实时看板模块
+
+**刷新机制**：实时看板模块**不直接监听全局 `tick` 事件**，而是依赖 React Query 的缓存机制。
+
+**刷新触发条件**：
+
+| 触发条件 | 类型 | 说明 |
+|---------|------|------|
+| 缓存过期 | 自动 | 当 `staleTime` 到期后，下次访问时重新获取 |
+| 组件挂载 | 生命周期 | 首次渲染时检查缓存 |
+| `dashboardState` 变化 | 状态 | 查询参数变化时触发新查询 |
+| 用户交互 | 手动 | 切换指标、展开详情等操作 |
+
+**关键**：实时看板的刷新**依赖缓存时效**，而不是全局定时器。
+
+### 3.3 刷新触发条件对照表
+
+| 模块 | 监听全局 tick | 刷新触发条件 | 链路类型 |
+|-----|-------------|-------------|---------|
+| **CurrentVisitors (导航栏)** | ✅ 是 | 30秒定时 + 状态变化 | 实时访客接口链路 |
+| **Top Stats (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+| **Main Graph (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+| **Sources (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+| **Pages (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+| **Locations (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+| **Devices (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+| **Behaviours (实时看板)** | ❌ 否 | 缓存过期 + 组件挂载 + 状态变化 | 实时看板通用查询链路 |
+
+**重要发现**：
+> 导航栏的 `CurrentVisitors` 组件**直接监听全局 `tick` 事件**，每 30 秒强制刷新；而实时看板内部的模块**不监听 `tick` 事件**，完全依赖 React Query 的缓存机制。
 
 ---
 
-**报告完成时间**: 2026-05-03
+## 4. 缓存时效与全局刷新节奏的配合
 
-**分析范围**: Plausible Analytics 实时访客指标刷新机制
+### 4.1 缓存时效配置
+
+#### 4.1.1 缓存常量定义
+
+**位置**: `assets/js/dashboard/hooks/api-client.ts:17-21`
+
+```typescript
+// define (in ms) when query API responses should become stale
+export const CACHE_TTL_REALTIME = REALTIME_UPDATE_TIME_MS  // 30_000 ms = 30秒
+export const CACHE_TTL_SHORT_ONGOING = 5 * 60 * 1000       // 5分钟
+export const CACHE_TTL_LONG_ONGOING = 60 * 60 * 1000       // 1小时
+export const CACHE_TTL_HISTORICAL = 12 * 60 * 60 * 1000    // 12小时
+```
+
+#### 4.1.2 关键常量关系
+
+```typescript
+// realtime-update-timer.js
+export const REALTIME_UPDATE_TIME_MS = 30_000  // 30秒
+
+// api-client.ts
+export const CACHE_TTL_REALTIME = REALTIME_UPDATE_TIME_MS  // 30秒（与全局刷新同步）
+```
+
+**关键设计**：
+> `CACHE_TTL_REALTIME` **完全等于** `REALTIME_UPDATE_TIME_MS`，确保缓存时效与全局刷新节奏**完全同步**。
+
+### 4.2 缓存时效计算逻辑
+
+#### 4.2.1 getStaleTime 函数
+
+**位置**: `assets/js/dashboard/hooks/api-client.ts:138-162`
+
+```typescript
+export const getStaleTime = (props: DashboardTimeSettings): number => {
+  // 实时周期 (realtime 或 realtime_30m)
+  if (
+    [DashboardPeriod.realtime, DashboardPeriod.realtime_30m].includes(
+      props.period
+    )
+  ) {
+    return CACHE_TTL_REALTIME  // 30秒
+  }
+
+  // 历史周期 (不包含今天)
+  if (isHistoricalPeriod(props)) {
+    return CACHE_TTL_HISTORICAL  // 12小时
+  }
+
+  // 进行中的周期 (包含今天)
+  const availableIntervals = validIntervals(props)
+
+  if (
+    availableIntervals.includes(Interval.day) ||
+    availableIntervals.includes(Interval.hour) ||
+    availableIntervals.includes(Interval.minute)
+  ) {
+    return CACHE_TTL_SHORT_ONGOING  // 5分钟
+  } else {
+    return CACHE_TTL_LONG_ONGOING   // 1小时
+  }
+}
+```
+
+#### 4.2.2 缓存时效对照表
+
+| 周期类型 | period 值 | staleTime (缓存时效) | 说明 |
+|---------|-----------|---------------------|------|
+| **实时周期** | `realtime` / `realtime_30m` | **30 秒** | 与全局刷新节奏完全同步 |
+| **历史周期** | 不包含今天的周期 | **12 小时** | 数据不再变化，缓存时间长 |
+| **短期进行中** | day, 7d 等 (支持 day/hour/minute 间隔) | **5 分钟** | 数据仍在变化，需要较频繁刷新 |
+| **长期进行中** | 12mo, year 等 (不支持短间隔) | **1 小时** | 数据变化较慢，缓存时间较长 |
+
+### 4.3 缓存时效与全局刷新的配合机制
+
+#### 4.3.1 架构图解
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    缓存时效与全局刷新配合机制                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    全局刷新节奏 (30秒)                            │   │
+│  │                                                                   │   │
+│  │  realtime-update-timer.js                                        │   │
+│  │         │                                                         │   │
+│  │         │ 每 30 秒                                                │   │
+│  │         ▼                                                         │   │
+│  │  ┌─────────────────┐                                              │   │
+│  │  │ 全局 'tick' 事件 │ ←── 仅 CurrentVisitors 组件监听             │   │
+│  │  └─────────────────┘                                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    缓存时效配置 (React Query)                      │   │
+│  │                                                                   │   │
+│  │  实时周期: staleTime = 30 秒 (CACHE_TTL_REALTIME)                │   │
+│  │         │                                                         │   │
+│  │         │ 与全局刷新节奏完全同步                                   │   │
+│  │         ▼                                                         │   │
+│  │  ┌─────────────────────────────────────────────────────────┐   │   │
+│  │  │  实际效果:                                                 │   │   │
+│  │  │  • 30秒后缓存过期                                          │   │   │
+│  │  │  • 下次访问时重新获取数据                                   │   │   │
+│  │  │  • 效果上等同于每30秒刷新一次                               │   │   │
+│  │  └─────────────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    配合效果                                        │   │
+│  │                                                                   │   │
+│  │  全局定时器 (30秒)                                                │   │
+│  │         │                                                         │   │
+│  │         ├───→ CurrentVisitors 组件: 强制刷新 (通过 tick 事件)   │   │
+│  │         │                                                         │   │
+│  │         └───→ 实时看板模块: 缓存过期 (通过 staleTime)            │   │
+│  │              下次访问时自动刷新                                   │   │
+│  │                                                                   │   │
+│  │  结果: 所有实时数据每 30 秒都会更新                               │   │
+│  │                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.3.2 时间线示意图
+
+```
+时间轴: 0s ────────── 30s ────────── 60s ────────── 90s ──────────→
+
+全局定时器:
+         │              │              │              │
+         ├──── tick ────┼──── tick ────┼──── tick ────┼────→
+         │              │              │              │
+
+CurrentVisitors 组件 (导航栏):
+         │              │              │              │
+         ├──── 刷新 ────┼──── 刷新 ────┼──── 刷新 ────┼────→
+         (监听 tick 事件，强制刷新)
+
+实时看板模块 (通过缓存机制):
+         │              │              │              │
+         │  缓存新鲜    │  缓存过期    │  缓存过期    │
+         │  (0-30s)    │  (30s后)    │  (60s后)    │
+         │              │              │              │
+         ├──────────────┼──────────────┼──────────────┼────→
+                        │              │              │
+                        └── 下次访问时 └── 下次访问时 └──→
+                            重新获取        重新获取
+
+关键:
+• CurrentVisitors: 每 30 秒强制刷新 (主动)
+• 实时看板模块: 每 30 秒缓存过期，下次访问时刷新 (被动)
+• 两者的刷新节奏完全同步 (都是 30 秒)
+```
+
+### 4.4 为什么这样设计？
+
+#### 4.4.1 设计考量
+
+| 设计决策 | 原因 |
+|---------|------|
+| **CurrentVisitors 直接监听 tick** | 导航栏指示器需要**即时响应**，用户期望看到实时更新 |
+| **实时看板依赖缓存机制
