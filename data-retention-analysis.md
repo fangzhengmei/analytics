@@ -1791,7 +1791,684 @@ end
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 10. 结论
+## 10. 兼容分流深度分析：Legacy 入口、Compare 场景与提示一致性
+
+本节深入分析系统中存在的三条兼容分流路径：Legacy 入口与当前入口的参数差异、Compare 场景下导入范围合并的边界情况、以及 Skip Reason 在不同统计面板提示不一致的原因。
+
+### 10.1 Legacy 入口与当前入口的分流差异
+
+系统中存在两条独立的查询入口路径，分别服务于不同的 API 端点和客户端。
+
+#### 10.1.1 两条入口路径概述
+
+| 入口类型 | 入口函数 | 使用场景 | 参数来源 |
+|----------|----------|----------|----------|
+| **Legacy 入口** | `Query.from/3` → `Legacy.QueryBuilder.from/4` | 细分 API（sources、channels、pages 等）、外部 Stats API v1 | URL 查询参数（旧格式） |
+| **当前入口** | `Query.parse_and_build/3` → `Dashboard.QueryParser.parse/2` → `QueryBuilder.build/3` | 统一 `query/2` API | JSON Body 参数（新格式） |
+
+#### 10.1.2 Legacy 入口参数解析
+
+**入口位置**：`lib/plausible/stats/query.ex:74-82`
+
+```elixir
+def from(site, params, opts \\ []) do
+  Legacy.QueryBuilder.from(
+    site,
+    params,
+    Keyword.get(opts, :debug_metadata, %{}),
+    Keyword.get(opts, :now)
+  )
+end
+```
+
+**使用 Legacy 入口的 API 端点**（`lib/plausible_web/controllers/api/stats_controller.ex`）：
+
+| 端点 | 行号 | 调用方式 |
+|------|------|----------|
+| `sources/2` | 第 62 行 | `Query.from(site, params, ...)` |
+| `channels/2` | 第 102 行 | `Query.from(site, params, ...)` |
+| `pages/2` | 第 352 行 | `Query.from(site, params, ...)` |
+| `entry_pages/2` | 第 387 行 | `Query.from(site, params, ...)` |
+| `exit_pages/2` | 第 422 行 | `Query.from(site, params, ...)` |
+| `countries/2` | 第 457 行 | `Query.from(site, params, ...)` |
+| `regions/2` | 第 492 行 | `Query.from(site, params, ...)` |
+| `cities/2` | 第 527 行 | `Query.from(site, params, ...)` |
+| `devices/2` | 第 583 行 | `Query.from(site, params, ...)` |
+| `browsers/2` | 第 616 行 | `Query.from(site, params, ...)` |
+| `operating_systems/2` | 第 660 行 | `Query.from(site, params, ...)` |
+| `custom_events/2` | 第 752 行 | `Query.from(site, params, ...)` |
+| `conversions/2` | 第 819 行 | `Query.from(site, params, ...)` |
+| `props/2` | 第 865 行 | `Query.from(site, params, ...)` |
+| `goals/2` | 第 916 行 | `Query.from(site, params, ...)` |
+| `utm_mediums/2` | 第 954 行 | `Query.from(site, params, ...)` |
+| `utm_sources/2` | 第 1001 行 | `Query.from(site, params, ...)` |
+| `utm_campaigns/2` | 第 1039 行 | `Query.from(site, params, ...)` |
+| `utm_contents/2` | 第 1086 行 | `Query.from(site, params, ...)` |
+| `utm_terms/2` | 第 1134 行 | `Query.from(site, params, ...)` |
+
+**外部 Stats API v1** 也使用 Legacy 入口（`lib/plausible_web/controllers/api/external_stats_controller.ex`）：
+- 第 19、39、257 行均调用 `Query.from(site, params, ...)`
+
+#### 10.1.3 当前入口参数解析
+
+**入口位置**：`lib/plausible/stats/query.ex:50-59`
+
+```elixir
+def parse_and_build(
+      %Plausible.Site{domain: domain} = site,
+      %{"site_id" => domain} = params,
+      opts \\ []
+    ) do
+  with {:ok, %ParsedQueryParams{} = parsed_query_params} <-
+         ApiQueryParser.parse(params, opts) do
+    QueryBuilder.build(site, parsed_query_params, Keyword.get(opts, :debug_metadata, %{}))
+  end
+end
+```
+
+**使用当前入口的 API 端点**：
+- `stats_controller.ex` 中的 `query/2`（第 40-57 行）：
+  ```elixir
+  def query(conn, params) do
+    with {:ok, %ParsedQueryParams{} = params} <- Dashboard.QueryParser.parse(params, now: now),
+         {:ok, %Query{} = query} <- QueryBuilder.build(site, params, debug_metadata(conn)) do
+      json(conn, Plausible.Stats.query(site, query))
+    end
+  end
+  ```
+
+#### 10.1.4 关键参数差异：`with_imported` vs `include.imports`
+
+这是两条入口最关键的差异：
+
+**Legacy 入口**（`lib/plausible/stats/legacy/legacy_query_builder.ex:248-256`）：
+
+```elixir
+defp put_include(query, params) do
+  include = parse_include(params["include"])
+
+  query
+  |> struct!(include: include)
+  |> Query.set_include(:compare, parse_include_compare(params))
+  |> Query.set_include(:compare_match_day_of_week, params["match_day_of_week"] == "true")
+  |> Query.set_include(:imports, params["with_imported"] == "true")  # 关键：使用 with_imported 参数
+end
+```
+
+- **参数名**：`with_imported`（字符串类型）
+- **值比较**：`params["with_imported"] == "true"`
+- **来源**：URL 查询参数，如 `?with_imported=true`
+
+**当前入口**（`lib/plausible/stats/dashboard/query_parser.ex:76-93`）：
+
+```elixir
+defp parse_include(params) do
+  with {:ok, compare} <- parse_include_compare(params["include"]) do
+    {:ok,
+     %QueryInclude{
+       imports: params["include"]["imports"] == true,  # 关键：使用 include.imports
+       imports_meta: params["include"]["imports_meta"] == true,
+       compare: compare,
+       compare_match_day_of_week: params["include"]["compare_match_day_of_week"] == true,
+       time_labels: params["include"]["time_labels"] == true,
+       # ...
+     }}
+  end
+end
+```
+
+- **参数名**：`include.imports`（嵌套在 `include` 对象中）
+- **值比较**：`params["include"]["imports"] == true`（布尔值）
+- **来源**：JSON Body，如 `{ "include": { "imports": true } }`
+
+#### 10.1.5 设计取舍与影响
+
+| 维度 | Legacy 入口 | 当前入口 | 设计取舍 |
+|------|-------------|----------|----------|
+| **参数格式** | URL 查询字符串（扁平） | JSON Body（结构化） | 向后兼容 vs 现代 API 设计 |
+| **布尔值表示** | 字符串 `"true"` | 布尔值 `true` | URL 参数限制 vs 类型安全 |
+| **使用场景** | 细分 API、外部 API v1 | 统一 `query` API | 渐进式迁移策略 |
+| **前端调用** | 旧版 Dashboard 组件 | 新版 Dashboard 组件 | 双轨制运行 |
+
+**潜在风险**：
+1. **参数名称混淆**：开发者可能混淆 `with_imported` 和 `include.imports`
+2. **类型不匹配**：Legacy 入口使用字符串比较，当前入口使用布尔值比较
+3. **测试覆盖**：两条路径需要分别测试，增加维护成本
+
+**设计意图**：
+- 保持向后兼容性：现有 API 客户端无需修改
+- 渐进式迁移：新功能使用当前入口，旧功能保持 Legacy 入口
+- 统一最终逻辑：两条入口最终都调用 `Query.put_imported_opts/2` 进行相同的导入数据判定
+
+### 10.2 Compare 场景下导入范围合并的边界
+
+当用户启用"同期对比"功能时，系统需要同时考虑主查询时间范围和比较查询时间范围内的导入数据。
+
+#### 10.2.1 导入范围合并逻辑
+
+**核心实现**：`lib/plausible/stats/query.ex:177-189`
+
+```elixir
+defp get_imports_in_range(site, query) do
+  in_range = Plausible.Imported.completed_imports_in_query_range(site, query)
+  
+  in_comparison_range =
+    if query.include.compare do
+      comparison_query = Comparisons.get_comparison_query(query)
+      Plausible.Imported.completed_imports_in_query_range(site, comparison_query)
+    else
+      []
+    end
+  
+  in_comparison_range ++ in_range  # 合并两个范围的导入
+end
+```
+
+**流程拆解**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Compare 场景导入范围合并流程                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 获取主查询范围内的导入                                                    │
+│     └─ in_range = completed_imports_in_query_range(site, query)            │
+│                                                                             │
+│  2. 检查是否启用比较功能                                                      │
+│     └─ if query.include.compare do ...                                      │
+│                                                                             │
+│  3. 构建比较查询                                                             │
+│     └─ comparison_query = Comparisons.get_comparison_query(query)          │
+│         ├─ 复制原查询的大部分属性                                            │
+│         └─ 替换 utc_time_range 为比较时间范围                                │
+│                                                                             │
+│  4. 获取比较查询范围内的导入                                                  │
+│     └─ in_comparison_range = completed_imports_in_query_range(...)          │
+│                                                                             │
+│  5. 合并两个范围的导入                                                        │
+│     └─ in_comparison_range ++ in_range                                      │
+│         └─ 使用列表拼接操作符 ++，保持顺序                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 10.2.2 比较时间范围计算
+
+**核心函数**：`lib/plausible/stats/comparisons.ex:50-72`
+
+```elixir
+def get_comparison_utc_time_range(%Stats.Query{} = source_query) do
+  datetime_range =
+    case source_query.include.compare do
+      {:datetime_range, from, to} ->
+        DateTimeRange.new!(from, to)
+      
+      _ ->
+        if use_datetime_for_comparison?(source_query) do
+          get_comparison_datetime_range(source_query)  # 24h 或当天的精确时间
+        else
+          comparison_date_range = get_comparison_date_range(source_query)
+          DateTimeRange.new!(
+            comparison_date_range.first,
+            comparison_date_range.last,
+            source_query.timezone
+          )
+        end
+    end
+  
+  DateTimeRange.to_timezone(datetime_range, "Etc/UTC")
+end
+```
+
+**比较模式**：
+
+| 比较模式 | 参数值 | 计算方式 |
+|----------|--------|----------|
+| **上一周期** | `:previous_period` | 按天数向前偏移相同天数 |
+| **同比去年** | `:year_over_year` | 向前偏移 1 年 |
+| **自定义范围** | `{:date_range, from, to}` | 使用用户指定的日期范围 |
+
+#### 10.2.3 四种边界情况分析
+
+**情况 1：主查询有导入，比较查询无导入**
+
+```
+主查询范围：2024-01-01 ~ 2024-01-31
+比较范围：  2023-12-01 ~ 2023-12-31
+
+导入数据：
+  导入 A：2024-01-01 ~ 2024-01-15 ✓（主查询范围内）
+  导入 B：2023-11-01 ~ 2023-11-30 ✗（比较范围外）
+
+合并结果：[导入 A]
+skip_imported_reason：不会触发（因为有导入在范围内）
+```
+
+**情况 2：主查询无导入，比较查询有导入**
+
+```
+主查询范围：2024-01-01 ~ 2024-01-31
+比较范围：  2023-12-01 ~ 2023-12-31
+
+导入数据：
+  导入 A：2023-12-10 ~ 2023-12-20 ✓（比较范围内）
+  导入 B：2024-02-01 ~ 2024-02-28 ✗（主查询范围外）
+
+合并结果：[导入 A]
+skip_imported_reason：不会触发
+```
+
+**情况 3：两者都有导入**
+
+```
+主查询范围：2024-01-01 ~ 2024-01-31
+比较范围：  2023-12-01 ~ 2023-12-31
+
+导入数据：
+  导入 A：2024-01-01 ~ 2024-01-15 ✓（主查询范围内）
+  导入 B：2023-12-10 ~ 2023-12-20 ✓（比较范围内）
+
+合并结果：[导入 B, 导入 A]（++ 操作符保持顺序）
+skip_imported_reason：不会触发
+```
+
+**情况 4：两者都无导入**
+
+```
+主查询范围：2024-01-01 ~ 2024-01-31
+比较范围：  2023-12-01 ~ 2023-12-31
+
+导入数据：
+  导入 A：2022-01-01 ~ 2022-12-31 ✗（两个范围都不包含）
+
+合并结果：[]
+skip_imported_reason：`:out_of_range`
+```
+
+#### 10.2.4 特殊边界：实时查询
+
+**代码位置**：`lib/plausible/stats/query.ex:172-175`
+
+```elixir
+defp get_imports_in_range(_site, %__MODULE__{input_date_range: period})
+     when period in [:realtime, :realtime_30m] do
+  []  # 实时查询直接返回空列表
+end
+```
+
+**设计含义**：
+- 实时查询（`realtime` 和 `realtime_30m`）永远不会包含导入数据
+- 这是语义上的合理限制：实时数据是"现在"的，导入数据是历史的
+- 即使启用 Compare 功能，实时查询的比较范围也不会包含导入数据
+
+#### 10.2.5 设计取舍与影响
+
+| 设计决策 | 选择 | 理由 | 权衡 |
+|----------|------|------|------|
+| **合并策略** | `in_comparison_range ++ in_range` | 确保两个范围的导入都被考虑 | 可能导入数据跨两个范围，但不会重复计算 |
+| **优先级** | 比较范围在前，主范围在后 | 列表顺序不影响 `imports_in_range == []` 判断 | 顺序对去重无影响（使用 `++` 而非 `MapSet.union`） |
+| **去重策略** | 无显式去重 | `completed_imports_in_query_range` 已返回唯一导入 | 如果导入同时在两个范围，会出现重复？ |
+| **实时查询** | 直接返回 `[]` | 语义清晰：实时 ≠ 历史 | 即使 Compare 也不例外 |
+
+**潜在问题分析**：
+
+```elixir
+# 假设存在一个导入同时覆盖主范围和比较范围
+导入 C：2023-12-15 ~ 2024-01-15
+
+主查询范围：2024-01-01 ~ 2024-01-31 → 包含导入 C
+比较范围：  2023-12-01 ~ 2023-12-31 → 包含导入 C
+
+# 合并结果：[导入 C, 导入 C]（重复！）
+```
+
+**实际影响**：
+- `imports_in_range` 用于两个地方：
+  1. `:out_of_range` 判断：`query.imports_in_range == []` → 重复不影响（列表非空）
+  2. `complete_import_ids/1`：已通过 `Enum.uniq()` 去重（见下文）
+
+**去重保障**：`lib/plausible/imported.ex:67-79`
+
+```elixir
+def complete_import_ids(site) do
+  imports = get_completed_imports(site)
+  has_legacy? = Enum.any?(imports, fn %{legacy: legacy?} -> legacy? end)
+  ids = Enum.map(imports, fn %{id: id} -> id end)  # 从 SiteImport 记录获取，已去重
+  
+  if has_legacy? do
+    [0 | ids]
+  else
+    ids
+  end
+end
+```
+
+- `complete_import_ids/1` 从 `SiteImport` 记录获取 ID，天然去重
+- `imports_in_range` 中的重复只影响 `:out_of_range` 判断（非空即有效）
+- 实际 SQL 查询使用 `import_id in ^import_ids`，不会重复
+
+### 10.3 Skip Reason 在不同统计面板提示不一致的原因
+
+前端系统中，不同统计面板对 `skip_imported_reason` 的显示逻辑存在差异，导致用户体验不一致。
+
+#### 10.3.1 核心显示逻辑
+
+**警告组件**：`assets/js/dashboard/stats/imported-query-unsupported-warning.js`
+
+```javascript
+const show =
+  dashboardState &&
+  dashboardState.with_imported &&              // 条件1：用户请求了导入数据
+  skipImportedReason === 'unsupported_query' && // 条件2：原因必须是 unsupported_query
+  dashboardState.period !== 'realtime'          // 条件3：不是实时查询
+```
+
+**核心规则**：
+1. 只有当 `skipImportedReason === 'unsupported_query'` 时才显示警告
+2. 其他原因（`:no_imported_data`、`:out_of_range`、`:unsupported_interval`）都不显示
+
+#### 10.3.2 不同面板的实现差异
+
+让我分析五个主要统计面板的实现：
+
+**面板 1：Sources（来源面板）**
+位置：`assets/js/dashboard/stats/sources/index.js`
+
+```javascript
+// 第 184 行：状态初始化
+const [skipImportedReason, setSkipImportedReason] = useState(null)
+
+// 第 235-248 行：数据获取后处理
+const afterFetchData = useCallback((apiResponse) => {
+  setLoading(false)
+  if (apiResponse) {
+    setSkipImportedReason(apiResponse.skip_imported_reason)  // 正确提取
+    // ...
+  }
+}, [])
+
+// 第 367-370 行：渲染警告
+<ImportedQueryUnsupportedWarning
+  loading={loading}
+  skipImportedReason={skipImportedReason}
+/>
+```
+
+**面板 2：Pages（页面面板）**
+位置：`assets/js/dashboard/stats/pages/index.js`
+
+```javascript
+// 第 159 行：状态初始化
+const [skipImportedReason, setSkipImportedReason] = useState(null)
+
+// 第 167-175 行：数据获取后处理
+function afterFetchData(apiResponse) {
+  setLoading(false)
+  setSkipImportedReason(apiResponse.skip_imported_reason)  // 正确提取
+  // ...
+}
+
+// 第 239-242 行：渲染警告
+<ImportedQueryUnsupportedWarning
+  loading={loading}
+  skipImportedReason={skipImportedReason}
+/>
+```
+
+**面板 3：Devices（设备面板）**
+位置：`assets/js/dashboard/stats/devices/index.js`
+
+```javascript
+// 第 431 行：状态初始化
+const [skipImportedReason, setSkipImportedReason] = useState(null)
+
+// 第 439-447 行：数据获取后处理
+function afterFetchData(apiResponse) {
+  setLoading(false)
+  setSkipImportedReason(apiResponse.skip_imported_reason)  // 正确提取
+  // ...
+}
+
+// 第 524-527 行：渲染警告
+<ImportedQueryUnsupportedWarning
+  loading={loading}
+  skipImportedReason={skipImportedReason}
+/>
+```
+
+**面板 4：Locations（地理位置面板）**
+位置：`assets/js/dashboard/stats/locations/index.js`
+
+```javascript
+// 第 154 行：状态初始化
+skipImportedReason: null,
+
+// 第 202-215 行：数据获取后处理
+afterFetchData(apiResponse) {
+  // ...
+  this.setState({
+    loading: false,
+    moreLinkState: newMoreLinkState,
+    skipImportedReason: apiResponse.skip_imported_reason  // 正确提取
+  })
+}
+
+// 第 294-297 行：渲染警告
+<ImportedQueryUnsupportedWarning
+  loading={this.state.loading}
+  skipImportedReason={this.state.skipImportedReason}
+/>
+```
+
+**面板 5：Behaviours（行为面板）**
+位置：`assets/js/dashboard/stats/behaviours/index.js`
+
+```javascript
+// 第 145 行：状态初始化
+const [skipImportedReason, setSkipImportedReason] = useState(null)
+
+// 第 256-264 行：数据获取后处理
+function afterFetchData(apiResponse) {
+  setLoading(false)
+  setSkipImportedReason(apiResponse.skip_imported_reason)  // 正确提取
+  // ...
+}
+
+// 第 440-464 行：特殊渲染逻辑
+function renderImportedQueryUnsupportedWarning() {
+  if (mode === Mode.CONVERSIONS) {
+    return (
+      <ImportedQueryUnsupportedWarning
+        loading={loading}
+        skipImportedReason={skipImportedReason}
+      />
+    )
+  } else if (mode === Mode.PROPS) {
+    return (
+      <ImportedQueryUnsupportedWarning
+        loading={loading}
+        skipImportedReason={skipImportedReason}
+        message="Imported data is unavailable in this view"  // 自定义消息
+      />
+    )
+  } else {
+    // FUNNELS 或 EXPLORATION 模式
+    return (
+      <ImportedQueryUnsupportedWarning
+        altCondition={importedDataInView}  // 关键：使用 altCondition
+        message="Imported data is unavailable in this view"
+      />
+    )
+  }
+}
+```
+
+#### 10.3.3 Behaviours 面板的特殊逻辑
+
+这是导致提示不一致的核心原因。让我深入分析 `altCondition` 的作用：
+
+**警告组件中的 `altCondition`**：`assets/js/dashboard/stats/imported-query-unsupported-warning.js:29`
+
+```javascript
+if (show || altCondition) {  // 逻辑或！
+  return (
+    <FadeIn show={!loading} className="h-4.5">
+      <Tooltip info={tooltipMessage} containerRef={portalRef}>
+        <ExclamationCircleIcon className="mb-1 size-4.5 text-gray-500 dark:text-gray-400" />
+      </Tooltip>
+    </FadeIn>
+  )
+} else {
+  return null
+}
+```
+
+**关键逻辑**：
+- 显示条件是 `show || altCondition`（逻辑或）
+- 即使 `show` 为 false，只要 `altCondition` 为 true，也会显示警告
+
+**`importedDataInView` 的来源**：
+
+在 `behaviours/index.js:561-591`：
+
+```javascript
+function BehavioursOuter({ importedDataInView }) {
+  // ...
+  return enabledModes.length && mode ? (
+    <Behaviours
+      importedDataInView={importedDataInView}  // 从父组件传入
+      mode={mode}
+      setMode={setMode}
+    />
+  ) : null
+}
+
+export default function BehavioursWrapped({ importedDataInView }) {
+  return (
+    <ModesContextProvider>
+      <BehavioursOuter importedDataInView={importedDataInView} />
+    </ModesContextProvider>
+  )
+}
+```
+
+**`importedDataInView` 的含义**：
+- 由更上层的 Dashboard 组件传入
+- 表示"视图中是否存在导入数据"（通过其他方式判断，而非 `skipImportedReason`）
+- 在 FUNNELS 和 EXPLORATION 模式下，即使 `skipImportedReason` 不是 `'unsupported_query'`，只要 `importedDataInView` 为 true，就会显示警告
+
+#### 10.3.4 四种 Skip Reason 的显示行为对比
+
+| Skip Reason | 普通面板（Sources/Pages/Devices/Locations） | Behaviours - Conversions 模式 | Behaviours - Props 模式 | Behaviours - Funnels/Exploration 模式 |
+|-------------|-----------------------------------------------|--------------------------------|--------------------------|----------------------------------------|
+| `:unsupported_query` | 显示 ✓ | 显示 ✓ | 显示 ✓（自定义消息） | 显示 ✓（`altCondition` 或 `show`） |
+| `:no_imported_data` | 不显示 ✗ | 不显示 ✗ | 不显示 ✗ | 可能显示（取决于 `importedDataInView`） |
+| `:out_of_range` | 不显示 ✗ | 不显示 ✗ | 不显示 ✗ | 可能显示（取决于 `importedDataInView`） |
+| `:unsupported_interval` | 不显示 ✗ | 不显示 ✗ | 不显示 ✗ | 可能显示（取决于 `importedDataInView`） |
+
+#### 10.3.5 设计取舍与影响
+
+**为什么只显示 `:unsupported_query`**？
+
+`lib/plausible/stats/query_result.ex:18-24` 中的预定义警告消息：
+
+```elixir
+@imports_warnings %{
+  unsupported_query:
+    "Imported stats are not included in the results because query parameters are not supported. " <>
+      "For more information, see: https://plausible.io/docs/stats-api#filtering-imported-stats",
+  unsupported_interval:
+    "Imported stats are not included because the time dimension (i.e. the interval) is too short."
+}
+```
+
+**设计意图**：
+1. **`:unsupported_query`**：用户可以调整查询参数来解决（如移除某些过滤器），需要提示
+2. **`:unsupported_interval`**：虽然有消息，但前端组件不显示（可能有其他时间粒度提示）
+3. **`:no_imported_data`**：用户没有导入数据，是"正常"情况，无需警告
+4. **`:out_of_range`**：用户选择的时间范围不包含导入数据，也是"正常"情况
+
+**Behaviours 面板的特殊考虑**：
+- FUNNELS 和 EXPLORATION 是企业版高级功能
+- 这些功能本质上不支持导入数据（需要原始事件序列）
+- 使用 `altCondition` 可以在用户有导入数据时持续提示"导入数据在此视图不可用"
+- 这是一种"功能告知"而非"错误提示"
+
+**潜在问题**：
+1. **用户困惑**：不同面板显示逻辑不一致，用户可能不理解为什么某些面板显示警告而其他不显示
+2. **调试困难**：`importedDataInView` 的来源不明确，可能与 `skipImportedReason` 不同步
+3. **消息不一致**：普通面板使用默认消息 `"Imported data is excluded due to applied filters"`，而 Behaviours 面板使用 `"Imported data is unavailable in this view"`
+
+### 10.4 兼容分流总结与影响评估
+
+#### 10.4.1 三条分流路径汇总
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        旧数据访问兼容分流全景                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 参数解析分流                                                            │
+│     ├─ Legacy 入口 (Query.from/3)                                          │
+│     │   ├─ 参数：with_imported (字符串 "true")                              │
+│     │   ├─ 使用者：细分 API、外部 API v1                                    │
+│     │   └─ 特点：向后兼容，但参数格式不统一                                  │
+│     │                                                                        │
+│     └─ 当前入口 (Query.parse_and_build/3)                                   │
+│         ├─ 参数：include.imports (布尔值 true)                             │
+│         ├─ 使用者：统一 query API                                           │
+│         └─ 特点：结构化 JSON，类型安全                                      │
+│                                                                             │
+│  2. Compare 场景分流                                                        │
+│     ├─ 主查询范围：in_range                                                  │
+│     ├─ 比较查询范围：in_comparison_range                                    │
+│     ├─ 合并：in_comparison_range ++ in_range                                │
+│     └─ 边界：                                                                │
+│         ├─ 实时查询：直接返回 []                                            │
+│         ├─ 跨范围导入：可能重复，但实际不影响                               │
+│         └─ 两者都无：:out_of_range                                         │
+│                                                                             │
+│  3. 前端提示分流                                                            │
+│     ├─ 普通面板 (Sources/Pages/Devices/Locations)                          │
+│     │   └─ 只显示：skipImportedReason === 'unsupported_query'              │
+│     │                                                                        │
+│     └─ Behaviours 面板                                                      │
+│         ├─ Conversions/Props：同普通面板                                   │
+│         └─ Funnels/Exploration：show || altCondition                       │
+│             └─ altCondition = importedDataInView                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 10.4.2 关键设计取舍复盘
+
+| 决策点 | 选择 | 优势 | 劣势 |
+|--------|------|------|------|
+| **双入口并存** | Legacy + 当前 | 向后兼容，渐进迁移 | 维护成本高，测试复杂 |
+| **参数格式差异** | `with_imported` vs `include.imports` | 符合各自 API 风格 | 开发者混淆，类型不匹配 |
+| **Compare 合并策略** | 列表拼接 `++` | 实现简单，不影响判断 | 可能重复（但实际无害） |
+| **Skip Reason 显示** | 只显示 `unsupported_query` | 用户体验简洁 | 某些情况缺乏反馈 |
+| **Behaviours 特殊逻辑** | `altCondition` | 高级功能明确告知 | 与其他面板不一致 |
+
+#### 10.4.3 潜在风险与改进建议
+
+**风险 1：参数名称混淆**
+- 场景：开发者同时使用细分 API 和统一 API，可能混淆 `with_imported` 和 `include.imports`
+- 建议：添加参数别名支持，或在文档中明确区分
+
+**风险 2：Compare 场景边界不清**
+- 场景：用户启用 Compare 但比较范围内没有导入数据，可能困惑为什么某些数据不合并
+- 建议：在 `skip_imported_reason` 中增加 Compare 相关的细分原因，或在前端明确告知比较范围
+
+**风险 3：提示不一致导致用户困惑**
+- 场景：用户在普通面板看不到提示，但在 Behaviours 面板看到，可能误解为 Bug
+- 建议：统一显示逻辑，或为每种 `skip_imported_reason` 提供明确的用户反馈
+
+**风险 4：Legacy 入口技术债务**
+- 场景：`Legacy.QueryBuilder` 已标记 `@deprecated`，但仍被广泛使用
+- 建议：制定迁移计划，逐步将细分 API 迁移到当前入口
+
+## 11. 结论
 
 Plausible Analytics 系统设计了一套完善的数据保留策略、导入导出流程和历史数据查询兼容机制，通过以下核心原则实现了高效的数据生命周期管理：
 
