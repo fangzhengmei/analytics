@@ -64,7 +64,7 @@ DEFAULT_FILE_TYPES = [
 ]
 ```
 
-**URL 处理**: 会去除查询参数
+**URL 处理**: 会去除查询参数，但**不会处理 URL 片段（`#fragment`）**
 ```javascript
 var hrefWithoutQuery =
   link && typeof link.href === 'string' && link.href.split('?')[0]
@@ -74,6 +74,52 @@ var hrefWithoutQuery =
 - 通过 `file-types` 属性（script 标签属性）
 - 通过 `fileDownloads.fileExtensions` 配置对象
 - 通过 `add-file-types` 属性追加到默认列表
+
+### 1.2.1 文件下载识别边界（新增）
+
+#### 扩展名大小写敏感
+
+**代码分析** (`tracker/src/custom-events.js:162-165`):
+```javascript
+var fileType = url.split('.').pop()
+return fileTypesToTrack.some(function (fileTypeToTrack) {
+  return fileTypeToTrack === fileType  // 严格相等，无大小写转换
+})
+```
+
+**默认文件类型** (第6-33行) 都是小写：
+```javascript
+DEFAULT_FILE_TYPES = ['pdf', 'xlsx', 'docx', ...]  // 全部小写
+```
+
+**实际行为**:
+
+| URL | 扩展名提取 | 匹配结果 |
+|-----|-----------|---------|
+| `/document.pdf` | `pdf` | ✅ 匹配 |
+| `/document.PDF` | `PDF` | ❌ **不匹配** |
+| `/document.Pdf` | `Pdf` | ❌ **不匹配** |
+
+**结论**: **扩展名大小写敏感**，只有小写扩展名会被识别。
+
+#### URL 片段（`#fragment`）的影响
+
+**代码分析** (`tracker/src/custom-events.js:81-82`):
+```javascript
+var hrefWithoutQuery = link.href.split('?')[0]  // 只去除 ? 后面的
+```
+
+只去除查询参数 (`?`)，**不会处理 URL 片段 (`#`)**！
+
+**实际行为**:
+
+| URL | `hrefWithoutQuery` | 扩展名提取 | 匹配结果 |
+|-----|---------------------|-----------|---------|
+| `/document.pdf` | `/document.pdf` | `pdf` | ✅ 匹配 |
+| `/document.pdf#section1` | `/document.pdf#section1` | `pdf#section1` | ❌ **不匹配** |
+| `/document.pdf?user=foo` | `/document.pdf` | `pdf` | ✅ 匹配 |
+
+**结论**: **URL 片段会破坏文件下载识别**。如果链接包含 `#fragment`，文件扩展名会包含片段内容，导致无法匹配。
 
 ---
 
@@ -432,10 +478,38 @@ if (COMPILE_COMPAT) {
 
 ### 5.3 已知限制
 
-1. **出站文件下载**: 出站链接上的文件下载只会被计为出站链接，不会被计为文件下载
+1. **出站文件下载**: 出站链接上的文件下载只会被计为出站链接，不会被计为文件下载（优先级机制）
 2. **SVG 链接**: SVG 命名空间内的链接无法被追踪
 3. **404 自动追踪**: 配置项存在但前端未实现，需要手动集成
 4. **查询参数**: 文件下载的 URL 会去除查询参数，而出站链接保留完整 URL
+
+### 5.4 复核修正说明（2026-05-03）
+
+**修正的错误结论**:
+
+原报告错误地认为：
+> **场景 5 原结论**: 链接有 `onclick="event.preventDefault()"` 时，**不追踪**该链接
+
+**修正后的正确结论**:
+- ✅ **事件仍然会被发送**
+- ❌ **只是导航不会发生**
+
+**关键代码分析**:
+
+1. **`handleLinkClickEvent`** 不检查 `event.defaultPrevented`
+2. **`shouldInterceptNavigation`** 只影响**导航拦截决策**，不影响**事件发送**
+3. **`sendLinkClickEvent`** 的两个分支（拦截/不拦截）**都会调用 `track()`**
+
+**测试验证** (`tracker/test/outbound-links.spec.ts:368-373`):
+```javascript
+expectedRequests: [
+  { n: 'Outbound Link: Click', p: { url: outboundUrl } }  // 事件仍然期望被发送
+]
+```
+
+**设计意图**:
+- 即使其他脚本阻止了导航，用户点击行为仍然应该被统计
+- `shouldInterceptNavigation` 的设计目的是：当其他脚本已经处理了导航时，Plausible 不再重复干预导航，但**仍然记录点击事件**
 
 ---
 
