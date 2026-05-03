@@ -409,41 +409,959 @@ end
 
 ## 5. 时间范围切换时的查询联动机制
 
-### 5.1 前端触发机制
+### 5.1 完整时序流程图
 
-当用户切换时间范围时，会触发以下流程：
+```
+用户操作 → 参数写回 → 页面状态重算 → 查询触发 → 服务端解析 → 数据返回
+   ↓           ↓              ↓              ↓            ↓            ↓
+点击菜单   构建search      URL变化         queryKey     解析参数    执行SQL
+或快捷键   更新URL         解析参数         变化         构建查询    返回结果
+```
 
-1. **更新 URL 参数**
-   - 当用户选择不同的时间范围（如从 "7天" 切换到 "30天"），前端会更新 URL 参数
-   - 使用 React Router 的导航功能更新 URL
+### 5.2 步骤1：用户操作触发
 
-2. **URL 变化触发状态更新**
-   - `useLocation` 钩子检测到 URL 变化
-   - `parseSearch` 重新解析 URL 参数
-   - `dashboardState` 依赖项变化，触发重新计算
+**方式1：通过菜单选择**
 
-3. **查询键变化触发数据重新获取**
-   - `dashboardState` 变化导致 `top-stats` 和 `main-graph` 查询键变化
-   - `@tanstack/react-query` 自动触发新的数据获取请求
+用户点击时间范围菜单中的选项，如 "Last 7 Days" 或 "Month to Date"。
 
-### 5.2 后端查询联动
+**核心组件**: `DashboardPeriodMenu`
 
-1. **接收新的查询参数**
-   - API 端点接收包含新时间范围的查询参数
-   - `Dashboard.QueryParser.parse` 解析新参数
+```typescript
+// assets/js/dashboard/nav-menu/query-periods/dashboard-period-menu.tsx:200-216
+<AppNavigationLink
+  key={label}
+  data-selected={isActive({ site, dashboardState })}
+  className={linkClassName}
+  search={search}
+  onClick={onEvent && ((e) => onEvent(e))}
+>
+  {label}
+  {!!keyboardKey && (
+    <KeybindHint>{keyboardKey}</KeybindHint>
+  )}
+</AppNavigationLink>
+```
 
-2. **构建新的日期时间范围**
-   ```elixir
-   # 基于 period 和相对日期构建 DateTimeRange
+**方式2：通过键盘快捷键**
+
+项目支持键盘快捷键快速切换时间范围，如 `D` 切换到 "Today"，`W` 切换到 "Last 7 Days"。
+
+```typescript
+// assets/js/dashboard/nav-menu/query-periods/dashboard-period-menu.tsx:41-81
+function DashboardPeriodMenuKeybinds({
+  closeDropdown,
+  groups
+}: {
+  groups: LinkItem[][]
+  closeDropdown: () => void
+}) {
+  const dashboardRouteMatch = useMatch(rootRoute.path)
+  const navigate = useAppNavigate()
+
+  if (!dashboardRouteMatch) {
+    return null
+  }
+  return (
+    <>
+      {groups.flatMap((group) =>
+        group
+          .filter(([[_name, keyboardKey]]) => !!keyboardKey)
+          .map(([[_name, keyboardKey], { search, onEvent }]) => (
+            <Keybind
+              key={keyboardKey}
+              keyboardKey={keyboardKey}
+              type="keydown"
+              handler={(e) => {
+                if (typeof search === 'function') {
+                  navigate({ search })  // 直接触发导航
+                }
+                if (typeof onEvent === 'function') {
+                  onEvent(e)
+                } else {
+                  closeDropdown()
+                }
+              }}
+              // ...
+            />
+          ))
+      )}
+    </>
+  )
+}
+```
+
+**方式3：选择自定义日期范围**
+
+用户通过日历组件选择自定义日期范围。
+
+```typescript
+// assets/js/dashboard/nav-menu/query-periods/dashboard-period-menu.tsx:244-259
+<DateRangeCalendar
+  id="calendar"
+  onCloseWithSelection={(selection) => {
+    navigate({
+      search: getSearchToApplyCustomDates(selection)
+    })
+    closeDropdown()
+  }}
+  // ...
+/>
+```
+
+### 5.3 步骤2：参数写回 URL
+
+当用户选择时间范围后，系统会构建新的搜索参数并更新 URL。
+
+**1. 构建搜索参数**
+
+每种时间范围选项都有对应的 `search` 函数，用于生成新的 URL 参数。
+
+```typescript
+// assets/js/dashboard/dashboard-time-periods.ts:326-446
+export const getDatePeriodGroups = ({
+  site,
+  onEvent,
+  extraItemsInLastGroup = [],
+  extraGroups = []
+}: {
+  // ...
+}): LinkItem[][] => {
+  const groups: LinkItem[][] = [
+    [
+      [
+        ['Today', 'D'],
+        {
+          search: (s) => ({
+            ...s,
+            ...clearedDateSearch,
+            period: DashboardPeriod.day,
+            date: formatISO(now(site.offset)),
+            keybindHint: 'D'
+          }),
+          isActive: ({ dashboardState }) =>
+            dashboardState.period === DashboardPeriod.day &&
+            isSameDate(dashboardState.date, now(site.offset)),
+          onEvent
+        }
+      ],
+      [
+        ['Last 7 Days', 'W'],
+        {
+          search: (s) => ({
+            ...s,
+            ...clearedDateSearch,
+            period: DashboardPeriod['7d'],
+            keybindHint: 'W'
+          }),
+          isActive: ({ dashboardState }) =>
+            dashboardState.period === DashboardPeriod['7d'],
+          onEvent
+        }
+      ],
+      // ... 更多时间范围选项
+    ]
+  ]
+  // ...
+}
+```
+
+**自定义日期范围参数构建**：
+
+```typescript
+// assets/js/dashboard/dashboard-time-periods.ts:249-277
+export const getSearchToApplyCustomDates = ([selectionStart, selectionEnd]: [
+  Date,
+  Date
+]): AppNavigationTarget['search'] => {
+  const [from, to] = [
+    parseNaiveDate(selectionStart),
+    parseNaiveDate(selectionEnd)
+  ]
+  const singleDaySelected = from.isSame(to, 'day')
+
+  if (singleDaySelected) {
+    return (search) => ({
+      ...search,
+      ...clearedDateSearch,
+      period: DashboardPeriod.day,
+      date: formatISO(from),
+      keybindHint: 'C'
+    })
+  }
+
+  return (search) => ({
+    ...search,
+    ...clearedDateSearch,
+    period: DashboardPeriod.custom,
+    from: formatISO(from),
+    to: formatISO(to),
+    keybindHint: 'C'
+  })
+}
+```
+
+**2. 执行导航更新 URL**
+
+使用 `useAppNavigate` 钩子执行导航，将新参数写回 URL。
+
+```typescript
+// assets/js/dashboard/navigation/use-app-navigate.tsx:71-86
+export const useAppNavigate = () => {
+  const _navigate = useNavigate()
+  const getToOptions = useGetNavigateOptions()
+  const navigate = useCallback(
+    ({
+      path,
+      params,
+      search,
+      ...options
+    }: AppNavigationTarget & NavigateOptions) => {
+      return _navigate(getToOptions({ path, params, search }), options)
+    },
+    [getToOptions, _navigate]
+  )
+  return navigate
+}
+```
+
+**3. 构建导航选项**
+
+`getNavigateToOptions` 函数负责解析当前 URL 并应用新的搜索参数。
+
+```typescript
+// assets/js/dashboard/navigation/use-app-navigate.tsx:34-45
+const getNavigateToOptions = (
+  currentSearchString: string,
+  { path, params, search }: AppNavigationTarget
+) => {
+  const searchRecord = parseSearch(currentSearchString)  // 解析当前 URL
+  const updatedSearchRecord = search && search(searchRecord)  // 应用新的搜索函数
+  const updatedPath = path && generatePath(path, params)
+  return {
+    pathname: updatedPath,
+    search: updatedSearchRecord && stringifySearch(updatedSearchRecord)  // 序列化新参数
+  }
+}
+```
+
+**4. 序列化 URL 参数**
+
+`stringifySearch` 函数将搜索记录序列化为 URL 参数字符串。
+
+```typescript
+// assets/js/dashboard/util/url-search-params.ts:26-50
+export function stringifySearch(
+  searchRecord: Record<string, null | undefined | number | string | unknown>
+): '' | string {
+  const { filters, labels, ...rest } = searchRecord ?? {}
+  const definedSearchEntries = Object.entries(rest)
+    .map(serializeSimpleSearchEntry)
+    .filter(isSearchEntryDefined)
+    .map(([k, v]) => `${k}=${v}`)
+
+  if (!Array.isArray(filters) || !filters.length) {
+    return definedSearchEntries.length
+      ? `?${definedSearchEntries.join('&')}`
+      : ''
+  }
+
+  const serializedFilters = Array.isArray(filters)
+    ? filters.map((f) => `${FILTER_URL_PARAM_NAME}=${serializeFilter(f)}`)
+    : []
+
+  const serializedLabels = Object.entries(labels ?? {}).map(
+    (entry) => `${LABEL_URL_PARAM_NAME}=${serializeLabelsEntry(entry)}`
+  )
+
+  return `?${serializedFilters.concat(serializedLabels).concat(definedSearchEntries).join('&')}`
+}
+```
+
+**示例 URL 变化**：
+- 从 `?period=7d` 切换到 "Last 28 Days" → `?period=28d`
+- 选择自定义日期范围（2024-01-01 到 2024-01-15）→ `?period=custom&from=2024-01-01&to=2024-01-15`
+
+### 5.4 步骤3：页面状态重算
+
+URL 更新后，React 会检测到变化并触发状态重算。
+
+**1. 检测 URL 变化**
+
+```typescript
+// assets/js/dashboard/dashboard-state-context.tsx:47
+const location = useLocation()  // React Router 钩子，URL 变化时触发重渲染
+```
+
+**2. 解析新的 URL 参数**
+
+```typescript
+// assets/js/dashboard/dashboard-state-context.tsx:66
+const {
+  compare_from,
+  compare_to,
+  comparison,
+  date,
+  filters: rawFilters,
+  from,
+  labels,
+  match_day_of_week,
+  period,
+  to,
+  with_imported,
+  ...otherSearch
+} = useMemo(() => parseSearch(location.search), [location.search])
+```
+
+**3. 解析逻辑详情**
+
+`parseSearch` 函数将 URL 参数字符串解析为对象：
+
+```typescript
+// assets/js/dashboard/util/url-search-params.ts:56-105
+export function parseSearch(searchString: string): Record<string, unknown> {
+  const searchRecord: Record<string, string | boolean> = {}
+  const filters: Filter[] = []
+  const labels: FilterClauseLabels = {}
+
+  const normalizedSearchString = normalizeSearchString(searchString)
+
+  if (!normalizedSearchString.length) {
+    return searchRecord
+  }
+
+  const meaningfulParams = normalizedSearchString
+    .split('&')
+    .filter((i) => i.length > 0)
+
+  for (const param of meaningfulParams) {
+    const [key, rawValue = ''] = param.split('=')
+    switch (key) {
+      case FILTER_URL_PARAM_NAME: {  // 处理过滤器参数
+        const filter = parseFilter(rawValue)
+        if (filter.length === 3 && filter[2].length) {
+          filters.push(filter)
+        }
+        break
+      }
+      case LABEL_URL_PARAM_NAME: {  // 处理标签参数
+        const [labelKey, labelValue] = parseLabelsEntry(rawValue)
+        if (labelKey.length && labelValue.length) {
+          labels[labelKey] = labelValue
+        }
+        break
+      }
+      case '': {
+        break
+      }
+      default: {  // 处理其他参数（如 period, date, from, to 等）
+        const parsedValue = parseSimpleSearchEntry(rawValue)
+        if (parsedValue !== null) {
+          searchRecord[decodeURIComponent(key)] = parsedValue
+        }
+      }
+    }
+  }
+
+  return {
+    ...searchRecord,
+    ...(filters.length && { filters }),
+    ...(Object.keys(labels).length && { labels })
+  }
+}
+```
+
+**4. 重新计算 dashboardState**
+
+当 `location.search` 变化时，`useMemo` 的依赖项变化，触发 `dashboardState` 重新计算。
+
+```typescript
+// assets/js/dashboard/dashboard-state-context.tsx:68-133
+const dashboardState = useMemo(() => {
+  const defaultValues = dashboardStateDefaultValue
+  const storedValues = getSavedTimePreferencesFromStorage({ site })
+  
+  // 计算时间设置（优先级：URL > 存储 > 默认值）
+  const timeSettings = getDashboardTimeSettings({
+    site,
+    searchValues: { period, comparison, match_day_of_week },
+    storedValues,
+    defaultValues,
+    segmentIsExpanded: !!expandedSegment
+  })
+
+  const filters = Array.isArray(rawFilters)
+    ? postProcessFilters(rawFilters as Filter[])
+    : defaultValues.filters
+
+  const resolvedFilters = resolveFilters(filters, segmentsContext.segments)
+
+  return {
+    ...timeSettings,
+    compare_from:
+      typeof compare_from === 'string' && compare_from.length
+        ? dayjs.utc(compare_from)
+        : defaultValues.compare_from,
+    compare_to:
+      typeof compare_to === 'string' && compare_to.length
+        ? dayjs.utc(compare_to)
+        : defaultValues.compare_to,
+    date:
+      typeof date === 'string' && date.length
+        ? dayjs.utc(date)
+        : now(site.offset).startOf('day'),
+    from:
+      typeof from === 'string' && from.length
+        ? dayjs.utc(from)
+        : timeSettings.period === DashboardPeriod.custom
+          ? yesterday(site.offset)
+          : defaultValues.from,
+    to:
+      typeof to === 'string' && to.length
+        ? dayjs.utc(to)
+        : timeSettings.period === DashboardPeriod.custom
+          ? now(site.offset)
+          : defaultValues.to,
+    with_imported: [true, false].includes(with_imported as boolean)
+      ? (with_imported as boolean)
+      : defaultValues.with_imported,
+    filters,
+    resolvedFilters,
+    labels: (labels as FilterClauseLabels) || defaultValues.labels
+  }
+}, [
+  compare_from,
+  compare_to,
+  comparison,
+  date,
+  rawFilters,
+  from,
+  labels,
+  match_day_of_week,
+  period,
+  to,
+  with_imported,
+  site,
+  expandedSegment,
+  segmentsContext.segments
+])
+```
+
+**5. 时间设置计算优先级**
+
+`getDashboardTimeSettings` 函数实现了三层优先级机制：
+
+```typescript
+// assets/js/dashboard/dashboard-time-periods.ts:616-670
+export function getDashboardTimeSettings({
+  site,
+  searchValues,
+  storedValues,
+  defaultValues,
+  segmentIsExpanded
+}: {
+  // ...
+}): Pick<DashboardState, 'period' | 'comparison' | 'match_day_of_week'> {
+  let period: DashboardPeriod
+  // 优先级：URL 参数 > 存储值 > 特殊情况 > 默认值
+  if (isValidPeriod(searchValues.period)) {
+    period = searchValues.period
+  } else if (isValidPeriod(storedValues.period)) {
+    period = storedValues.period
+  } else if (isTodayOrYesterday(site.nativeStatsBegin)) {
+    period = DashboardPeriod.day
+  } else {
+    period = defaultValues.period
+  }
+
+  let comparison: ComparisonMode | null
+  // 检查是否禁用比较（实时模式或分段展开时）
+  if (isComparisonForbidden({ period, segmentIsExpanded })) {
+    comparison = null
+  } else {
+    // 优先级：URL 参数 > 存储值
+    comparison = isValidComparison(searchValues.comparison)
+      ? searchValues.comparison
+      : storedValues.comparison
+
+    if (!isComparisonEnabled(comparison)) {
+      comparison = null
+    }
+  }
+
+  // match_day_of_week 优先级：URL > 存储 > 默认
+  const match_day_of_week = isValidMatchDayOfWeek(
+    searchValues.match_day_of_week
+  )
+    ? (searchValues.match_day_of_week as boolean)
+    : isValidMatchDayOfWeek(storedValues.match_day_of_week)
+      ? (storedValues.match_day_of_week as boolean)
+      : defaultValues.match_day_of_week
+
+  return {
+    period,
+    comparison,
+    match_day_of_week
+  }
+}
+```
+
+### 5.5 步骤4：查询触发
+
+`dashboardState` 更新后，由于查询键（queryKey）依赖 `dashboardState`，`@tanstack/react-query` 会自动触发新的数据获取。
+
+**1. 查询键依赖机制**
+
+```typescript
+// assets/js/dashboard/stats/graph/visitor-graph.tsx:46-61
+const topStatsQuery = useQuery({
+  queryKey: ['top-stats', { dashboardState }] as const,  // 查询键包含 dashboardState
+  queryFn: async ({ queryKey }) => {
+    const [_, opts] = queryKey
+    return await fetchTopStats(site, opts.dashboardState)
+  },
+  placeholderData: (previousData) => previousData,
+  staleTime: ({ queryKey }) => {
+    const [_, opts] = queryKey
+    return getStaleTime({
+      siteTimezoneOffset: site.offset,
+      siteStatsBegin: site.statsBegin,
+      ...opts.dashboardState
+    })
+  }
+})
+
+// assets/js/dashboard/stats/graph/visitor-graph.tsx:63-95
+const mainGraphQuery = useQuery({
+  enabled: !!selectedMetric,
+  queryKey: [
+    'main-graph',
+    { dashboardState, metric: selectedMetric!, interval: selectedInterval }
+  ] as const,  // 查询键包含 dashboardState
+  queryFn: async ({ queryKey }) => {
+    const [_, opts] = queryKey
+    const data = await fetchMainGraph(
+      site,
+      opts.dashboardState,
+      opts.metric,
+      opts.interval
+    )
+    return {
+      ...data,
+      period: opts.dashboardState.period,
+      interval: opts.interval
+    }
+  },
+  // ... 其他配置
+})
+```
+
+**2. 触发查询执行**
+
+当 `queryKey` 变化时，`useQuery` 会：
+1. 检查缓存中是否有对应的数据
+2. 如果没有或已过期，执行 `queryFn`
+3. 更新缓存并触发组件重渲染
+
+**3. 构建 API 查询参数**
+
+`queryFn` 执行时，会调用 `createStatsQuery` 将 `dashboardState` 转换为 API 所需的查询参数。
+
+```typescript
+// assets/js/dashboard/stats-query.ts:40-61
+export function createStatsQuery(
+  dashboardState: DashboardState,
+  reportParams: ReportParams
+): StatsQuery {
+  return {
+    date_range: createDateRange(dashboardState),  // 构建时间范围
+    relative_date: dashboardState.date ? formatISO(dashboardState.date) : null,
+    dimensions: reportParams.dimensions || [],
+    metrics: reportParams.metrics,
+    filters: remapToApiFilters(dashboardState.filters),
+    include: {
+      imports: dashboardState.with_imported,
+      imports_meta: reportParams.include?.imports_meta || false,
+      time_labels: reportParams.include?.time_labels || false,
+      partial_time_labels: reportParams.include?.partial_time_labels || false,
+      compare: createIncludeCompare(dashboardState),  // 构建比较模式
+      compare_match_day_of_week: dashboardState.match_day_of_week,
+      empty_metrics: reportParams.include?.empty_metrics || false,
+      present_index: reportParams.include?.present_index || false
+    }
+  }
+}
+```
+
+**4. 时间范围转换**
+
+```typescript
+// assets/js/dashboard/stats-query.ts:63-69
+function createDateRange(dashboardState: DashboardState): DateRange {
+  if (dashboardState.period === DashboardPeriod.custom) {
+    return [formatISO(dashboardState.from), formatISO(dashboardState.to)]
+  } else {
+    return dashboardState.period
+  }
+}
+```
+
+**5. 比较模式转换**
+
+```typescript
+// assets/js/dashboard/stats-query.ts:71-88
+function createIncludeCompare(dashboardState: DashboardState) {
+  switch (dashboardState.comparison) {
+    case ComparisonMode.custom:
+      return [
+        formatISO(dashboardState.compare_from),
+        formatISO(dashboardState.compare_to)
+      ]
+    case ComparisonMode.previous_period:
+      return ComparisonMode.previous_period
+    case ComparisonMode.year_over_year:
+      return ComparisonMode.year_over_year
+    default:
+      return null
+  }
+}
+```
+
+**6. 发送 API 请求**
+
+最终通过 `api.stats` 发送请求到后端。
+
+```typescript
+// assets/js/dashboard/stats/graph/fetch-main-graph.ts:9-36
+export function fetchMainGraph(
+  site: PlausibleSite,
+  dashboardState: DashboardState,
+  metric: Metric,
+  interval: string
+): Promise<MainGraphResponse> {
+  const metricToQuery =
+    metric === 'conversion_rate' ? 'group_conversion_rate' : metric
+
+  const reportParams: ReportParams = {
+    metrics: [metricToQuery],
+    dimensions: [`time:${interval}`],
+    include: {
+      time_labels: true,
+      partial_time_labels: true,
+      empty_metrics: true,
+      present_index: true
+    }
+  }
+
+  const statsQuery = createStatsQuery(dashboardState, reportParams)
+
+  // 实时模式特殊处理
+  if (isRealTimeDashboard(dashboardState)) {
+    statsQuery.date_range = DashboardPeriod.realtime_30m
+  }
+
+  return api.stats(site, statsQuery)
+}
+```
+
+### 5.6 步骤5：服务端解析与处理
+
+**1. API 端点接收请求**
+
+请求发送到后端 API 端点，通常是 `/api/stats/:domain/` 路径。
+
+**2. 解析查询参数**
+
+后端使用 `Dashboard.QueryParser.parse` 解析前端传来的查询参数。
+
+```elixir
+# lib/plausible/stats/dashboard/query_parser.ex:17-36
+def parse(params, opts \\ []) do
+  with {:ok, input_date_range} <- parse_input_date_range(params),
+       {:ok, relative_date} <- parse_relative_date(params),
+       {:ok, dimensions} <- ApiQueryParser.parse_dimensions(params["dimensions"]),
+       {:ok, filters} <- ApiQueryParser.parse_filters(params["filters"]),
+       {:ok, metrics} <- parse_metrics(params),
+       {:ok, include} <- parse_include(params) do
+    {:ok,
+     ParsedQueryParams.new!(%{
+       input_date_range: input_date_range,
+       relative_date: relative_date,
+       dimensions: dimensions,
+       filters: filters,
+       metrics: metrics,
+       include: include,
+       skip_goal_existence_check: true,
+       now: Keyword.get(opts, :now)
+     })}
+  end
+end
+```
+
+**3. 解析时间范围**
+
+```elixir
+# lib/plausible/stats/dashboard/query_parser.ex:38-49
+defp parse_input_date_range(%{"date_range" => date_range}) do
+  case date_range do
+    "realtime" -> {:ok, :realtime}
+    "realtime_30m" -> {:ok, :realtime_30m}
+    date_range -> ApiQueryParser.parse_input_date_range(date_range)
+  end
+end
+```
+
+**4. 解析相对日期**
+
+```elixir
+# lib/plausible/stats/dashboard/query_parser.ex:51-62
+defp parse_relative_date(%{"relative_date" => date}) when is_binary(date) do
+  case Date.from_iso8601(date) do
+    {:ok, date} ->
+      {:ok, date}
+
+    _ ->
+      {:error,
+       %QueryError{code: :invalid_relative_date, message: "Failed to convert '#{date}' to date"}}
+  end
+end
+
+defp parse_relative_date(_), do: {:ok, nil}
+```
+
+**5. 解析 include 选项（比较模式等）**
+
+```elixir
+# lib/plausible/stats/dashboard/query_parser.ex:76-122
+defp parse_include(params) do
+  with {:ok, compare} <- parse_include_compare(params["include"]) do
+    {:ok,
+     %QueryInclude{
+       imports: params["include"]["imports"] == true,
+       imports_meta: params["include"]["imports_meta"] == true,
+       compare: compare,
+       compare_match_day_of_week: params["include"]["compare_match_day_of_week"] == true,
+       time_labels: params["include"]["time_labels"] == true,
+       partial_time_labels: params["include"]["partial_time_labels"] == true,
+       present_index: params["include"]["present_index"] == true,
+       empty_metrics: params["include"]["empty_metrics"] == true,
+       trim_relative_date_range: true,
+       drop_unavailable_time_on_page: true,
+       drop_unavailable_revenue_metrics: true
+     }}
+  end
+end
+
+defp parse_include_compare(%{"compare" => compare})
+     when compare in @valid_comparison_shorthand_keys do
+  {:ok, @valid_comparison_shorthands[compare]}
+end
+
+defp parse_include_compare(%{"compare" => [from, to] = compare})
+     when is_binary(from) and is_binary(to) do
+  case ApiQueryParser.parse_date_strings(from, to) do
+    {:ok, compare} ->
+      {:ok, compare}
+
+    {:error, _} ->
+      {:error,
+       %QueryError{
+         code: :invalid_include,
+         message: "Invalid include.compare '#{inspect(compare)}'"
+       }}
+  end
+end
+```
+
+**6. 构建 DateTimeRange**
+
+解析后的参数用于构建 `DateTimeRange` 结构体。
+
+```elixir
+# lib/plausible/stats/datetime_range.ex:23-58
+defmodule Plausible.Stats.DateTimeRange do
+  @enforce_keys [:first, :last]
+  defstruct [:first, :last]
+
+  @doc """
+  Creates a `DateTimeRange` struct from the given `%Date{}` structs.
+  The first datetime will become the first date at 00:00:00, and the last datetime
+  will become the last date at 23:59:59.
+  """
+  def new!(%Date{} = first, last, timezone) do
+    first =
+      case DateTime.new(first, ~T[00:00:00], timezone) do
+        {:ok, datetime} -> datetime
+        {:gap, _just_before, just_after} -> just_after
+        {:ambiguous, _first_datetime, second_datetime} -> second_datetime
+      end
+
+    new!(first, last, timezone)
+  end
+
+  def new!(%DateTime{} = first, %DateTime{} = last) do
+    first = DateTime.truncate(first, :second)
+    last = DateTime.truncate(last, :second)
+
+    if DateTime.before?(first, last) do
+      %__MODULE__{first: first, last: last}
+    else
+      %__MODULE__{first: last, last: first}
+    end
+  end
+end
+```
+
+**7. 生成 SQL 查询**
+
+基于 `DateTimeRange` 和其他参数，后端构建 SQL 查询。
+
+**8. 执行查询并返回结果**
+
+查询执行后，结果被格式化并返回给前端。
+
+### 5.7 步骤6：数据返回与界面更新
+
+**1. 前端接收响应**
+
+`@tanstack/react-query` 自动处理响应，更新缓存并触发组件重渲染。
+
+**2. 图表组件重渲染**
+
+`VisitorGraph` 组件检测到数据变化，重新渲染图表。
+
+```typescript
+// assets/js/dashboard/stats/graph/visitor-graph.tsx:213-254
+return (
+  <div className="col-span-full relative w-full bg-white rounded-md shadow-sm dark:bg-gray-900">
+    <>
+      <div
+        id="top-stats-container"
+        className="flex flex-wrap relative"
+        ref={topStatsBoundary}
+      >
+        {topStatsQuery.data ? (
+          <TopStats
+            data={topStatsQuery.data}
+            selectedMetric={selectedMetric}
+            onMetricClick={onMetricClick}
+            tooltipBoundary={topStatsBoundary.current}
+          />
+        ) : (
+          // 加载状态
+          <div style={{ height: `${heightPx}px` }}></div>
+        )}
+      </div>
+      <div className="relative flex flex-col pl-3 pr-4">
+        <MainGraphContainer ref={mainGraphContainer}>
+          {!!mainGraphQuery.data && !!width && (
+            <>
+              {!showGraphLoader && (
+                <MainGraph width={width} data={mainGraphQuery.data} />
+              )}
+              {showGraphLoader && <Loader />}
+            </>
+          )}
+        </MainGraphContainer>
+      </div>
+    </>
+    {(!(topStatsQuery.data && mainGraphQuery.data) || showFullLoader) && (
+      <Loader />
+    )}
+  </div>
+)
+```
+
+### 5.8 实时更新机制
+
+对于实时时间范围（`period: realtime`），项目实现了特殊的定时更新机制。
+
+```typescript
+// assets/js/dashboard/stats/graph/visitor-graph.tsx:155-178
+useEffect(() => {
+  const onTick = () => {
+    setIsRealtimeSilentUpdate({ topStats: true, mainGraph: true })
+    queryClient.invalidateQueries({
+      predicate: ({ queryKey }) => {
+        const realtimeTopStatsOrMainGraphQuery =
+          ['top-stats', 'main-graph'].includes(queryKey[0] as string) &&
+          typeof queryKey[1] === 'object' &&
+          (queryKey[1] as { dashboardState?: DashboardState })?.dashboardState
+            ?.period === DashboardPeriod.realtime
+
+        return realtimeTopStatsOrMainGraphQuery
+      }
+    })
+  }
+
+  if (isRealtime) {
+    document.addEventListener('tick', onTick)
+  }
+
+  return () => {
+    document.removeEventListener('tick', onTick)
+  }
+}, [queryClient, isRealtime])
+```
+
+**静默更新机制**：
+
+```typescript
+// assets/js/dashboard/stats/graph/visitor-graph.tsx:117-144
+const [isRealtimeSilentUpdate, setIsRealtimeSilentUpdate] = useState({
+  topStats: false,
+  mainGraph: false
+})
+
+// ... 相关 useEffect 逻辑
+
+const showGraphLoader =
+  mainGraphQuery.isFetching &&
+  mainGraphQuery.isStale &&
+  !isRealtimeSilentUpdate.mainGraph &&
+  !showFullLoader
+```
+
+### 5.9 时序总结表
+
+| 阶段 | 关键组件/函数 | 核心操作 | 输入 | 输出 |
+|------|--------------|----------|------|------|
+| **用户操作** | `DashboardPeriodMenu` 或 `Keybind` | 用户选择时间范围或按快捷键 | 无 | 触发导航 |
+| **参数写回** | `useAppNavigate` + `stringifySearch` | 构建新搜索参数并更新 URL | `search` 函数 | 新的 URL（如 `?period=28d`） |
+| **状态重算** | `DashboardStateContextProvider` | 解析 URL，重新计算 `dashboardState` | `location.search` | 新的 `dashboardState` 对象 |
+| **查询触发** | `useQuery` + `createStatsQuery` | 检测查询键变化，构建 API 参数 | `dashboardState` | API 请求参数 |
+| **服务端解析** | `Dashboard.QueryParser.parse` | 解析请求参数，构建 `DateTimeRange` | HTTP 请求体 | `ParsedQueryParams` 结构体 |
+| **数据返回** | `@tanstack/react-query` | 接收响应，更新缓存 | API 响应 | 更新后的 `query.data` |
+
+### 5.10 关键数据流示例
+
+假设用户从 "Last 7 Days" 切换到 "Last 28 Days"：
+
+1. **URL 变化**：`?period=7d` → `?period=28d`
+2. **dashboardState 变化**：
+   ```typescript
+   // 之前
+   { period: '7d', date: null, from: null, to: null, ... }
+   
+   // 之后
+   { period: '28d', date: null, from: null, to: null, ... }
    ```
-
-3. **生成新的 SQL 查询**
-   - 使用新的时间范围构建 SQL 查询
-   - 根据时间维度（如 day, hour）确定分组粒度
-
-4. **执行查询并返回结果**
-   - 执行新的数据库查询
-   - 返回包含新时间范围数据的响应
+3. **查询键变化**：
+   ```typescript
+   // 之前
+   ['top-stats', { dashboardState: { period: '7d', ... } }]
+   
+   // 之后
+   ['top-stats', { dashboardState: { period: '28d', ... } }]
+   ```
+4. **API 请求参数**：
+   ```typescript
+   {
+     date_range: '28d',
+     relative_date: null,
+     // ... 其他参数
+   }
+   ```
+5. **后端查询**：查询过去 28 天的数据
 
 ### 5.3 实时更新机制
 
