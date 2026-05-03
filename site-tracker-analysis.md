@@ -2,61 +2,99 @@
 
 ## 1. 概述
 
-本文档详细分析了 Plausible 站点创建后，tracker script 配置与域名校验的完整闭环流程。重点关注安装引导、事件匹配、验证反馈和边界情况处理四个核心环节。
+本文档详细分析了 Plausible 站点创建后，tracker script 配置与域名校验的完整闭环流程。**重点补充**：配置参数从安装到验证的传递链路、测试事件域名解析比对逻辑、关键状态节点、边界分支和设计取舍。
 
-## 2. 安装引导流程
+---
 
-### 2.1 流程架构
+## 2. 配置参数传递链路详解
 
-安装引导流程由 `PlausibleWeb.Live.Installation` LiveView 模块协调，为用户提供多种安装方式的选择和配置。
+### 2.1 完整数据流图
 
-**关键文件：**
-- `lib/plausible_web/live/installation.ex` - 主安装引导 LiveView
-- `lib/plausible_web/live/installation/instructions.ex` - 安装说明组件
-- `lib/plausible_web/tracker.ex` - Tracker 脚本核心模块
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        配置参数传递链路 (Installation → Verification)                  │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 
-### 2.2 安装类型检测与选择
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ 1. 用户选择   │────▶│ 2. 表单提交   │────▶│ 3. 数据库存储 │────▶│ 4. URL跳转   │
+│ 安装类型     │     │              │     │              │     │              │
+│              │     │ - params收集  │     │ - site_id    │     │ - domain     │
+│ - manual    │     │ - installation│     │ - installation│    │ - flow       │
+│ - wordpress │     │   _type      │     │   _type      │     │ - installation│
+│ - gtm (EE)  │     │ - 功能选项    │     │ - 各功能开关  │     │   _type      │
+│ - npm       │     │              │     │              │     │ (关键参数)   │
+└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+                                                          │
+                                                          ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ 7. 诊断解析  │◀────│ 6. 检查执行   │◀────│ 5. 验证页面   │
+│              │     │              │     │ 读取优先级    │
+│ - selected_   │     │ - data_domain│    │ 1. URL参数    │
+│   installation│    │ (站点域名)    │     │ 2. 数据库存储  │
+│   _type      │     │ - selected_   │     │ 3. 默认值      │
+│              │     │   installation  │    │              │
+│ 用于生成    │     │   _type        │    │              │
+│ 错误消息    │     │              │     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
 
-系统支持以下安装类型：
+### 2.2 安装阶段参数收集
 
-| 安装类型 | 描述 | 可用版本 |
-|---------|------|---------|
-| `manual` | 手动嵌入脚本标签 | CE/EE |
-| `wordpress` | WordPress 插件安装 | CE/EE |
-| `npm` | NPM 包集成 | CE/EE |
-| `gtm` | Google Tag Manager 模板 | EE Only |
-
-**自动检测机制（EE版）：**
+**用户选择安装类型** (`installation.ex:126-147`):
 
 ```elixir
-# lib/plausible_web/live/installation.ex:208-222
-defp detect_recommended_installation_type(flow, site) do
-  with {:ok, detection_result} <-
-         Detection.Checks.run_with_rate_limit(nil, site.domain,
-           detect_v1?: flow == Flows.review(),
-           report_to: nil,
-           slowdown: 0,
-           async?: false
-         ),
-       %Result{ok?: true, data: data} <-
-         Detection.Checks.interpret_diagnostics(detection_result) do
-    {data.suggested_technology, data.v1_detected}
-  else
-    _ -> {PlausibleWeb.Tracker.fallback_installation_type(), false}
-  end
+# 用户通过 Tab 切换选择安装类型，通过 URL 参数传递
+<.tab
+  patch={"?type=manual&flow=#{@flow}"}
+  selected={@installation_type.result == "manual"}
+>
+  <Icons.script_icon /> Script
+</.tab>
+```
+
+**表单提交处理** (`installation.ex:295-311`):
+
+```elixir
+def handle_event("submit", %{"tracker_script_configuration" => params}, socket) do
+  # params 包含用户选择的配置：
+  # - installation_type (隐藏字段，从当前选择的 tab 获取)
+  # - outbound_links (checkbox)
+  # - file_downloads (checkbox)
+  # - form_submissions (checkbox)
+  # - track_404_pages (checkbox)
+  
+  config =
+    PlausibleWeb.Tracker.update_script_configuration!(
+      socket.assigns.site,
+      params,
+      :installation  # 标识这是安装流程中的更新
+    )
+
+  # 跳转到验证页面，携带关键参数
+  {:noreply,
+   push_navigate(socket,
+     to:
+       Routes.site_path(socket, :verification, socket.assigns.site.domain,
+         flow: socket.assigns.flow,
+         installation_type: config.installation_type  # 关键：通过 URL 传递安装类型
+       )
+   )}
 end
 ```
 
-### 2.3 Tracker Script 配置模型
+### 2.3 数据库存储结构
 
-**数据结构定义：**
+**TrackerScriptConfiguration Schema** (`tracker_script_configuration.ex:23-39`):
 
 ```elixir
-# lib/plausible/site/tracker_script_configuration.ex:23-39
-@primary_key {:id, Plausible.Ecto.Types.TrackerScriptNanoid, autogenerate: true}
 schema "tracker_script_configuration" do
+  # 主键：自动生成的 NanoID，用于脚本 URL (如 /js/abc123.js)
+  @primary_key {:id, Plausible.Ecto.Types.TrackerScriptNanoid, autogenerate: true}
+  
+  # 安装类型：决定错误消息的展示内容
   field :installation_type, Ecto.Enum, values: [:manual, :wordpress, :gtm, :npm, nil]
 
+  # 功能配置：影响生成的脚本内容
   field :track_404_pages, :boolean, default: false
   field :hash_based_routing, :boolean, default: false
   field :outbound_links, :boolean, default: false
@@ -66,159 +104,259 @@ schema "tracker_script_configuration" do
   field :form_submissions, :boolean, default: false
   field :pageview_props, :boolean, default: false
 
-  belongs_to :site, Plausible.Site
+  belongs_to :site, Plausible.Site  # 关联到站点
   timestamps()
 end
 ```
 
-### 2.4 脚本生成机制
+**关键点澄清**：
+- `installation_type` **不影响脚本生成**，只用于**错误消息的展示
+- 真正影响脚本内容的是各个功能开关字段 (`outbound_links`, `file_downloads` 等)
+- `id` (NanoID) 是脚本 URL 的唯一标识，用于 CDN 缓存和脚本查找
 
-**动态脚本构建：**
+### 2.4 验证阶段参数读取
+
+**安装类型读取优先级** (`verification.ex:183-194`):
 
 ```elixir
-# lib/plausible_web/tracker.ex:49-67
-def build_script(
-      %TrackerScriptConfiguration{site: %{domain: _domain}} = tracker_script_configuration
-    ) do
-  config_js_content =
-    tracker_script_configuration
-    |> plausible_main_config()
-    |> Enum.flat_map(fn
-      {key, value} when is_binary(value) -> ["#{key}:#{JSON.encode!(value)}"]
-      {key, true} -> ["#{key}:!0"]
-      {_key, false} -> []
-    end)
-    |> Enum.sort_by(&String.length/1, :desc)
-    |> Enum.join(",")
+defp get_installation_type(params, site) do
+  cond do
+    # 优先级 1: URL 参数 (最高优先级，允许用户动态切换)
+    params["installation_type"] in PlausibleWeb.Tracker.supported_installation_types() ->
+      params["installation_type"]
 
-  @plausible_main_script
-  |> String.replace("\"<%= @config_js %>\"", "{#{config_js_content}}")
+    # 优先级 2: 数据库中保存的配置
+    (saved_installation_type = get_saved_installation_type(site)) in @supported_installation_types_atoms ->
+      Atom.to_string(saved_installation_type)
+
+    # 优先级 3: 默认值 ("manual")
+    true ->
+      PlausibleWeb.Tracker.fallback_installation_type()
+  end
+end
+
+defp get_saved_installation_type(site) do
+  case PlausibleWeb.Tracker.get_tracker_script_configuration(site) do
+    %{installation_type: installation_type} ->
+      installation_type
+    _ ->
+      nil
+  end
 end
 ```
 
-**脚本嵌入代码（Manual 安装）：**
+**设计取舍分析**：
 
-```html
-<!-- Privacy-friendly analytics by Plausible -->
-<script async src="https://plausible.io/js/{script_id}.js"></script>
-<script>
-  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
-  plausible.init()
-</script>
-```
+| 设计决策 | 原因 | 影响 |
+|---------|------|------|
+| URL 参数优先级最高 | 允许用户在验证页面直接切换安装类型，无需回到安装页面重新配置 | 增加了灵活性，但也意味着 URL 可以"绕过"数据库配置 |
+| 支持动态切换 | 用户可以尝试不同安装方式的验证 | 需要确保切换时不会破坏已有配置 |
+| 默认值兜底 | 确保验证流程不会因为缺少配置而中断 | 可能隐藏了潜在的配置丢失问题 |
 
-### 2.5 可选功能配置
+### 2.5 检查执行阶段参数传递
 
-用户可在安装界面启用以下可选测量功能：
-
-| 功能 | 描述 | 默认值 |
-|-----|------|--------|
-| Outbound Links | 自动追踪外部链接点击 | true |
-| File Downloads | 自动追踪文件下载 | true |
-| Form Submissions | 自动追踪表单提交 | true |
-| 404 Error Pages | 追踪404错误页面 | true |
-| Hash-based Routing | 支持哈希路由 | false |
-| Tagged Events | 手动标签事件 | false |
-| Custom Properties | 自定义属性 | false |
-| E-commerce Revenue | 电商收入追踪 | false |
-
-**配置与 Goal 同步机制：**
+**State 结构** (`state.ex:9-15`):
 
 ```elixir
-# lib/plausible_web/tracker.ex:214-230
-defp sync_goals(site, original_config, updated_config) do
-  [:track_404_pages, :outbound_links, :file_downloads, :form_submissions]
-  |> Enum.map(fn key ->
-    {key, Map.get(original_config, key, false), Map.get(updated_config, key, false)}
-  end)
-  |> Enum.each(fn
-    {:track_404_pages, false, true} -> Plausible.Goals.create_404(site)
-    {:track_404_pages, true, false} -> Plausible.Goals.delete_404(site)
-    {:outbound_links, false, true} -> Plausible.Goals.create_outbound_links(site)
-    {:outbound_links, true, false} -> Plausible.Goals.delete_outbound_links(site)
-    {:file_downloads, false, true} -> Plausible.Goals.create_file_downloads(site)
-    {:file_downloads, true, false} -> Plausible.Goals.delete_file_downloads(site)
-    {:form_submissions, false, true} -> Plausible.Goals.create_form_submissions(site)
-    {:form_submissions, true, false} -> Plausible.Goals.delete_form_submissions(site)
-    _ -> nil
-  end)
+defstruct url: nil,                    # 要验证的 URL (可能是自定义 URL)
+          data_domain: nil,            # ⭐ 关键：站点的域名 (用于域名比对的基准)
+          report_to: nil,               # 汇报进程 PID
+          assigns: %{},                 # 检查间共享数据
+          diagnostics: %{},             # 诊断结果
+          skip_further_checks?: false
+```
+
+**检查初始化** (`verification/checks.ex:27-47`):
+
+```elixir
+def run(url, data_domain, installation_type, opts \\ []) do
+  init_state =
+    %State{
+      url: url,
+      data_domain: data_domain,  # 站点域名 (从 site.domain 来)
+      report_to: report_to,
+      diagnostics: %Verification.Diagnostics{
+        selected_installation_type: installation_type  # 安装类型 (用于错误消息)
+      }
+    }
+
+  # 执行三个检查：
+  checks = [
+    {Checks.Url, []},                              # URL 可达性检查
+    {Checks.VerifyInstallation, [timeout: ...]},   # 核心：浏览器验证
+    {Checks.VerifyInstallationCacheBust, [...]}      # 缓存清除重试
+  ]
 end
 ```
 
-## 3. 事件匹配机制
+**关键概念澄清**：
 
-### 3.1 验证架构概览
+| 变量名 | 来源 | 用途 |
+|-------|------|------|
+| `url` | 用户输入或默认 (`https://#{domain}` | 浏览器要访问的地址 |
+| `data_domain` | `site.domain` | ⭐ 域名比对的**期望域名** |
+| `selected_installation_type` | URL 参数或数据库 | 错误消息的**展示方式** |
 
-验证流程通过浏览器自动化服务（Browserless）在目标网站上执行验证脚本，检测 tracker script 的安装状态和事件发送能力。
+---
 
-**关键文件：**
-- `extra/lib/plausible/installation_support/checks/verify_installation.ex` - 验证检查执行器
-- `tracker/installation_support/verifier.js` - 浏览器端验证脚本
-- `extra/lib/plausible/installation_support/verification/diagnostics.ex` - 诊断结果解析
+## 3. 测试事件域名解析比对详解
 
-### 3.2 浏览器端验证流程
+### 3.1 域名来源完整链路
 
-**验证脚本执行架构：**
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          域名来源链路 (Site → Script → Event → Verification)                │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│ 1. 站点创建   │
+│  (Site.domain │
+│              │
+│  "example.com"│
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐     ┌──────────────────────────────────────────────────────────────┐
+│ 2. 脚本生成   │────▶│  lib/plausible_web/tracker.ex:36-46                      │
+│              │     │                                                              │
+│ plausible_   │     │  def plausible_main_config(config) do                            │
+│ main_config  │     │    %{                                                        │
+│              │     │      domain: config.site.domain,  ◀─── 关键：嵌入域名   │
+│  domain:     │     │      endpoint: tracker_ingestion_endpoint(),              │
+│  "example.com"│     │      outboundLinks: config.outbound_links,             │
+│              │     │      ...                                                    │
+│              │     │    }                                                         │
+└──────┬───────┘     └──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────┐     ┌──────────────────────────────────────────────────────────────┐
+│ 3. 脚本构建   │────▶│  lib/plausible_web/tracker.ex:49-67                      │
+│              │     │                                                              │
+│ 替换占位符   │     │  def build_script(config) do                                │
+│              │     │    config_js_content =                                       │
+│ <%= @config_ │     │      config                                                 │
+│ js %>        │     │      |> plausible_main_config()                             │
+│              │     │      |> ... (构建 JS 对象)                                 │
+│ 最终脚本:    │     │                                                              │
+│ {            │     │    @plausible_main_script                                   │
+│   domain:    │     │    |> String.replace("\"<%= @config_js %>\"",             │
+│   "example.com"│    │               "{#{config_js_content}}")                    │
+│   endpoint:  │     │  end                                                         │
+│   "...",     │     └──────────────────────────────────────────────────────────────┘
+│   ...        │
+│ }            │
+└──────┬───────┘
+       │
+       ▼ 脚本加载到用户网站
+       │
+┌──────────────┐     ┌──────────────────────────────────────────────────────────────┐
+│ 4. 脚本初始化 │────▶│  tracker/src/config.js:38-64                                 │
+│              │     │                                                              │
+│ 读取配置     │     │  export function init(options) {                             │
+│              │     │    if (COMPILE_PLAUSIBLE_WEB) {                             │
+│ config =     │     │      // 占位符被替换为实际配置对象                            │
+│ {            │     │      config = '<%= @config_js %>'  ◀─── 注意：是字符串？    │
+│   domain:    │     │      Object.assign(config, options, {                         │
+│   "example.com"│    │        // ⭐ 关键：domain 不可覆盖！                         │
+│ }            │     │        domain: config.domain  ◀── 强制使用嵌入的域名       │
+│              │     │      })                                                       │
+│              │     │    }                                                           │
+│              │     │    // NPM 方式：需要用户传入 domain                           │
+│              │     │    if (COMPILE_PLAUSIBLE_NPM) {                              │
+│              │     │      if (!options || !options.domain) {                       │
+│              │     │        throw new Error('domain argument is required')         │
+│              │     │      }                                                          │
+│              │     │      Object.assign(config, options)                            │
+│              │     │    }                                                           │
+│              │     │  }                                                             │
+└──────┬───────┘     └──────────────────────────────────────────────────────────────┘
+       │
+       ▼ 发送事件
+       │
+┌──────────────┐     ┌──────────────────────────────────────────────────────────────┐
+│ 5. 事件发送   │────▶│  事件 payload 中的 domain 字段                               │
+│              │     │                                                              │
+│ POST /api/   │     │  {                                                            │
+│ event        │     │    "n": "pageview",      // 或 "verification-agent-test"  │
+│              │     │    "d": "example.com",     // ◀── 从 config.domain 来        │
+│ Body:        │     │    "u": "https://example.com/page",                         │
+│ {            │     │    "v": 2,                                                 │
+│   "n": "pageview",  │     │    "r": null,                                             │
+│   "d": "example.com"│    │    ...                                                  │
+│ }            │     │  }                                                            │
+│              │     │                                                              │
+│              │     │  ⭐ 测试事件也是同样的逻辑：                                     │
+│              │     │  window.plausible('verification-agent-test', { callback: ... })│
+│              │     │  发送的事件中 d 字段 = config.domain                           │
+└──────┬───────┘     └──────────────────────────────────────────────────────────────┘
+       │
+       ▼ 验证服务拦截事件
+       │
+┌──────────────┐
+│ 6. 域名比对   │
+│              │
+│ 期望域名:    │
+│ data_domain  │
+│ (site.domain)│
+│              │
+│ 实际域名:    │
+│ event.d        │
+│ (从事件payload│
+│ 中提取)      │
+│              │
+│ 比对:        │
+│ event.d ==  │
+│ data_domain? │
+└──────────────┘
+```
+
+### 3.2 关键设计：Domain 不可覆盖性
+
+**Web 脚本的安全设计** (`tracker/src/config.js:38-45`):
 
 ```javascript
-// tracker/installation_support/verifier.js:12-119
-async function verifyPlausibleInstallation(options) {
-  const disallowedByCsp = checkDisallowedByCSP(responseHeaders, cspHostToCheck)
-  
-  forceIgnoreWebdriverCondition()
-  const { stopRecording, getInterceptedFetch } = startRecordingEventFetchCalls()
-
-  const {
-    plausibleIsInitialized,
-    plausibleIsOnWindow,
-    plausibleVersion,
-    plausibleVariant,
-    testEvent,
-    cookiesConsentResult,
-    error: testPlausibleFunctionError
-  } = await testPlausibleFunction({ timeoutMs, debug })
-  
-  const trackerIsInHtml = isInHtml(trackerScriptSelector)
-  
-  let interceptedTestEvent = getInterceptedFetch('verification-agent-test')
-  
-  // 兼容旧版 v1 脚本
-  if (!interceptedTestEvent && [200, 202].includes(testEvent.callbackResult?.status)) {
-    // 处理 legacy data-domain 方式
+export function init(options) {
+  if (COMPILE_PLAUSIBLE_WEB) {
+    // 这行代码在服务端被替换为实际的配置对象
+    // 例如：config = '{domain:"example.com",endpoint:"...",outboundLinks:!0}'
+    
+    config = '<%= @config_js %>'
+    
+    Object.assign(config, options, {
+      // ⭐ 关键设计：domain 显式放在最后，强制使用嵌入的域名
+      // 即使用户通过 transformRequest 或其他方式尝试覆盖，也无效
+      domain: config.domain
+    })
   }
 }
 ```
 
-### 3.3 测试事件发送机制
+**设计意图分析**：
 
-**事件发送与拦截：**
+| 设计决策 | 原因 | 安全影响 |
+|---------|------|---------|
+| Web 脚本 domain 不可覆盖 | 防止用户意外或恶意修改目标站点 | 确保事件始终发送到正确的站点 |
+| NPM 脚本需要显式传入 domain | NPM 用于 SPA/自定义场景，需要灵活性 | 用户负责确保 domain 正确性 |
+| 旧版脚本从 data-domain 读取 | 兼容 v1 脚本 | 依赖 script 标签属性 |
+
+**重要澄清**：
+- **Web 脚本**：domain 是**硬编码**在脚本中的，无法通过前端配置修改
+- 这意味着：如果用户复制了脚本 A（对应站点 A 的脚本），即使修改了页面上的 domain 属性或其他配置，事件仍然会发送到站点 A
+- 这是**安全设计**，防止配置错误时会导致"域名不匹配"错误，而不是静默发送到错误站点
+
+### 3.3 测试事件发送与拦截
+
+**测试事件发送** (`tracker/installation_support/verifier.js:208-308`):
 
 ```javascript
-// tracker/installation_support/verifier.js:208-308
 async function testPlausibleFunction({ timeoutMs, debug }) {
   return new Promise((_resolve) => {
-    // 1. 轮询检测 window.plausible 是否存在
-    plausibleOnWindowPollInterval = setInterval(
-      () => plausibleIsOnWindow
-        ? clearInterval(plausibleOnWindowPollInterval)
-        : (plausibleIsOnWindow = isPlausibleOnWindow()),
-      10
-    )
-
-    // 2. 轮询检测是否已初始化
-    plausibleInitializedPollInterval = setInterval(() => {
-      if (plausibleIsInitialized) {
-        plausibleVersion = getPlausibleVersion()
-        plausibleVariant = getPlausibleVariant()
-        clearInterval(plausibleInitializedPollInterval)
-      } else {
-        plausibleIsInitialized = isPlausibleInitialized()
-      }
-    }, 10)
-
-    // 3. 发送测试事件
+    // ... 轮询检测 window.plausible 是否存在和初始化 ...
+    
+    // 当 plausible 就绪后，发送测试事件
     testEventPollInterval = setInterval(() => {
       if (plausibleIsOnWindow && plausibleIsInitialized) {
+        // 发送名为 'verification-agent-test' 的测试事件
         window.plausible('verification-agent-test', {
           callback: (testEventCallbackResult) => {
             resolve({
@@ -235,22 +373,26 @@ async function testPlausibleFunction({ timeoutMs, debug }) {
 }
 ```
 
-**Fetch 拦截机制：**
+**Fetch 拦截机制** (`tracker/installation_support/verifier.js:144-186`):
 
 ```javascript
-// tracker/installation_support/verifier.js:144-186
 function startRecordingEventFetchCalls() {
   const interceptions = new Map()
   const originalFetch = window.fetch
   
   window.fetch = function (url, options = {}) {
     let identifier = null
+    
+    // 规范化事件体，提取关键信息
     const normalizedEventBody = getNormalizedPlausibleEventBody(options)
     
     if (normalizedEventBody) {
-      identifier = normalizedEventBody.name
+      identifier = normalizedEventBody.name  // 事件名称作为标识
       interceptions.set(identifier, {
-        request: { url, normalizedBody: normalizedEventBody }
+        request: { 
+          url, 
+          normalizedBody: normalizedEventBody  // 包含 domain 字段
+        }
       })
     }
 
@@ -274,140 +416,79 @@ function startRecordingEventFetchCalls() {
 }
 ```
 
-### 3.4 事件体规范化
-
-**事件体解析：**
+**事件体规范化** (`tracker/installation_support/verifier.js:121-142`):
 
 ```javascript
-// tracker/installation_support/verifier.js:121-142
 function getNormalizedPlausibleEventBody(fetchOptions) {
   try {
     const body = JSON.parse(fetchOptions.body ?? '{}')
+
     let name = null
     let domain = null
     let version = null
 
+    // 支持新旧两种字段格式
     if (
       fetchOptions.method === 'POST' &&
       (typeof body?.n === 'string' || typeof body?.name === 'string') &&
       (typeof body?.d === 'string' || typeof body?.domain === 'string')
     ) {
-      name = body?.n || body?.name
-      domain = body?.d || body?.domain
-      version = body?.v || body?.version
+      name = body?.n || body?.name        // 新: n, 旧: name
+      domain = body?.d || body?.domain    // 新: d, 旧: domain
+      version = body?.v || body?.version  // 新: v, 旧: version
     }
     return name && domain ? { name, domain, version } : null
   } catch (_error) {
-    // ignore error
+    // 解析失败则忽略
   }
 }
 ```
 
-**支持的字段格式（兼容新旧版本）：**
+### 3.4 域名比对逻辑详解
 
-| 新字段 | 旧字段 | 描述 |
-|-------|-------|------|
-| `name` | `n` | 事件名称 |
-| `domain` | `d` | 站点域名 |
-| `version` | `v` | 脚本版本 |
-
-### 3.5 服务端验证代理执行
-
-**Browserless 集成：**
+**比对入口** (`verification/checks.ex:53-99`):
 
 ```elixir
-# extra/lib/plausible/installation_support/checks/verify_installation.ex:20-72
-@puppeteer_wrapper_code """
-export default async function({ page, context: { url, userAgent, maxAttempts, timeoutBetweenAttemptsMs, ...functionContext } }) {
-  try {
-    await page.setUserAgent(userAgent)
-    const response = await page.goto(url)
-    const responseStatus = response.status()
-    const responseHeaders = response.headers()
+def interpret_diagnostics(
+      %State{
+        diagnostics: diagnostics,
+        data_domain: data_domain,  # ⭐ 期望域名
+        url: url
+      },
+      opts \\ []
+    ) do
+  result =
+    Verification.Diagnostics.interpret(
+      diagnostics,
+      data_domain,  # 传递给 interpret 函数
+      url
+    )
+  # ...
+end
+```
 
-    async function verify() {
-      await page.evaluate(() => {#{@verifier_code}}) // 注入验证脚本
-      return await page.evaluate(
-        (c) => window.verifyPlausibleInstallation(c),
-        { ...functionContext, responseHeaders }
-      );
-    }
+**核心比对函数** (`verification/diagnostics.ex:87-122`):
 
-    // 重试机制
-    let lastError;
-    for (let attempts = 1; attempts <= maxAttempts; attempts++) {
-      try {
-        const output = await verify();
-        return {
-          data: {
-            ...output.data,
-            attempts,
-            responseStatus
+```elixir
+# 成功场景 1: 普通成功
+def interpret(
+      %__MODULE__{
+        test_event: %{
+          "normalizedBody" => %{
+            "domain" => domain  # 实际域名（从事件中提取
           },
-        };
-      } catch (error) {
-        lastError = error;
-        if (typeof error?.message === "string" &&
-            error.message.toLowerCase().includes("execution context")) {
-          await new Promise((resolve) => setTimeout(resolve, timeoutBetweenAttemptsMs));
-          continue;
-        }
-        throw error
-      }
-    }
-    throw lastError;
-  } catch (error) {
-    return {
-      data: {
-        completed: false,
-        error: { message: error?.message ?? JSON.stringify(error) }
-      }
-    }
-  }
-}
-"""
-```
+          "responseStatus" => response_status
+        },
+        service_error: nil
+      },
+      expected_domain,  # 期望域名（data_domain = site.domain
+      _url
+    )
+    when response_status in [200, 202] and
+           domain == expected_domain,  # ⭐ 核心比对：完全相等
+    do: success()
 
-## 4. 验证反馈机制
-
-### 4.1 诊断数据结构
-
-**诊断字段定义：**
-
-```elixir
-# extra/lib/plausible/installation_support/verification/diagnostics.ex:7-23
-defstruct [
-  :selected_installation_type,
-  :disallowed_by_csp,
-  :tracker_is_in_html,
-  :plausible_is_on_window,
-  :plausible_is_initialized,
-  :plausible_version,
-  :plausible_variant,
-  :diagnostics_are_from_cache_bust,
-  :test_event,
-  :cookies_consent_result,
-  :response_status,
-  :service_error,
-  :attempts
-]
-```
-
-### 4.2 诊断解析流程
-
-**解析入口：**
-
-```elixir
-# extra/lib/plausible/installation_support/verification/diagnostics.ex:68-288
-def interpret(diagnostics, expected_domain, url)
-```
-
-### 4.3 成功判定条件
-
-**成功场景：**
-
-```elixir
-# extra/lib/plausible/installation_support/verification/diagnostics.ex:87-102
+# 成功场景 2: 仅在清除缓存后成功（视为缓存问题）
 def interpret(
       %__MODULE__{
         test_event: %{
@@ -416,386 +497,975 @@ def interpret(
           },
           "responseStatus" => response_status
         },
-        service_error: nil
+        service_error: nil,
+        diagnostics_are_from_cache_bust: true  # 标记：这是缓存清除后的重试
       },
       expected_domain,
       _url
     )
     when response_status in [200, 202] and
            domain == expected_domain,
-    do: success()
-```
+    do: handled_error(@error_succeeds_only_after_cache_bust)
 
-**成功条件：**
-1. 测试事件响应状态码为 200 或 202
-2. 事件中的 `domain` 与期望域名完全匹配
-3. 无服务端错误
-
-### 4.4 错误类型与反馈
-
-**错误分类体系：**
-
-| 错误类型 | 触发条件 | 用户反馈 |
-|---------|---------|---------|
-| 缓存问题 | 仅在清除缓存后成功 | 提示清除站点缓存 |
-| 域名不匹配 | 事件 domain 与期望不符 | 检查脚本配置 |
-| CSP 阻止 | CSP 禁止加载脚本 | 添加 plausible.io 到白名单 |
-| 脚本未找到 | HTML 中无脚本且 window 无对象 | 检查脚本安装 |
-| 网络错误 | 非 200/202 响应 | 检查代理或网络配置 |
-| 站点不可达 | 无法访问目标 URL | 检查域名或手动验证 |
-| 服务超时 | Browserless 超时 | 稍后重试 |
-
-**关键错误处理代码：**
-
-```elixir
-# 缓存问题处理
-@error_succeeds_only_after_cache_bust Error.new!(%{
-  message: "We detected an issue with your site's cache",
-  recommendation: "Please clear the cache for your site...",
-  url: "https://plausible.io/docs/troubleshoot-integration#have-you-cleared-the-cache-of-your-site"
-})
-
-# CSP 阻止处理
-@error_csp_disallowed Error.new!(%{
-  message: "We encountered an issue with your site's Content Security Policy (CSP)",
-  recommendation: "Please add plausible.io domain specifically to the allowed list...",
-  url: "https://plausible.io/docs/troubleshoot-integration#does-your-site-use-a-content-security-policy-csp"
-})
-
-# 域名不匹配处理
-defp error_unexpected_domain(selected_installation_type) do
-  case selected_installation_type do
-    "npm" -> @error_unexpected_domain_for_npm
-    "gtm" -> @error_unexpected_domain_for_gtm
-    "wordpress" -> @error_unexpected_domain_for_wordpress
-    _ -> @error_unexpected_domain_for_manual
-  end
-end
-```
-
-### 4.5 前端验证状态展示
-
-**验证组件渲染逻辑：**
-
-```elixir
-# lib/plausible_web/live/components/verification.ex:30-53
-def render(assigns) do
-  ~H"""
-  <div id="verification-ui">
-    <.render_progress :if={not @finished?} message={@message} />
-    <.render_success
-      :if={@finished? and @success?}
-      awaiting_first_pageview?={@awaiting_first_pageview?}
-      domain={@domain}
-    />
-    <.render_failed
-      :if={@finished? and not @success?}
-      interpretation={@interpretation}
-      attempts={@attempts}
-      domain={@domain}
-      flow={@flow}
-      installation_type={@installation_type}
-    />
-  </div>
-  """
-end
-```
-
-## 5. 边界情况处理
-
-### 5.1 旧版脚本兼容（v1 检测）
-
-**v1 脚本自动检测：**
-
-```elixir
-# lib/plausible_web/live/installation.ex:229-259
-defp outdated_script_notice(assigns) do
-  ~H"""
-  <div :if={
-    @recommended_installation_type.result == "manual" and
-      @installation_type.result == "manual"
-  }>
-    <.notice class="mt-4" theme={:yellow}>
-      Your website is running an outdated version of the tracking script. Please
-      <.styled_link new_tab href="https://plausible.io/docs/script-update-guide">
-        update
-      </.styled_link>
-      your tracking script before continuing
-    </.notice>
-  </div>
-  """
-end
-```
-
-**v1 脚本事件兼容处理：**
-
-```javascript
-// tracker/installation_support/verifier.js:64-89
-if (
-  !interceptedTestEvent &&
-  [200, 202].includes(testEvent.callbackResult?.status)
-) {
-  log(
-    `The callback result indicates a successful request, assuming legacy .compat installation that uses XMLHttpRequest`
-  )
-  const firstLegacySnippet = document.querySelector(
-    'script[data-domain][src]'
-  )
-  if (firstLegacySnippet) {
-    const domainString = firstLegacySnippet.getAttribute('data-domain')
-    const firstDomain = domainString && domainString.split(',').shift()
-
-    interceptedTestEvent = {
-      request: {
-        normalizedBody: {
-          __legacyCompatInstallation: true,
-          domain: firstDomain
-        }
+# 失败场景：域名不匹配
+def interpret(
+      %__MODULE__{
+        test_event: %{
+          "normalizedBody" => %{
+            "domain" => domain
+          },
+          "responseStatus" => response_status
+        },
+        service_error: nil,
+        selected_installation_type: selected_installation_type
       },
-      response: { status: testEvent.callbackResult.status }
-    }
-  }
-}
+      expected_domain,
+      _url
+    )
+    when response_status in [200, 202] and
+           domain != expected_domain do  # ⭐ 域名不匹配
+  error_unexpected_domain(selected_installation_type)
+  |> handled_error()
+end
 ```
 
-### 5.2 自定义 URL 验证
+### 3.5 域名比对边界分支详解
 
-**非标准路径支持：**
+**完整比对决策树**：
+
+```
+                    ┌─────────────────────────────────────────────────────────────────┐
+                    │              测试事件域名比对决策树                                │
+                    └─────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+                              ┌───────────────────────────────┐
+                              │ 测试事件是否成功发送？          │
+                              │ (response_status ∈ [200,  │
+                              │  202]?)                  │
+                              └───────────────────────────────┘
+                                   │               │
+                              是 │               │ 否
+                                   ▼               ▼
+                    ┌───────────────┐    ┌──────────────────────────────────┐
+                    │ 检查:        │    │ 检查: 网络/代理错误分支          │
+                    │ domain ==  │    │                             │
+                    │ expected_ │    │ - 检查 requestUrl 是否以     │
+                    │ domain?   │    │   Plausible endpoint 开头  │
+                    └───────────────┘    │                             │
+                          │             │ 是代理 │ 否                  │
+                     是 │ │ 否              ▼             ▼                     │
+                          │    ┌──────────────┐  ┌──────────────┐         │
+                          ▼    │ 代理网络错误 │  │ Plausible    │         │
+                    ┌──────────┐  │ 提示检查代理 │  │ 网络错误    │         │
+                    │ 成功   │  │ 配置       │  │ 提示稍后重试│         │
+                    │分支  │  │  └──────────────┘  └──────────────┘         │
+                    └──────┘  └──────────┘                             │
+                       │           │                                      │
+                       ▼           ▼                                      │
+           ┌──────────────┐  ┌──────────────┐                              │
+           │ 普通成功   │  │ 域名不匹配   │                              │
+           │ (无缓存   │  │ 错误分支     │                              │
+           │  标记)     │  │              │                              │
+           │           │  │ 根据安装类型 │                              │
+           │ 返回      │  │ 显示不同错误   │                              │
+           │ success()  │  │ 消息         │                              │
+           └──────────────┘  └──────────────┘                              │
+                                                                          │
+                                                                          │
+                    ┌─────────────────────────────────────────────────────────┐
+                    │ 其他失败场景（无有效测试事件）：                      │
+                    │                                                   │
+                    │ 1. tracker_is_in_html: false                   │
+                    │    → "We couldn't detect Plausible..."     │
+                    │                                                   │
+                    │ 2. plausible_is_on_window: false                 │
+                    │    → 同上（根据安装类型）                       │
+                    │                                                   │
+                    │ 3. CSP 阻止: disallowed_by_csp: true            │
+                    │    → "We encountered an issue with CSP"      │
+                    │                                                   │
+                    │ 4. 服务错误: service_error 存在                  │
+                    │    - :domain_not_found → 站点不可达             │
+                    │    - :browserless_timeout → 服务超时            │
+                    │    - :browserless_client_error → 网络错误          │
+                    └─────────────────────────────────────────────────┘
+```
+
+### 3.6 域名不匹配错误的详细分析
+
+**错误生成逻辑** (`verification/diagnostics.ex:324-359`):
 
 ```elixir
-# lib/plausible_web/live/verification.ex:97-105
+@unexpected_domain_message "Plausible test event is not for this site"
+
+# 不同安装类型的错误消息：
+
+# Manual 安装
+@error_unexpected_domain_for_manual Error.new!(%{
+  message: @unexpected_domain_message,
+  recommendation:
+    "Please check that the snippet on your site matches the installation instructions exactly",
+  url: @verify_manually_url
+})
+
+# NPM 安装
+@error_unexpected_domain_for_npm Error.new!(%{
+  message: @unexpected_domain_message,
+  recommendation:
+    "Please check that you've initialized Plausible with the correct domain",
+  url: @verify_manually_url
+})
+
+# GTM 安装
+@error_unexpected_domain_for_gtm Error.new!(%{
+  message: @unexpected_domain_message,
+  recommendation:
+    "Please check that you've entered the ID in the GTM template correctly",
+  url: @verify_manually_url
+})
+
+# WordPress 安装
+@error_unexpected_domain_for_wordpress Error.new!(%{
+  message: @unexpected_domain_message,
+  recommendation:
+    "Please check that you've installed the WordPress plugin correctly",
+  url: @verify_manually_url
+})
+```
+
+**常见原因分析**：
+
+| 安装类型 | 可能原因 | 排查方向 |
+|---------|---------|--------|
+| Manual | 复制了错误的脚本（其他站点的脚本） | 检查 script URL 中的 script ID |
+| NPM | init() 时传入了错误的 domain | 检查初始化代码 |
+| GTM | 模板中输入了错误的 Script ID | 检查 GTM 配置 |
+| WordPress | 插件配置了错误的域名 | 检查插件设置 |
+
+**重要澄清**：
+- "域名不匹配"错误**不代表**脚本本身工作正常
+- 它表示：脚本发送的事件中的 domain 与当前验证的站点不匹配
+- 这通常是**配置错误**，不是代码错误
+
+---
+
+## 4. 关键状态节点与边界分支
+
+### 4.1 安装流程状态机
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          安装流程状态机 (Installation Flow)                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │   页面加载      │
+                              │  mount/1          │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                    ┌──────────────────────────────────────┐
+                    │ 初始化数据:                     │
+                    │                                 │
+                    │ 1. 检测推荐安装类型 (EE)      │
+                    │    - 扫描站点技术栈            │
+                    │    - 检测 v1 旧脚本           │
+                    │                                 │
+                    │ 2. 获取或创建配置             │
+                    │    - 默认启用所有自动捕获功能    │
+                    │    - installation_type = 推荐类型    │
+                    │                                 │
+                    │ 3. 确定当前选中类型             │
+                    │    - 优先级: URL参数 > 保存值 > 默认│
+                    └────────────────┬─────────────┘
+                                     │
+                                     ▼
+                    ┌──────────────────────────────────────┐
+                    │     用户交互阶段                 │
+                    │                                 │
+                    │ 可能的操作：                    │
+                    │                                 │
+                    │ 1. 切换 Tab (修改 URL ?type=xx) │
+                    │    → 更新 installation_type          │
+                    │                                 │
+                    │ 2. 勾选/取消勾选功能选项       │
+                    │    → 更新表单数据                │
+                    │                                 │
+                    │ 3. 点击 "Verify X installation" │
+                    │    → 提交表单                   │
+                    └────────────────┬─────────────┘
+                                     │
+                                     ▼
+                    ┌──────────────────────────────────────┐
+                    │     表单提交处理                 │
+                    │                                 │
+                    │ 1. update_script_configuration!│
+                    │    - 保存到数据库              │
+                    │    - 同步 Goals (自动捕获功能)    │
+                    │    - 清除 CDN 缓存 (如果需要)    │
+                    │                                 │
+                    │ 2. push_navigate 到验证页面   │
+                    │    - URL: /:domain/verification│
+                    │    - 参数: flow, installation_type│
+                    └────────────────┬─────────────┘
+                                     │
+                                     ▼
+                              ┌──────────────────┐
+                              │   进入验证流程  │
+                              └──────────────────┘
+```
+
+### 4.2 验证流程状态机
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          验证流程状态机 (Verification Flow)                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │   页面加载      │
+                              │  mount/1        │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                    ┌──────────────────────────────────────┐
+                    │ 初始化:                           │
+                    │                                 │
+                    │ 1. 获取 site                   │
+                    │ 2. 检查是否有 pageviews?            │
+                    │ 3. 确定 installation_type:       │
+                    │    - URL参数 > 数据库 > 默认   │
+                    │ 4. custom_url_input?           │
+                    │    - 是: 显示自定义 URL 表单   │
+                    │    - 否: 自动启动验证           │
+                    └────────────────┬─────────────┘
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              │                     │                      │
+              ▼                     ▼                      ▼
+    ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+    │ custom_url      │   │ 自动启动验证    │   │ CE 特殊处理     │
+    │ 输入表单       │   │                 │   │                 │
+    │                 │   │ launch_delayed │   │ 无 Browserless │
+    │ 用户输入自定义   │   │                 │   │ 支持            │
+    │ URL            │   │ 发送 {:start,    │   │                 │
+    │                 │   │ self()}      │   │ 直接显示        │
+    │ 点击 "Verify   │   │                 │   │ "Awaiting your │
+    │ Installation" │   │ 速率限制检查:   │   │ first pageview" │
+    │                 │   │ 60分钟内最多3次 │   │                 │
+    └────────┬────────┘   └────────┬────────┘   └─────────────────┘
+             │                         │
+             ▼                         ▼
+             │              ┌─────────────────┐
+             │              │ 检查执行中...   │
+             │              │                 │
+             │              │ Checks.run()   │
+             │              │                 │
+             │              │ 1. Url 检查   │
+             │              │ 2. Verify    │
+             │              │    Installation│
+             │              │ 3. Cache Bust  │
+             │              │    重试        │
+             │              └────────┬────────┘
+             │                       │
+             └───────────────────────┘
+                                     │
+                                     ▼
+                    ┌──────────────────────────────────────┐
+                    │     结果处理                       │
+                    │                                 │
+                    │ 收到 {:all_checks_done, state}    │
+                    │                                 │
+                    │ 1. interpret_diagnostics(state)   │
+                    │    → 计算 success?            │
+                    │                                 │
+                    │ 2. 无 pageviews?                 │
+                    │    → schedule_pageviews_check      │
+                    │                                 │
+                    │ 3. 更新组件状态:                 │
+                    │    - finished?: true            │
+                    │    - success?: interpretation.ok?│
+                    │    - interpretation: 结果       │
+                    └────────────────┬─────────────┘
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              │                     │                      │
+              ▼                     ▼                      ▼
+    ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+    │ 成功            │   │ 失败            │   │ 等待 pageview    │
+    │                 │   │                 │   │                 │
+    │ 显示:          │   │ 显示:          │   │ 无 pageviews?   │
+    │ "Success!"     │   │ 错误标题       │   │                 │
+    │                 │   │ 修复建议       │   │ 轮询检查:      │
+    │ 按钮:          │   │                 │   │ check_pageviews │
+    │ "Go to the     │   │ 按钮:          │   │                 │
+    │ dashboard"     │   │ "Verify again"  │   │ 有 pageview?     │
+    │                 │   │                 │   │                 │
+    │ 无 pageviews?   │   │ 链接:          │   │ redirect_to     │
+    │ → "Awaiting    │   │ - 自定义 URL    │   │ stats           │
+    │   your first   │   │ - 联系支持(EE)  │   │                 │
+    │   pageview..." │   │ - 回到安装说明  │   │                 │
+    │                 │   │ - 跳过验证      │   │                 │
+    │ 轮询 pageviews │   │                 │   │                 │
+    └─────────────────┘   └─────────────────┘   └─────────────────┘
+```
+
+### 4.3 关键边界分支详解
+
+#### 分支 1: 自定义 URL 输入
+
+**触发条件**：
+- URL 参数 `?custom_url=true`
+- 或验证失败且 `offer_custom_url_input: true`
+
+**场景**：
+- 站点部署在子路径 (`https://example.com/blog`)
+- 站点使用非标准端口
+- 站点需要特定路径才能触发脚本加载
+
+**代码** (`verification.ex:97-105`):
+
+```elixir
 def handle_event("verify-custom-url", %{"custom_url" => custom_url}, socket) do
   socket =
     socket
-    |> assign(url_to_verify: custom_url)
+    |> assign(url_to_verify: custom_url)  # 自定义 URL
     |> assign(custom_url_input?: false)
 
-  launch_delayed(socket)
+  launch_delayed(socket)  # 使用自定义 URL 启动验证
   {:noreply, reset_component(socket)}
 end
 ```
 
-**适用场景：**
-- 站点部署在子路径（如 `/blog`）
-- 使用非标准端口
-- 需要验证特定页面
+**重要澄清**：
+- `url_to_verify` 是**浏览器要访问的地址
+- `data_domain` 仍然是**站点域名**（用于比对）
+- 这允许：验证 `https://example.com/blog` 上的脚本发送事件到 `example.com`
 
-### 5.3 速率限制与重试机制
+#### 分支 2: 缓存问题检测
 
-**验证频率限制：**
+**触发条件**：
+- 第一次验证失败
+- 第二次（清除缓存后验证成功
+
+**错误类型**：
+```elixir
+# verification/diagnostics.ex:68-85
+def interpret(
+      %__MODULE__{
+        # ... 成功条件 ...
+        diagnostics_are_from_cache_bust: true  # 标记：这是缓存清除后的重试
+      },
+      expected_domain,
+      _url
+    )
+    when response_status in [200, 202] and
+           domain == expected_domain,
+    do: handled_error(@error_succeeds_only_after_cache_bust)
+```
+
+**用户反馈**：
+- 不是完全成功（显示警告）
+- 提示用户清除站点缓存
+- 提供缓存清除文档链接
+
+#### 分支 3: 版本差异（CE vs EE）
+
+| 特性 | Community Edition | Enterprise Edition |
+|-----|-----------------|-------------------|
+| Browserless 验证 | ❌ 不支持 | ✅ 支持 |
+| 安装类型检测 | ❌ 不支持 | ✅ 支持 |
+| GTM 安装类型 | ❌ 不支持 | ✅ 支持 |
+| v1 脚本检测 | ❌ 不支持 | ✅ 支持 |
+| 验证流程 | 直接等待 pageview | 完整浏览器验证 |
+
+**CE 验证逻辑** (`verification_test.exs:32-39`):
 
 ```elixir
-# lib/plausible_web/live/verification.ex:114-121
-case Plausible.RateLimit.check_rate(
-       "site_verification:#{domain}",
-       :timer.minutes(60),
-       3
-     ) do
-  {:allow, _} -> :ok
-  {:deny, _} -> :timer.sleep(@slowdown_for_frequent_checking)
+@tag :ce_build_only
+test "static verification screen renders (ce)", %{conn: conn, site: site} do
+  resp =
+    get(conn, conn |> no_slowdown() |> get("/#{site.domain}") |> redirected_to)
+    |> html_response(200)
+
+  assert resp =~ "Awaiting your first pageview …"
 end
 ```
 
-**限制规则：**
-- 每 60 分钟最多 3 次验证
-- 超过限制后添加 5 秒延迟
+#### 分支 4: 速率限制
 
-**多级重试机制：**
-
-1. **浏览器内重试**（max_attempts: 2）：处理页面导航延迟
-2. **HTTP 请求重试**（max_retries: 1）：处理临时网络问题
-3. **用户手动重试**：通过 "Verify installation again" 按钮
-
-### 5.4 验证代理事件过滤
-
-**防止测试事件污染统计：**
+**限制规则** (`verification.ex:114-121`):
 
 ```elixir
-# lib/plausible/ingestion/event.ex:197-210
+case Plausible.RateLimit.check_rate(
+       "site_verification:#{domain}",
+       :timer.minutes(60),  # 时间窗口：60 分钟
+       3                      # 最大次数：3 次
+     ) do
+  {:allow, _} -> :ok
+  {:deny, _} -> :timer.sleep(@slowdown_for_frequent_checking)  # 延迟 5 秒
+end
+```
+
+**设计意图**：
+- 防止 Browserless 服务被滥用
+- 防止对用户站点被频繁请求
+- 超过限制后不是完全拒绝，而是添加延迟
+
+#### 分支 5: 未处理情况 (Unhandled Cases)
+
+**触发条件**：
+- 诊断结果无法匹配任何已知错误模式
+- Browserless 服务内部错误
+
+**处理逻辑** (`verification/checks.ex:70-96`):
+
+```elixir
+case {telemetry?, result.data} do
+  {_, %{unhandled: true, browserless_issue: browserless_issue}} ->
+    sentry_msg =
+      if browserless_issue,
+        do: "Browserless failure in verification",
+        else: "Unhandled case for site verification"
+
+    Sentry.capture_message(sentry_msg,
+      extra: %{
+        message: inspect(diagnostics),
+        url: url,
+        hash: :erlang.phash2(diagnostics)
+      }
+    )
+
+    Logger.warning(
+      "[VERIFICATION] Unhandled case (data_domain='#{data_domain}'): #{inspect(diagnostics)}"
+    )
+
+    :telemetry.execute(telemetry_event_unhandled(), %{})
+end
+```
+
+**用户反馈**：
+- 显示通用错误消息
+- 提示"稍后重试"或"手动验证"
+- 内部记录到 Sentry 和日志
+
+---
+
+## 5. 设计取舍与容易混淆的口径
+
+### 5.1 关键设计取舍
+
+| 设计决策 | 取舍 | 影响 |
+|---------|------|------|
+| **Web 脚本 domain 硬编码** | 安全性 > 灵活性 | 配置错误会导致验证失败，但不会发送到错误站点 |
+| **URL 参数优先级 > 数据库** | 用户体验 > 一致性 | 用户可以动态切换安装类型，但可能与数据库不一致 |
+| **验证失败不阻止使用** | 用户体验 > 正确性 | 用户可以跳过验证去查看仪表板 |
+| **测试事件特殊 UA** | 数据准确性 > 实现简单 | 需要特殊处理防止污染统计 |
+| **60 分钟 3 次限制** | 服务保护 > 用户体验 | 频繁验证会被延迟 |
+| **CE 无 Browserless** | 简化部署 > 功能完整 | CE 用户只能等待 pageview |
+
+### 5.2 容易混淆的概念澄清
+
+#### 🔴 混淆点 1: "域名"的不同含义
+
+**容易混淆的表述**：
+> "验证域名"、"站点域名"、"事件域名"、"URL 域名"
+
+**澄清**：
+
+| 术语 | 定义 | 来源 | 用途 |
+|-----|------|------|------|
+| **站点域名** | `site.domain` | 用户创建站点时输入 | ⭐ 域名比对的**期望基准** |
+| **事件域名** | `event.d` 或 `event.domain` | 脚本中硬编码的配置 | ⭐ 实际发送的**目标域名** |
+| **URL 域名** | `url_to_verify` 中的 host | 用户输入或默认 | 浏览器要**访问的地址** |
+| **data_domain** | State 中的字段 | `site.domain` | 同"站点域名" |
+
+**验证成功的核心条件**：
+```
+事件域名 == 站点域名
+(event.d)    (site.domain)
+```
+
+**URL 域名**可以不同**（例如子路径部署），只要事件域名匹配即可。
+
+---
+
+#### 🔴 混淆点 2: installation_type 的作用
+
+**容易混淆的表述**：
+> "installation_type 决定脚本如何生成"
+
+**澄清**：
+
+| 实际作用 | 不影响 |
+|---------|--------|
+| ❌ **不影响**脚本内容生成 | 脚本内容由功能开关决定 |
+| ❌ **不影响**验证逻辑 | 验证只关心 domain 是否匹配 |
+| ✅ **只影响**错误消息展示 | 根据安装类型显示不同的修复建议 |
+| ✅ **影响**默认安装引导界面 | 显示对应安装类型的说明 |
+
+**代码证据** (`tracker.ex:36-46`):
+```elixir
+def plausible_main_config(config) do
+  %{
+    domain: config.site.domain,           # 来自 site，不是 installation_type
+    endpoint: tracker_ingestion_endpoint(),
+    outboundLinks: config.outbound_links, # 功能开关
+    fileDownloads: config.file_downloads,  # 功能开关
+    formSubmissions: config.form_submissions # 功能开关
+  }
+end
+```
+
+---
+
+#### 🔴 混淆点 3: "验证成功" vs "有 pageview"
+
+**容易混淆的表述**：
+> "验证成功就会有 pageview"
+
+**澄清**：
+
+| 概念 | 含义 | 触发条件 |
+|-----|------|---------|
+| **验证成功** | 脚本安装正确，能发送事件 | 测试事件 domain 匹配 |
+| **有 pageview** | 真实用户访问产生了数据 | 真实用户访问页面 |
+
+**两者的关系**：
+
+```
+验证成功 ──────► 脚本可以工作
+                      │
+                      ▼
+                 真实用户访问 ──────► 产生 pageview
+                      │
+                      ▼
+                 自动跳转到仪表板
+```
+
+**测试事件的特殊性**：
+- 测试事件使用特殊 User-Agent
+- 被 `drop_verification_agent` 过滤
+- **不会**产生 pageview
+
+**代码证据** (`ingestion/event.ex:197-210`):
+```elixir
 on_ee do
   @verification_user_agent Plausible.InstallationSupport.user_agent()
 
-  defp drop_verification_agent(%__MODULE__{} = event, _context) do
+  defp drop_verification_agent(event, _context) do
     case event.request.user_agent do
       @verification_user_agent ->
-        drop(event, :verification_agent)
-
+        drop(event, :verification_agent)  # 丢弃验证事件
       _ ->
         event
     end
   end
-else
-  defp drop_verification_agent(%__MODULE__{} = event, _context), do: event
 end
 ```
 
-**过滤机制：**
-- 使用特定的 User-Agent 标识验证请求
-- 在事件处理管道早期丢弃这些事件
-- 不消耗页面视图配额
+---
 
-### 5.5 域名变更过渡期
+#### 🔴 混淆点 4: "域名不匹配"错误的含义
 
-**域名切换双接受机制：**
+**容易混淆的表述**：
+> "域名不匹配意味着脚本坏了"
 
-```elixir
-# lib/plausible/site/domain.ex:4-21
-@moduledoc """
-Basic interface for domain changes.
+**澄清**：
 
-We will set a transition period of #{@expire_threshold_hours} hours
-during which, both old and new domains, will be accepted as traffic
-identifiers to the same site.
-"""
+| 实际含义 | 不代表 |
+|---------|--------|
+| ✅ 脚本**正在工作** | ❌ 脚本损坏 |
+| ✅ 事件**正在发送** | ❌ 网络错误 |
+| ✅ 但发送到了**错误的站点** | ❌ CSP 阻止 |
+| ✅ **配置错误** | ❌ 代码错误 |
 
-@expire_threshold_hours 72
-```
+**常见场景**：
+1. 用户 A 创建了站点 `example.com`
+2. 用户 A 复制了脚本，但不小心用了站点 `other.com` 的脚本 ID
+3. 脚本正常工作，事件发送到 `other.com`
+4. 验证时发现：事件 domain (`other.com`) ≠ 期望 domain (`example.com`)
+5. 显示"域名不匹配"错误
 
-**过渡期特性：**
-- 72 小时内同时接受新旧域名的事件
-- 定期任务清理过期过渡状态
-- 数据库触发器确保域名唯一性
+**这是**安全特性**，不是 bug**：
+- 防止用户意外将数据发送到错误站点
+- 强制用户检查配置正确性
 
-### 5.6 Cookie Consent 处理
+---
 
-**自动处理 CMP（Consent Management Platform）：**
+#### 🔴 混淆点 5: 脚本 URL 中的 ID  vs 域名
 
+**容易混淆的表述**：
+> "脚本 URL 中的域名是目标域名"
+
+**澄清**：
+
+| 脚本 URL 示例 | 含义 |
+|-------------|------|
+| `https://plausible.io/js/abc123.js` | `plausible.io` 是 Plausible 服务域名 |
+| `https://your-self-hosted.com/js/def456.js` | `your-self-hosted.com` 是自托管域名 |
+
+**脚本 URL 中的域名**是 Plausible 服务的地址，**不是**被跟踪站点的域名。
+
+**被跟踪站点的域名**是：
+- Web 脚本：硬编码在脚本内容中（`config.domain`）
+- NPM 脚本：`init()` 时传入的 `domain` 参数
+- 旧版脚本：`data-domain` 属性
+
+---
+
+### 5.3 常见问题排查指南
+
+#### Q1: 验证一直失败，显示"域名不匹配"
+
+**排查步骤**：
+1. 检查页面上的脚本 URL 中的 script ID
+2. 确认该 ID 对应正确的站点
+3. 对于 NPM：检查 `init({ domain: "..." })
+4. 对于 GTM：检查模板中输入的 Script ID
+5. 对于 WordPress：检查插件设置
+
+**快速验证**：
+在浏览器控制台执行：
 ```javascript
-// tracker/installation_support/verifier.js:286-306
-cookiesConsentResult = initializeCookieConsentEngine({
-  debug,
-  onConsentDone: (cmp) => {
-    if (resolved) return
-    cookiesConsentResult = { handled: true, cmp }
-  },
-  onConsentError: (err) => {
-    if (resolved) return
-    cookiesConsentResult = { handled: false, error: err }
-  },
-  onLifecycleUpdate: (lifecycle) => {
-    if (resolved) return
-    if (cookiesConsentResult.handled !== null) return
-    if (lifecycle === 'done') {
-      cookiesConsentResult = { handled: true }
-    } else {
-      cookiesConsentResult.engineLifecycle = lifecycle
-    }
-  }
-})
+window.plausible  // 检查是否存在
+window.plausible.l  // 检查是否初始化
+// 发送测试事件查看实际 domain
+window.plausible('test', { callback: r => console.log(r) })
 ```
 
-### 5.7 超级管理员诊断信息
+---
 
-**内部调试支持：**
+#### Q2: 验证成功但仪表板没有数据
 
-```elixir
-# lib/plausible_web/live/components/verification.ex:171-201
-defp render_super_admin_diagnostics(assigns) do
-  ~H"""
-  <.focus_box>
-    <div
-      class="flex flex-col dark:text-gray-200"
-      x-data="{ showDiagnostics: false }"
-      id="super-admin-report"
-    >
-      <p class="text-sm">
-        <a href="#" @click.prevent="showDiagnostics = !showDiagnostics" class="bg-yellow-100 dark:bg-yellow-800/40">
-          As a super-admin, you're eligible to see diagnostics details. Click to expand.
-        </a>
-      </p>
-      <div x-show="showDiagnostics" x-cloak>
-        <.focus_list>
-          <:item :for={{diag, value} <- Map.from_struct(@verification_state.diagnostics)}>
-            <span class="text-sm">
-              {Phoenix.Naming.humanize(diag)}:
-              <span class="font-mono">{to_string_value(value)}</span>
-            </span>
-          </:item>
-        </.focus_list>
-      </div>
-    </div>
-  </.focus_box>
-  """
-end
-```
+**可能原因**：
+1. 验证成功只说明脚本配置正确
+2. 但测试事件被过滤，不会产生 pageview
+3. 需要真实用户访问才会产生数据
 
-## 6. 完整闭环流程图
+**解决方案**：
+- 自己访问页面（使用普通浏览器，不是隐身模式可能被识别为 bot）
+- 检查是否有广告拦截器
+- 检查是否在 `localhost`（某些情况下可能不发送）
+
+---
+
+#### Q3: 切换安装类型后验证结果不变
+
+**原因**：
+- `installation_type` 只影响错误消息
+- 不影响脚本生成和验证逻辑
+- 真正影响的是脚本内容（功能开关）
+
+**如果想真正改变**：
+- 需要修改功能开关（出站链接、文件下载等）
+- 或者修改脚本 ID（使用正确站点的脚本）
+
+---
+
+## 6. 完整闭环流程图（补充版）
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           站点创建后 Tracker 配置与验证闭环                     │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    站点 Tracker Script 配置与域名校验完整闭环                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  1. 站点创建  │────▶│ 2. 安装引导  │────▶│ 3. 脚本配置  │────▶│ 4. 验证触发  │
-│              │     │              │     │              │     │              │
-│ - 输入域名   │     │ - 检测技术栈 │     │ - 生成Script │     │ - 提交验证   │
-│ - 创建记录   │     │ - 选择安装   │     │ - 配置Options│     │ - 跳转验证页 │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-                                                          │
-                                                          ▼
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ 8. 结果反馈  │◀────│ 7. 诊断解析  │◀────│ 6. 事件匹配  │◀────│ 5. 验证执行  │
-│              │     │              │     │              │     │              │
-│ - 成功UI    │     │ - 成功判定   │     │ - 拦截Fetch  │     │ - Browserless│
-│ - 失败详情  │     │ - 错误分类   │     │ - 提取Domain │     │ - 执行脚本   │
-│ - 重试入口  │     │ - 建议生成   │     │ - 状态码校验 │     │ - 发送测试   │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              9. 后续流程                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ 成功:                                                                         │
-│   - 显示"Go to dashboard"按钮                                                 │
-│   - 若尚无 pageview，显示 "Awaiting your first pageview..."                  │
-│   - 后台轮询 pageview，有数据后自动跳转仪表板                                  │
-│                                                                               │
-│ 失败:                                                                         │
-│   - 显示具体错误信息和修复建议                                                  │
-│   - 提供"Verify installation again"按钮                                       │
-│   - 尝试 >=3 次（EE）后显示联系支持入口                                        │
-│   - 提供"回到安装说明"和"跳过验证去设置"链接                                   │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 1: 站点创建与配置初始化                                                        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+  用户输入域名 ──▶ 创建 Site 记录 ──▶ site.domain = "example.com"
+                                                    │
+                                                    ▼
+                                          ┌─────────────────┐
+                                          │ 初始化配置      │
+                                          │                 │
+                                          │ - 创建         │
+                                          │   TrackerScript-│
+                                          │   Configuration │
+                                          │ - id: 自动生成  │
+                                          │ - installation_ │
+                                          │   type: "manual"│
+                                          │ - 所有功能开关:  │
+                                          │   true         │
+                                          └────────┬────────┘
+                                                   │
+                                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 2: 脚本生成与嵌入                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                                          ┌─────────────────┐
+                                          │ 构建脚本内容   │
+                                          │                 │
+                                          │ plausible_main_ │
+                                          │ config():      │
+                                          │ {              │
+                                          │   domain:      │
+                                          │   "example.com"│
+                                          │   endpoint:    │
+                                          │   "/api/event" │
+                                          │   outboundLinks│
+                                          │   : !0         │
+                                          │   ...          │
+                                          │ }              │
+                                          └────────┬────────┘
+                                                   │
+                                                   ▼
+                                          ┌─────────────────┐
+                                          │ 替换占位符     │
+                                          │                 │
+                                          │ <%= @config_js  │
+                                          │ %>  ──▶      │
+                                          │ {domain:"examp │
+                                          │ le.com,...}    │
+                                          └────────┬────────┘
+                                                   │
+                                                   ▼
+                                          ┌─────────────────┐
+                                          │ 最终脚本       │
+                                          │                 │
+                                          │ URL:           │
+                                          │ /js/{id}.js   │
+                                          │                 │
+                                          │ 包含硬编码:      │
+                                          │ domain =      │
+                                          │ "example.com"  │
+                                          └────────┬────────┘
+                                                   │
+                                                   ▼
+                                          用户复制到自己的网站
+                                          嵌入到 <head> 中
+                                                   │
+                                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 3: 验证流程（EE 版）                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+  用户点击 "Verify Script installation"
+                    │
+                    ▼
+          ┌─────────────────┐
+          │ 保存配置      │
+          │               │
+          │ - 更新        │
+          │   Tracker-     │
+          │   Script-    │
+          │   Config-       │
+          │   uration    │
+          │ - 同步 Goals │
+          │ - 清除 CDN   │
+          │   缓存       │
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │ 跳转到验证页面 │
+          │               │
+          │ URL:          │
+          │ /example.com/ │
+          │ verification  │
+          │ ?flow=...&   │
+          │ installation │
+          │ _type=manual │
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │ 初始化验证状态     │
+          │                 │
+          │ data_domain =    │
+          │   "example.com"│
+          │                 │
+          │ installation_   │
+          │ type = "manual" │
+          │ (从 URL 参数)   │
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │ 启动 Browserless│
+          │ 检查          │
+          │                 │
+          │ 1. 访问 URL    │
+          │ 2. 执行验证脚本 │
+          │ 3. 发送测试事件 │
+          └────────┬────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 4: 测试事件发送与拦截                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                    用户网站的浏览器环境
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │ 脚本加载      │
+                    │               │
+                    │ window.         │
+                    │ plausible 存在│
+                    │               │
+                    │ config.domain =│
+                    │ "example.com" │
+                    │ (硬编码)      │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ 验证脚本执行    │
+                    │                 │
+                    │ 1. 检测        │
+                    │    window.     │
+                    │    plausible   │
+                    │ 2. 检测初始化  │
+                    │ 3. 发送测试事件│
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ 发送测试事件    │
+                    │                 │
+                    │ window.         │
+                    │ plausible(     │
+                    │   'verification│
+                    │   -agent-test', │
+                    │   { callback:   │
+                    │     ... }       │
+                    │ )               │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ 事件体构建      │
+                    │                 │
+                    │ {              │
+                    │   "n":        │
+                    │   "verification│
+                    │   -agent-test",│
+                    │   "d":         │
+                    │   "example.com"│
+                    │   ◀── 来自     │
+                    │   config.domain│
+                    │ }              │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ POST /api/event │
+                    │                 │
+                    │ 被验证脚本拦截  │
+                    │                 │
+                    │ 提取 normalized │
+                    │ Body:           │
+                    │ {              │
+                    │   name: "verif │
+                    │   ication-agent│
+                    │   -test",      │
+                    │   domain:      │
+                    │   "example.com"│
+                    │ }              │
+                    │                 │
+                    │ responseStatus │
+                    │ : 202         │
+                    └────────┬────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 5: 域名比对与结果反馈                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+                    诊断数据返回给服务端
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │ 诊断解析      │
+                    │               │
+                    │ interpret(    │
+                    │   diagnostics,│
+                    │   expected_   │
+                    │   domain,     │
+                    │   url         │
+                    │ )             │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ 核心比对        │
+                    │               │
+                    │ test_event.    │
+                    │ normalizedBody │
+                    │ .domain       │
+                    │ ==             │
+                    │ expected_domain │
+                    │ (data_domain)  │
+                    │                │
+                    │ "example.com"  │
+                    │ ==             │
+                    │ "example.com"  │
+                    │ ──▶ 成功!    │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ 结果反馈        │
+                    │               │
+                    │ success()        │
+                    │ ok?: true     │
+                    │               │
+                    │ 显示:          │
+                    │ "Success!"    │
+                    │               │
+                    │ 按钮:          │
+                    │ "Go to the    │
+                    │ dashboard"   │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ 等待          │
+                    │ 真实 pageview  │
+                    │               │
+                    │ 轮询检查:      │
+                    │ has_pageviews?│
+                    │               │
+                    │ 真实用户访问 ──▶│
+                    │ 产生 pageview │
+                    │               │
+                    │ 自动跳转到     │
+                    │ 仪表板         │
+                    └─────────────────┘
 ```
 
-## 7. 关键文件索引
+---
 
-| 模块 | 文件路径 | 职责 |
-|-----|---------|------|
-| 安装引导 LiveView | `lib/plausible_web/live/installation.ex` | 协调安装流程、类型选择 |
-| 安装说明组件 | `lib/plausible_web/live/installation/instructions.ex` | 各安装类型的具体说明 |
-| Tracker 核心模块 | `lib/plausible_web/tracker.ex` | 脚本生成、配置管理、缓存 |
-| 配置数据模型 | `lib/plausible/site/tracker_script_configuration.ex` | 数据库 Schema |
-| 验证 LiveView | `lib/plausible_web/live/verification.ex` | 验证流程协调 |
-| 验证组件 | `lib/plausible_web/live/components/verification.ex` | 验证 UI 渲染 |
-| 诊断解析 | `extra/lib/plausible/installation_support/verification/diagnostics.ex` | 结果解析、错误分类 |
-| 验证执行器 | `extra/lib/plausible/installation_support/checks/verify_installation.ex` | Browserless 集成 |
-| 浏览器验证脚本 | `tracker/installation_support/verifier.js` | 页面内验证逻辑 |
-| 事件处理 | `lib/plausible/ingestion/event.ex` | 事件接收、过滤、处理 |
-| 域名管理 | `lib/plausible/site/domain.ex` | 域名变更、过渡期 |
+## 7. 关键文件索引（更新版）
 
-## 8. 总结
+| 文件路径 | 职责 | 关键函数/结构 |
+|---------|------|-----------|
+| `lib/plausible_web/live/installation.ex` | 安装引导 LiveView | `handle_event("submit"...) |
+| `lib/plausible_web/live/verification.ex` | 验证 LiveView | `get_installation_type/2` |
+| `lib/plausible_web/tracker.ex` | 脚本生成核心 | `plausible_main_config/1` |
+| `lib/plausible/site/tracker_script_configuration.ex` | 配置 Schema | `schema "tracker_script_configuration"` |
+| `extra/lib/plausible/installation_support/verification/checks.ex` | 检查执行 | `interpret_diagnostics/1` |
+| `extra/lib/plausible/installation_support/verification/diagnostics.ex` | 诊断解析 | `interpret/3` |
+| `extra/lib/plausible/installation_support/state.ex` | 状态结构 | `defstruct data_domain:...` |
+| `tracker/src/config.js` | 前端配置 | `init/1` |
+| `tracker/installation_support/verifier.js` | 验证脚本 | `getNormalizedPlausibleEventBody/1` |
+| `lib/plausible/ingestion/event.ex` | 事件处理 | `drop_verification_agent/2` |
 
-### 8.1 闭环核心机制
+---
 
-1. **多安装类型支持**：Manual、WordPress、NPM、GTM（EE），自动检测推荐
-2. **动态脚本生成**：基于配置动态生成，包含启用的功能模块
-3. **真实浏览器验证**：通过 Browserless 执行真实页面环境中的验证
-4. **事件级验证**：不仅检测脚本存在，还验证事件发送和域名匹配
-5. **精细错误反馈**：针对不同失败场景提供针对性的修复建议
-6. **多级重试机制**：浏览器内重试、HTTP 重试、用户手动重试
-7. **完善边界处理**：旧版兼容、自定义 URL、Cookie Consent、速率限制等
+## 8. 核心概念速查表
 
-### 8.2 安全与隔离
-
-- 验证事件使用特殊 User-Agent，被服务端过滤不记入统计
-- 域名变更有过渡期，确保平滑迁移
-- 速率限制防止滥用验证服务
-
-### 8.3 用户体验优化
-
-- 自动检测技术栈，推荐最佳安装方式
-- 可视化验证进度和状态
-- 失败时提供具体的错误信息和修复链接
-- 支持自定义 URL 验证非标准部署场景
+| 概念 | 值/行为 |
+|-----|---------|
+| **成功条件** | `test_event.normalizedBody.domain == data_domain` AND `response_status in [200, 202]` |
+| **期望域名来源** | `site.domain`（用户创建站点时输入） |
+| **实际域名来源** | 脚本中硬编码的 `config.domain` |
+| **installation_type 作用** | 仅影响错误消息展示，不影响脚本生成 |
+| **测试事件是否产生 pageview** | ❌ 否，被特殊 UA 过滤 |
+| **URL 参数 vs 数据库** | URL 参数优先级更高 |
+| **Web 脚本 domain 可覆盖** | ❌ 否，安全设计 |
+| **CE 版验证方式** | 直接等待 pageview，无 Browserless |
