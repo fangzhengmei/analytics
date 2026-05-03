@@ -22,7 +22,7 @@ Plausible Analytics 的数据处理流水线采用了分层过滤 + 隐私优先
   put_user_agent,               # UA解析 + Bot检测 (关键)
   put_basic_info,               # 基本信息填充
   put_source_info,              # 来源归因 (关键)
-  maybe_infer_medium,           # 媒介推断
+  maybe_infer_medium,           # 媒介推断 (可能修改 utm_medium)
   put_props, put_revenue,       # 扩展属性
   put_salts, put_user_id,       # 隐私保护 (关键)
   validate_clickhouse_event,    # 数据验证
@@ -42,8 +42,8 @@ Plausible Analytics 的数据处理流水线采用了分层过滤 + 隐私优先
 |---------|------|---------|---------|
 | **自定义代理头** | `x-plausible-ip`, `x-plausible-ip-type` | ⚠️ **必须依赖代理** | 需配置反向代理注入/过滤，禁止直接暴露应用 |
 | **CDN/标准代理头** | `cf-connecting-ip`, `x-forwarded-for`, `forwarded` | ⚠️ **必须依赖代理** | 需配置可信代理链，取最左/最右取决于配置 |
-| **Tracker 请求体** | `r`/`referrer`, `u`/`url`, `d`/`domain` 等 | ⚠️ **客户端可伪造** | JavaScript 发送，可被篡改 |
-| **HTTP 标准头** | `User-Agent` | ⚠️ **客户端可伪造** | 浏览器可随意设置 |
+| **Tracker 请求体** | `r`/`referrer`, `u`/`url`, `d`/`domain` 等 | ❌ **客户端可伪造** | JavaScript 发送，可被篡改 |
+| **HTTP 标准头** | `User-Agent` | ❌ **客户端可伪造** | 浏览器可随意设置 |
 
 ### 2.2 关键代码证据：Remote IP 获取
 
@@ -71,7 +71,6 @@ def get(conn) do
       parse_forwarded_for(x_forwarded_for)  # 优先级 4：标准 X-Forwarded-For
 
     byte_size(forwarded) > 0 ->
-      # 解析 RFC 7239 Forwarded 头
       Regex.named_captures(~r/for=(?<for>[^;,]+).*$/, forwarded)
       |> Map.get("for")
       |> String.trim("\"")
@@ -88,49 +87,6 @@ defp parse_forwarded_for(header) do
   |> List.first()    # ⚠️ 取第一个 IP（最接近客户端）
   |> clean_ip()
 end
-```
-
-**信任边界分析**：
-
-```
-                    ┌─────────────────────────────────────────┐
-                    │        典型部署架构                      │
-                    └─────────────────────────────────────────┘
-                                          │
-                    ┌─────────────────────┴─────────────────────┐
-                    ▼                                           ▼
-           ┌────────────────┐                        ┌────────────────┐
-           │   攻击者       │                        │   真实用户     │
-           │  可随意设置头  │                        │                │
-           │  x-forwarded-for│                       │                │
-           │  x-plausible-ip │                       │                │
-           └───────┬────────┘                        └───────┬────────┘
-                   │                                           │
-                   ▼                                           ▼
-           ┌─────────────────────────────────────────────────────────┐
-           │              反向代理 (Nginx/Cloudflare)                │
-           │                                                         │
-           │  ✅ 可信配置：                                           │
-           │     - 清除/忽略客户端发送的 x-plausible-ip              │
-           │     - 清除/忽略客户端发送的 x-plausible-ip-type         │
-           │     - 代理自己注入真实的客户端 IP 和分类                  │
-           │                                                         │
-           │  ❌ 危险配置（直接暴露）：                                │
-           │     - 应用直接监听公网                                    │
-           │     - 代理未过滤/覆盖这些头                               │
-           │     → 攻击者可伪造任意 IP 和 IP 类型                      │
-           └───────────────────────────┬─────────────────────────────┘
-                                       │
-                                       ▼
-           ┌─────────────────────────────────────────────────────────┐
-           │                   Plausible 应用                          │
-           │                                                         │
-           │  remote_ip = 第一个非空：                                 │
-           │    x-plausible-ip → cf-connecting-ip → x-forwarded-for │
-           │                                                         │
-           │  ip_classification = 直接取：                            │
-           │    x-plausible-ip-type (List.first 取第一个)            │
-           └─────────────────────────────────────────────────────────┘
 ```
 
 ### 2.3 关键代码证据：IP Classification 获取
@@ -188,30 +144,29 @@ end
 }
 ```
 
-**信任影响**：
-| 数据项 | 实际来源 | 可伪造程度 | 影响 |
-|-------|---------|-----------|------|
-| `referrer` | 请求体 `"r"` 字段 | 高 | 归因完全依赖此字段 |
-| `url` | 请求体 `"u"` 字段 | 高 | 页面路径、hostname |
-| `domain` | 请求体 `"d"` 字段 | 高 | 目标站点 |
-| `query_params` | 从 `"u"` 解析 | 高 | UTM 参数、点击 ID |
-| `user_agent` | HTTP `User-Agent` 头 | 高 | Bot 检测、设备指纹 |
-| `remote_ip` | 代理头 | 中 | 需代理保护 |
-| `ip_classification` | `x-plausible-ip-type` 头 | 高 | 需代理过滤 |
-
 ### 2.5 安全部署要求总结
 
 **必须配置的反向代理规则**（以 Nginx 为例）：
 
 ```nginx
 # 关键：清除/覆盖客户端可能伪造的头
-proxy_set_header x-plausible-ip $real_client_ip;      # 覆盖，代理注入真实 IP
-proxy_set_header x-plausible-ip-type "";              # 清除，由外部服务（如 MaxMind）决定
-# 或如果有 IP 信誉服务：
-# proxy_set_header x-plausible-ip-type $ip_classification;
+location /api/event {
+    # 清除客户端可能伪造的 Plausible 自定义头
+    proxy_set_header x-plausible-ip "";
+    proxy_set_header x-plausible-ip-type "";
 
-# 对于标准代理头，确保配置正确的信任链
-# Nginx 的 real_ip 模块应正确配置
+    # 注入真实客户端 IP（使用 ngx_http_realip_module）
+    proxy_set_header x-plausible-ip $real_ip_override;
+
+    # 可选：如果有 IP 信誉服务，注入分类
+    # proxy_set_header x-plausible-ip-type $ip_classification;
+
+    # 标准 X-Forwarded-For 配置
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_pass http://plausible_backend;
+}
 ```
 
 ---
@@ -276,12 +231,6 @@ defp drop_threat_ip(%__MODULE__{} = event, _context) do
   end
 end
 ```
-
-**准确性取舍**：
-- **强过滤**：`dc_ip` 和 `threat_ip` 直接丢弃
-- **风险**：如果代理配置错误，可能：
-  - 漏过滤：攻击者不设置 `x-plausible-ip-type` 头即可绕过
-  - 误过滤：代理错误标记 `dc_ip` 导致真实用户被丢弃
 
 ---
 
@@ -376,11 +325,6 @@ defp register_session(%__MODULE__{} = event, context) do
 end
 ```
 
-**设计意图**：
-- **current 盐值**：用于生成最终存入数据库的 `user_id`
-- **previous 盐值**：用于在盐值轮换后，查找"昨天的"同一个用户
-- 目的：在盐值轮换的 90 秒窗口内，保持会话的连续性
-
 ### 4.5 IP 分类与隐私处理
 
 **处理流程** (`event.ex:324-333`, `event.ex:212-230`):
@@ -411,81 +355,47 @@ end
                                    └──────────────────┘
 ```
 
-**代码实现** (`event.ex:324-333`):
-
-```elixir
-defp put_geolocation(%__MODULE__{} = event, _context) do
-  case event.request.ip_classification do
-    "anonymous_vpn_ip" ->
-      # 匿名 VPN：不使用真实地理位置，统一标记为 A1
-      update_session_attrs(event, %{country_code: "A1"})
-
-    _any ->
-      # 正常 IP：使用 MaxMind GeoIP 数据库解析
-      result = Plausible.Ingestion.Geolocation.lookup(event.request.remote_ip) || %{}
-      update_session_attrs(event, result)
-  end
-end
-```
-
 ---
 
 ## 5. 访客归因机制与准确入库字段
 
-### 5.1 归因层级与优先级
+### 5.1 核心代码证据
 
-**核心模块** (`lib/plausible/ingestion/source.ex`):
+**归因数据的来源** (`event.ex:292-310`):
 
-归因遵循 **"标记优先于自然来源"** 的原则：
+```elixir
+defp put_source_info(%__MODULE__{} = event, _context) do
+  query_params = event.request.query_params
 
-```
-                    ┌─────────────────────────────┐
-                    │      归因决策流程           │
-                    └──────────────┬──────────────┘
-                                   │
-              ┌────────────────────┼────────────────────┐
-              ▼                    ▼                    ▼
-       ┌─────────────┐      ┌─────────────┐     ┌─────────────┐
-       │  utm_source │      │   source    │     │     ref     │
-       │  优先级 1   │      │  优先级 2   │     │  优先级 3   │
-       └──────┬──────┘      └──────┬──────┘     └──────┬──────┘
-              └────────────────────┼────────────────────┘
-                                   ▼
-                         ┌─────────────────┐
-                         │  tagged_source  │
-                         │  (有值则使用)   │
-                         └────────┬────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │  tagged_source 有值吗？   │
-                    └─────────────┬─────────────┘
-                                  │
-           ┌──────────────────────┴──────────────────────┐
-           ▼                                             ▼
-    ┌─────────────┐                              ┌─────────────────┐
-    │  使用标记   │                              │  检查 Referer   │
-    │  (不考虑Ref)│                              │   头有效性      │
-    └─────────────┘                              └────────┬────────┘
-                                                          │
-                                              ┌───────────┴───────────┐
-                                              │ 是有效的外部引用吗？  │
-                                              └───────────┬───────────┘
-                                                          │
-                                    ┌─────────────────────┴─────────────────────┐
-                                    ▼                                           ▼
-                             ┌─────────────┐                            ┌─────────────┐
-                             │  解析来源   │                            │  无来源     │
-                             │ RefInspector│                            │ source=nil  │
-                             └─────────────┘                            └─────────────┘
+  # utm_source: 原始值，直接从 query_params 取
+  tagged_source =
+    query_params["utm_source"] ||
+      query_params["source"] ||
+      query_params["ref"]
+
+  update_session_attrs(event, %{
+    # referrer_source: 标准化后的值，经过 Source.resolve() + find_mapping()
+    referrer_source: Plausible.Ingestion.Source.resolve(event.request),
+
+    # referrer: 格式化后的完整引用 URL
+    referrer: Plausible.Ingestion.Source.format_referrer(event.request),
+
+    click_id_param: get_click_id_param(event.request.query_params),
+
+    # utm_* 系列：原始值，直接从 query_params 取
+    utm_source: tagged_source,
+    utm_medium: query_params["utm_medium"],
+    utm_campaign: query_params["utm_campaign"],
+    utm_content: query_params["utm_content"],
+    utm_term: query_params["utm_term"]
+  })
+end
 ```
 
-### 5.2 来源解析实现
-
-**关键代码** (`source.ex:66-80`):
+**Source.resolve() 的内部逻辑** (`source.ex:66-80`):
 
 ```elixir
 def resolve(request) do
-  # 步骤 1: 检查 URL 标记参数（从 query_params 解析）
   tagged_source =
     request.query_params["utm_source"] ||
       request.query_params["source"] ||
@@ -493,21 +403,51 @@ def resolve(request) do
 
   source =
     cond do
-      tagged_source -> tagged_source  # 标记优先
-      has_valid_referral?(request) -> parse(request.referrer)  # 自然来源
-      true -> nil  # 直接访问
+      tagged_source -> tagged_source                                    # 优先级 1: 有 UTM 标记
+      has_valid_referral?(request) -> parse(request.referrer)          # 优先级 2: 有 referrer
+      true -> nil                                                        # 直接访问
     end
 
-  # 步骤 2: 标准化来源名称 (case-insensitive 映射)
-  find_mapping(source)
+  find_mapping(source)  # ⚠️ 关键：对结果进行标准化映射！
+end
+
+def find_mapping(nil), do: nil
+
+def find_mapping(source) do
+  case src(String.downcase(source)) do
+    name when is_binary(name) -> name   # 有映射：返回标准化名称
+    _ -> source                          # 无映射：返回原值
+  end
 end
 ```
 
-### 5.3 入库字段精确定义
+**媒介推断** (`event.ex:312-322`):
 
-**重要修正**：Plausible 使用 **两张核心表** 存储数据，且 `referrer_source` 和 `utm_source` 是**完全不同的字段**。
+```elixir
+defp maybe_infer_medium(%__MODULE__{} = event, _context) do
+  inferred_medium =
+    case event.clickhouse_session_attrs do
+      # 显式 utm_medium 优先
+      %{utm_medium: medium} when is_binary(medium) -> medium
 
-#### 表结构对比
+      # Google + gclid = 推断为 "(gclid)"
+      %{utm_medium: nil, referrer_source: "Google", click_id_param: "gclid"} -> "(gclid)"
+
+      # Bing + msclkid = 推断为 "(msclkid)"
+      %{utm_medium: nil, referrer_source: "Bing", click_id_param: "msclkid"} -> "(msclkid)"
+
+      _ -> nil
+    end
+
+  update_session_attrs(event, %{utm_medium: inferred_medium})  # ⚠️ 会修改 utm_medium！
+end
+```
+
+### 5.2 入库字段精确定义
+
+Plausible 使用 **两张核心表** 存储数据：`sessions_v2` 和 `events_v2`。两张表的归因字段定义相同。
+
+#### 表结构定义
 
 **Session 表** (`lib/plausible/clickhouse_session_v2.ex:35-78`):
 
@@ -519,9 +459,171 @@ schema "sessions_v2" do
   field :site_id, Ch, type: "UInt64"
 
   # ============================================
-  # 归因字段 - 注意区分！
+  # 归因字段 - 精确定义
   # ============================================
 
-  # 【字段 1】完整引用 URL
-  # 来源：请求体 "r" 字段
-  # 示例
+  # 【字段 1】完整引用 URL（格式化后）
+  # 来源：Source.format_referrer(request.referrer)
+  # 处理：去协议(https://)、去 www.、保留路径
+  # 示例：
+  #   输入: "https://www.google.co.uk/search?q=plausible"
+  #   输出: "google.co.uk/search?q=plausible"
+  # 无效引用: nil
+  field :referrer, :string
+
+  # 【字段 2】标准化来源名称
+  # 来源：Source.resolve() 结果
+  # 处理：
+  #   - 优先用 utm_source/source/ref（如果有）
+  #   - 否则用 request.referrer 解析
+  #   - 最后经过 find_mapping() 标准化映射
+  # 示例：
+  #   utm_source="ig" → 映射 → "Instagram"
+  #   utm_source="google" → 映射 → "Google"
+  #   referrer="https://google.co.uk/..." → RefInspector → "Google"
+  #   直接访问 → nil
+  field :referrer_source, :string
+
+  # 【字段 3】广告点击 ID 参数名
+  # 来源：检测 query_params 中的 click_id 参数
+  # 支持：gclid, gbraid, wbraid, msclkid, fbclid, twclid
+  # 示例："gclid", "msclkid"
+  # 注意：存储的是参数**名称**，不是值
+  field :click_id_param, Ch, type: "LowCardinality(String)"
+
+  # 【字段 4-8】UTM 参数（原始值）
+  # 来源：直接从 query_params 取
+  # 注意：这些字段**不经过**标准化映射
+  # 注意：utm_medium 可能被 maybe_infer_medium() 修改
+
+  # 来源：query_params["utm_source"] || query_params["source"] || query_params["ref"]
+  # 示例："google", "ig", "newsletter"
+  field :utm_source, :string
+
+  # 来源：query_params["utm_medium"]，可能被推断修改
+  # 示例："cpc", "organic", "email", "(gclid)"
+  field :utm_medium, :string
+
+  # 来源：query_params["utm_campaign"]
+  field :utm_campaign, :string
+
+  # 来源：query_params["utm_content"]
+  field :utm_content, :string
+
+  # 来源：query_params["utm_term"]
+  field :utm_term, :string
+
+  # 地理位置字段
+  field :country_code, Ch, type: "LowCardinality(FixedString(2))"  # 如 "US", "A1"
+  field :subdivision1_code, Ch, type: "LowCardinality(String)"
+  field :subdivision2_code, Ch, type: "LowCardinality(String)"
+  field :city_geoname_id, Ch, type: "UInt32"
+
+  # 设备字段
+  field :screen_size, Ch, type: "LowCardinality(String)"
+  field :operating_system, Ch, type: "LowCardinality(String)"
+  field :operating_system_version, Ch, type: "LowCardinality(String)"
+  field :browser, Ch, type: "LowCardinality(String)"
+  field :browser_version, Ch, type: "LowCardinality(String)"
+
+  # 计算字段（只读）
+  field :acquisition_channel, Ch, type: "LowCardinality(String)", writable: :never
+end
+```
+
+**Event 表** (`lib/plausible/clickhouse_event_v2.ex:8-53`):
+
+```elixir
+schema "events_v2" do
+  # 基础字段
+  field :name, Ch, type: "LowCardinality(String)"
+  field :site_id, Ch, type: "UInt64"
+  field :hostname, :string
+  field :pathname, :string
+  field :user_id, Ch, type: "UInt64"
+  field :session_id, Ch, type: "UInt64"
+  field :timestamp, :naive_datetime
+
+  # Session 属性（与 sessions_v2 相同的归因字段，冗余存储）
+  field :referrer, :string
+  field :referrer_source, :string
+  field :click_id_param, Ch, type: "LowCardinality(String)"
+  field :utm_medium, :string
+  field :utm_source, :string
+  field :utm_campaign, :string
+  field :utm_content, :string
+  field :utm_term, :string
+
+  # 地理位置（与 sessions_v2 相同）
+  field :country_code, Ch, type: "FixedString(2)"
+  field :subdivision1_code, Ch, type: "LowCardinality(String)"
+  field :subdivision2_code, Ch, type: "LowCardinality(String)"
+  field :city_geoname_id, Ch, type: "UInt32"
+
+  # 设备信息（与 sessions_v2 相同）
+  field :screen_size, Ch, type: "LowCardinality(String)"
+  field :operating_system, Ch, type: "LowCardinality(String)"
+  field :operating_system_version, Ch, type: "LowCardinality(String)"
+  field :browser, Ch, type: "LowCardinality(String)"
+  field :browser_version, Ch, type: "LowCardinality(String)"
+end
+```
+
+### 5.3 字段关系与数据流
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         归因字段完整数据流                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  输入数据（来自 Tracker 请求体）                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  request_body = {                                                     │  │
+│  │    "u": "https://example.com/page?utm_source=ig&utm_medium=cpc",   │  │
+│  │    "r": "https://www.google.co.uk/search?q=test",                  │  │
+│  │    "d": "example.com"                                                │  │
+│  │  }                                                                    │  │
+│  └───────────────────────────────────┬─────────────────────────────────┘  │
+│                                      │                                        │
+│                                      ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  解析阶段（Request.build()）                                          │  │
+│  │                                                                      │  │
+│  │  request.uri = %URI{                                                 │  │
+│  │    host: "example.com",                                              │  │
+│  │    query: "utm_source=ig&utm_medium=cpc"                            │  │
+│  │  }                                                                    │  │
+│  │                                                                      │  │
+│  │  request.query_params = %{                                           │  │
+│  │    "utm_source" => "ig",                                             │  │
+│  │    "utm_medium" => "cpc"                                             │  │
+│  │  }                                                                    │  │
+│  │                                                                      │  │
+│  │  request.referrer = "https://www.google.co.uk/search?q=test"       │  │
+│  │  request.hostname = "example.com"                                    │  │
+│  └───────────────────────────────────┬─────────────────────────────────┘  │
+│                                      │                                        │
+│                                      ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  put_source_info 阶段（event.ex:292-310）                           │  │
+│  │                                                                      │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │ 步骤 1: 提取 utm_source 原始值                                 │    │  │
+│  │  │ tagged_source =                                               │    │  │
+│  │  │   query_params["utm_source"] ||                               │    │  │
+│  │  │   query_params["source"] ||                                   │    │  │
+│  │  │   query_params["ref"]                                         │    │  │
+│  │  │                                                                │    │  │
+│  │  │ 本例：tagged_source = "ig"                                     │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                                                                      │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │ 步骤 2: 计算 referrer_source（标准化）                        │    │  │
+│  │  │ Source.resolve(request)                                      │    │  │
+│  │  │   → tagged_source = "ig" (有值，优先)                        │    │  │
+│  │  │   → source = "ig"                                             │    │  │
+│  │  │   → find_mapping("ig")                                        │    │  │
+│  │  │   → src("ig") → 查表 → "Instagram"                           │    │  │
+│  │  │                                                                │    │  │
+│  │  │ 本例：referrer_source = "Instagram"                           │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
