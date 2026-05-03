@@ -14,7 +14,7 @@
 │  • Bearer Token 验证                │  • 用户会话认证                      │
 │  • Scopes 范围检查                   │  • 角色权限检查                      │
 │  • 速率限制检查                      │  • 共享链接支持                      │
-│  • 订阅功能可用性检查                │  • 密码保护支持                      │
+│  • StatsAPI 功能检查                 │  • 团队锁定检查                      │
 └───────────────────┬─────────────────┴───────────────────┬─────────────────┘
                     │                                     │
                     ▼                                     ▼
@@ -23,6 +23,8 @@
 ├─────────────────────────────────────┬─────────────────────────────────────┤
 │   Api.StatsController               │   StatsController                    │
 │   (API 端点处理)                      │   (Web 界面处理)                     │
+│   ExternalStatsController           │                                      │
+│   (Public API v1/v2)                 │                                      │
 ├─────────────────────────────────────┼─────────────────────────────────────┤
 │  • 解析 API 参数                     │  • 解析前端状态                      │
 │  • Query.from/3 构建查询            │  • 直接调用 API 控制器方法           │
@@ -128,7 +130,7 @@ defp check_api_key_burst_limit(limit_key) do
 end
 ```
 
-#### 2.1.5 站点访问验证
+#### 2.1.5 站点访问验证（关键：订阅功能检查）
 
 ```elixir
 # L257-290
@@ -157,7 +159,8 @@ defp verify_site_access(opts) do
     # 4. 团队锁定检查
     Teams.locked?(team) -> {:error, :site_locked}
 
-    # 5. 订阅功能检查
+    # 5. ⚠️ 关键：StatsAPI 功能可用性检查
+    # 这是 API Token 特有的检查，需要高级订阅
     feature.check_availability(team) !== :ok ->
       {:error, :upgrade_required}
 
@@ -169,14 +172,16 @@ defp verify_site_access(opts) do
 end
 ```
 
-### 2.2 界面权限机制 (AuthorizeSiteAccess)
+### 2.2 界面权限机制 (AuthorizeSiteAccess + StatsController)
 
-**文件位置**: `lib/plausible_web/plugs/authorize_site_access.ex`
+**文件位置**: 
+- `lib/plausible_web/plugs/authorize_site_access.ex`
+- `lib/plausible_web/controllers/stats_controller.ex`
 
 #### 2.2.1 授权流程
 
 ```elixir
-# L78-140
+# authorize_site_access.ex:78-140
 def call(conn, {allowed_roles, site_param}) do
   current_user = conn.assigns[:current_user]
 
@@ -221,7 +226,38 @@ end
 # 7. :public - 公开访问（通过共享链接或公开站点）
 ```
 
-#### 2.2.3 共享链接支持
+#### 2.2.3 ⚠️ 界面权限的订阅检查（修正前偏差）
+
+**之前的错误结论**: 界面权限"隐式通过会话处理"订阅检查
+
+**正确的事实**:
+
+1. **AuthorizeSiteAccess 插件**：**不**检查 `Feature.StatsAPI` 功能可用性
+2. **StatsController**：在 `stats/2` 动作中检查 `Teams.locked?(site.team)`
+
+```elixir
+# stats_controller.ex:51-114
+def stats(%{assigns: %{site: site}} = conn, _params) do
+  site = Plausible.Repo.preload(site, :owners)
+  site_role = conn.assigns[:site_role]
+  current_user = conn.assigns[:current_user]
+  stats_start_date = Plausible.Sites.stats_start_date(site)
+  
+  # ⚠️ 关键：只检查团队是否被锁定，不检查 StatsAPI 功能
+  can_see_stats? = not Teams.locked?(site.team) or site_role == :super_admin
+  
+  # ...
+  
+  cond do
+    # ...
+    Teams.locked?(site.team) ->
+      site = Plausible.Repo.preload(site, :owners)
+      render(conn, "site_locked.html", site: site, dogfood_page_path: dogfood_page_path)
+  end
+end
+```
+
+#### 2.2.4 共享链接支持
 
 ```elixir
 # L200-220
@@ -250,7 +286,7 @@ defp maybe_get_shared_link(conn, site) do
 end
 ```
 
-### 2.3 授权机制对比表
+### 2.3 授权机制对比表（修正后）
 
 | 特性 | API Token 授权 | 界面权限授权 |
 |------|---------------|-------------|
@@ -258,20 +294,215 @@ end
 | **权限检查** | Scopes 范围匹配 | 角色列表匹配 |
 | **速率限制** | 有（每小时 + 突发） | 无 |
 | **共享链接** | 不支持 | 支持（可密码保护） |
-| **订阅检查** | 必须检查功能可用性 | 隐式通过会话处理 |
+| **订阅检查 - 团队锁定** | ✅ 检查 `Teams.locked?` | ✅ 检查 `Teams.locked?` |
+| **订阅检查 - StatsAPI 功能** | ✅ 检查 `Feature.StatsAPI` | ❌ **不检查** |
 | **团队切换** | 基于 API key 绑定 | 自动切换到站点所属团队 |
 | **错误响应** | JSON 格式 | 404 页面或 JSON（根据格式） |
 | **超级管理员** | 绕过所有检查 | 绕过所有检查 |
 
+**关键差异说明**:
+- **API Token**: 需要 `StatsAPI` 功能可用（通常需要高级订阅如 Business/Enterprise）
+- **界面权限**: 只需要团队没有被锁定（有活跃订阅即可，包括基础版）
+
 ---
 
-## 3. 参数流转分析
+## 3. Stats 各接口权限声明映射
 
-### 3.1 API 层参数流转 (Api.StatsController)
+### 3.1 路由 Pipeline 概览
+
+根据 `lib/plausible_web/router.ex`，Stats API 有三个主要的访问入口：
+
+| Pipeline | 授权机制 | 适用场景 |
+|----------|----------|----------|
+| `:internal_stats_api` | `AuthorizeSiteAccess` (默认 `:all_roles`) | 前端界面调用 |
+| `:public_api` + `AuthorizePublicAPI` | Bearer Token + Scopes | 公共 API v1/v2 |
+| `:docs_stats_api` | `AuthorizeSiteAccess` (限制 `[:admin, :editor, :super_admin, :owner]`) | API 文档测试 |
+
+### 3.2 公共 API v1/v2 权限映射 (API Token)
+
+#### 3.2.1 API v1 端点 (`/api/v1/stats`)
+
+**Scope**: `stats:read:*`
+
+| 端点 | HTTP 方法 | 控制器动作 | 所需 Scope | 功能检查 |
+|------|-----------|-----------|------------|----------|
+| `/api/v1/stats/realtime/visitors` | GET | `ExternalStatsController.realtime_visitors/2` | `stats:read:*` | StatsAPI |
+| `/api/v1/stats/aggregate` | GET | `ExternalStatsController.aggregate/2` | `stats:read:*` | StatsAPI |
+| `/api/v1/stats/breakdown` | GET | `ExternalStatsController.breakdown/2` | `stats:read:*` | StatsAPI |
+| `/api/v1/stats/timeseries` | GET | `ExternalStatsController.timeseries/2` | `stats:read:*` | StatsAPI |
+
+#### 3.2.2 API v2 端点 (`/api/v2`)
+
+**Scope**: `stats:read:*`
+
+| 端点 | HTTP 方法 | 控制器动作 | 所需 Scope | 功能检查 |
+|------|-----------|-----------|------------|----------|
+| `/api/v2/query` | POST | `ExternalQueryApiController.query/2` | `stats:read:*` | StatsAPI |
+
+#### 3.2.3 Sites API 端点 (`/api/v1/sites`)
+
+| 端点组 | Scope | 功能检查 |
+|--------|-------|----------|
+| 读取类 (index, teams_index, goals_index 等) | `sites:read:*` | StatsAPI |
+| 管理类 (create_site, update_site, delete_site 等) | `sites:provision:*` | StatsAPI + SitesAPI |
+
+### 3.3 内部 Stats API 权限映射 (界面权限)
+
+**Pipeline**: `internal_stats_api`
+**授权插件**: `AuthorizeSiteAccess` (默认 `:all_roles`)
+
+#### 3.3.1 核心查询端点
+
+| 端点 | HTTP 方法 | 控制器动作 | 允许角色 | 团队锁定检查 | StatsAPI 检查 |
+|------|-----------|-----------|----------|-------------|---------------|
+| `/api/stats/:domain/query` | POST | `StatsController.query/2` | 所有角色 | ✅ | ❌ |
+| `/api/stats/:domain/current-visitors` | GET | `StatsController.current_visitors/2` | 所有角色 | ✅ | ❌ |
+
+#### 3.3.2 Breakdown 类端点
+
+| 端点 | HTTP 方法 | 控制器动作 | 对应维度 |
+|------|-----------|-----------|----------|
+| `/api/stats/:domain/sources` | GET | `StatsController.sources/2` | `visit:source` |
+| `/api/stats/:domain/channels` | GET | `StatsController.channels/2` | `visit:channel` |
+| `/api/stats/:domain/pages` | GET | `StatsController.pages/2` | `event:page` |
+| `/api/stats/:domain/entry-pages` | GET | `StatsController.entry_pages/2` | `visit:entry_page` |
+| `/api/stats/:domain/exit-pages` | GET | `StatsController.exit_pages/2` | `visit:exit_page` |
+| `/api/stats/:domain/countries` | GET | `StatsController.countries/2` | `visit:country` |
+| `/api/stats/:domain/regions` | GET | `StatsController.regions/2` | `visit:region` |
+| `/api/stats/:domain/cities` | GET | `StatsController.cities/2` | `visit:city` |
+| `/api/stats/:domain/browsers` | GET | `StatsController.browsers/2` | `visit:browser` |
+| `/api/stats/:domain/browser-versions` | GET | `StatsController.browser_versions/2` | `visit:browser_version` |
+| `/api/stats/:domain/operating-systems` | GET | `StatsController.operating_systems/2` | `visit:os` |
+| `/api/stats/:domain/operating-system-versions` | GET | `StatsController.operating_system_versions/2` | `visit:os_version` |
+| `/api/stats/:domain/screen-sizes` | GET | `StatsController.screen_sizes/2` | `visit:device` |
+| `/api/stats/:domain/conversions` | GET | `StatsController.conversions/2` | `event:goal` |
+
+#### 3.3.3 UTM 类端点
+
+| 端点 | HTTP 方法 | 控制器动作 | 对应维度 |
+|------|-----------|-----------|----------|
+| `/api/stats/:domain/utm_mediums` | GET | `StatsController.utm_mediums/2` | `visit:utm_medium` |
+| `/api/stats/:domain/utm_sources` | GET | `StatsController.utm_sources/2` | `visit:utm_source` |
+| `/api/stats/:domain/utm_campaigns` | GET | `StatsController.utm_campaigns/2` | `visit:utm_campaign` |
+| `/api/stats/:domain/utm_contents` | GET | `StatsController.utm_contents/2` | `visit:utm_content` |
+| `/api/stats/:domain/utm_terms` | GET | `StatsController.utm_terms/2` | `visit:utm_term` |
+
+#### 3.3.4 自定义属性端点
+
+| 端点 | HTTP 方法 | 控制器动作 | 说明 |
+|------|-----------|-----------|------|
+| `/api/stats/:domain/custom-prop-values/:prop_key` | GET | `StatsController.custom_prop_values/2` | 需要检查 Props 功能可用性 |
+| `/api/stats/:domain/suggestions/custom-prop-values/:prop_key` | GET | `StatsController.custom_prop_value_filter_suggestions/2` | 属性值建议 |
+
+#### 3.3.5 企业版特有端点 (EE Only)
+
+| 端点 | HTTP 方法 | 控制器动作 | 额外权限 |
+|------|-----------|-----------|----------|
+| `/api/stats/:domain/funnels/:id` | GET | `StatsController.funnel/2` | 需要 Funnels 功能 |
+| `/api/stats/:domain/exploration/*` | POST | `StatsController.exploration_*` | 需要 Super Admin |
+
+### 3.4 Web 界面端点权限映射
+
+| 端点 | HTTP 方法 | 控制器动作 | 允许角色 | 说明 |
+|------|-----------|-----------|----------|------|
+| `/:domain/*path` | GET | `StatsController.stats/2` | 所有角色 | 主统计面板 |
+| `/:domain/export` | GET | `StatsController.csv_export/2` | 所有角色 | CSV 导出（重用 API 控制器方法） |
+| `/share/:domain/*path` | GET | `StatsController.shared_link/2` | 公开 | 共享链接访问 |
+
+### 3.5 权限声明总表
+
+#### 3.5.1 API Token 方式
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        API Token 权限声明模型                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  层级1: Bearer Token 验证                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Authorization: Bearer <api_key>                                    │  │
+│  │  → 验证 key_hash 是否存在                                            │  │
+│  │  → 获取关联的 user 和 team                                           │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│                                    ▼                                        │
+│  层级2: 速率限制检查                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  • 每小时请求限制 (基于 team 或 user)                                 │  │
+│  │  • 突发请求限制 (防止瞬间流量冲击)                                     │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│                                    ▼                                        │
+│  层级3: Scopes 范围匹配                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  路由 assigns: %{api_scope: "stats:read:*"}                         │  │
+│  │  vs                                                                    │  │
+│  │  API Key scopes: ["stats:read:*", "sites:provision:*"]              │  │
+│  │                                                                       │  │
+│  │  匹配规则: 前缀匹配 (支持通配符 *)                                      │  │
+│  │  隐式 scopes: ["stats:read:*", "sites:read:*"] (所有 API key 都有)   │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│                                    ▼                                        │
+│  层级4: 站点/团队访问验证                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  1. 成员资格检查: 用户是否是站点/团队成员                               │  │
+│  │  2. 团队锁定检查: Teams.locked?(team)                                 │  │
+│  │  3. 功能检查: Feature.StatsAPI.check_availability(team)              │  │
+│  │     → 这是 API Token 特有的严格检查                                    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.5.2 界面权限方式
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        界面权限声明模型                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  层级1: Session 认证                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Cookie 中的 session token                                            │  │
+│  │  → AuthPlug 填充 conn.assigns[:current_user, :current_team, ...]    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│                                    ▼                                        │
+│  层级2: 角色检查 (AuthorizeSiteAccess)                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  确定用户的 site_role:                                                 │  │
+│  │    1. 成员角色 (:owner, :admin, :editor, :viewer, :billing)         │  │
+│  │    2. :super_admin (超级管理员)                                        │  │
+│  │    3. :public (公开站点或共享链接)                                     │  │
+│  │                                                                       │  │
+│  │  检查: role in allowed_roles                                          │  │
+│  │  - internal_stats_api: :all_roles (所有角色都允许)                    │  │
+│  │  - docs_stats_api: [:admin, :editor, :super_admin, :owner]          │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│                                    ▼                                        │
+│  层级3: 访问验证                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  1. 合并视图检查: consolidated_view_available?                        │  │
+│  │  2. 共享链接检查: 密码保护验证 (如有)                                   │  │
+│  │  3. 团队锁定检查: Teams.locked?(team) (在 StatsController 中)          │  │
+│  │                                                                       │  │
+│  │  ⚠️ 注意: 没有 StatsAPI 功能检查!                                      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. 参数流转分析
+
+### 4.1 API 层参数流转 (Api.StatsController)
 
 **文件位置**: `lib/plausible_web/controllers/api/stats_controller.ex`
 
-#### 3.1.1 统一的查询构建模式
+#### 4.1.1 统一的查询构建模式
 
 ```elixir
 # 以 sources 端点为例 (L59-97)
@@ -296,7 +527,7 @@ def sources(conn, params) do
 end
 ```
 
-#### 3.1.2 Query.from/3 调用链
+#### 4.1.2 Query.from/3 调用链
 
 ```
 Query.from(site, params, opts)
@@ -319,7 +550,7 @@ Legacy.QueryBuilder.from(site, params, debug_metadata, now)
 }
 ```
 
-#### 3.1.3 新的 query 端点 (L40-57)
+#### 4.1.3 新的 query 端点 (L40-57)
 
 ```elixir
 # 使用新的解析器
@@ -336,9 +567,9 @@ def query(conn, params) do
 end
 ```
 
-### 3.2 界面层参数流转 (StatsController + 前端)
+### 4.2 界面层参数流转 (StatsController + 前端)
 
-#### 3.2.1 Web 控制器重用 API 控制器
+#### 4.2.1 Web 控制器重用 API 控制器
 
 ```elixir
 # lib/plausible_web/controllers/stats_controller.ex:134-196
@@ -357,7 +588,7 @@ def csv_export(conn, params) do
 end
 ```
 
-#### 3.2.2 前端参数构建 (stats-query.ts)
+#### 4.2.2 前端参数构建 (stats-query.ts)
 
 **文件位置**: `assets/js/dashboard/stats-query.ts`
 
@@ -384,7 +615,7 @@ export function createStatsQuery(
 }
 ```
 
-### 3.3 参数流转统一模式
+### 4.3 参数流转统一模式
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -431,7 +662,7 @@ export function createStatsQuery(
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.4 Query 结构体核心字段
+### 4.4 Query 结构体核心字段
 
 **文件位置**: `lib/plausible/stats/query.ex:4-34`
 
@@ -468,11 +699,295 @@ defstruct utc_time_range: nil,           # UTC 时间范围 (实际查询使用)
 
 ---
 
-## 4. 稳定性取舍分析
+## 5. 两种权限模型在查询复用上的边界与限制
 
-### 4.1 API Token 稳定性保障
+### 5.1 复用边界总览
 
-#### 4.1.1 速率限制策略
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    查询能力复用边界与限制                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                      完全复用的层 (Shared Layers)                     │  │
+│  ├─────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  核心查询层 (Plausible.Stats)                                          │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │ Stats.breakdown/4, Stats.aggregate/3, Stats.timeseries/3   │    │  │
+│  │  │ Stats.query/2, Stats.current_visitors/2                      │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                              ▲                                         │  │
+│  │                              │                                         │  │
+│  │  Query 结构体层                                               │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │ Query.from/3, Query.parse_and_build/3                        │    │  │
+│  │  │ Query 结构体 (filters, dimensions, metrics, 等)               │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                              ▲                                         │  │
+│  │                              │                                         │  │
+│  │  参数解析层 (ApiQueryParser, Legacy.QueryBuilder)                    │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │ 过滤器解析、日期范围解析、维度/指标验证                         │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                                                                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                    部分复用的层 (Partially Shared)                    │  │
+│  ├─────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  控制器层 (Controllers)                                                │  │
+│  │  ┌──────────────────┬──────────────────────────────────────────┐   │  │
+│  │  │ Api.StatsController │ StatsController                        │   │  │
+│  │  │ (内部 API)         │ (Web 界面)                               │   │  │
+│  │  ├──────────────────┼──────────────────────────────────────────┤   │  │
+│  │  │ • 所有 stats 端点  │ • stats/2 (渲染面板)                     │   │  │
+│  │  │ • 被 csv_export    │ • csv_export/2 (重用 API 控制器方法)    │   │  │
+│  │  │   直接调用         │                                          │   │  │
+│  │  └──────────────────┴──────────────────────────────────────────┘   │  │
+│  │                                                                       │  │
+│  │  ExternalStatsController / ExternalQueryApiController                │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│  │  │ 公共 API v1/v2 专用，不被界面复用                               │    │  │
+│  │  │ 不同的参数格式、不同的错误处理                                    │    │  │
+│  │  └─────────────────────────────────────────────────────────────┘    │  │
+│  │                                                                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                    完全隔离的层 (Completely Isolated)                 │  │
+│  ├─────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  授权层 (Authorization Plugs)                                          │
+│  │  ┌──────────────────────────┬──────────────────────────────────┐   │  │
+│  │  │ AuthorizePublicAPI       │ AuthorizeSiteAccess              │   │  │
+│  │  ├──────────────────────────┼──────────────────────────────────┤   │  │
+│  │  │ • Bearer Token 验证       │ • Session 认证                    │   │  │
+│  │  │ • Scopes 范围匹配         │ • 角色列表匹配                    │   │  │
+│  │  │ • 速率限制检查            │ • 无速率限制                       │   │  │
+│  │  │ • StatsAPI 功能检查       │ • 仅团队锁定检查                   │   │  │
+│  │  │ • 详细 JSON 错误响应      │ • 404 页面或模糊 JSON              │   │  │
+│  │  └──────────────────────────┴──────────────────────────────────┘   │  │
+│  │                                                                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 核心复用能力
+
+| 能力层级 | API Token | 界面权限 | 复用方式 |
+|----------|-----------|----------|----------|
+| **Query 结构体** | ✅ 使用 | ✅ 使用 | 完全相同的结构体定义 |
+| **Query 构建** | ✅ `Query.from/3`, `Query.parse_and_build/3` | ✅ 相同函数 | 完全相同的构建逻辑 |
+| **核心查询函数** | ✅ `Stats.breakdown/4` 等 | ✅ 相同函数 | 完全相同的实现 |
+| **稳定性机制** | ✅ 采样、导入数据跳过 | ✅ 相同机制 | 完全相同的保护 |
+| **参数解析** | ✅ `ApiQueryParser`, `Legacy.QueryBuilder` | ✅ 相同解析器 | 完全相同的解析逻辑 |
+
+### 5.3 边界与限制
+
+#### 5.3.1 授权边界（不可逾越）
+
+| 限制项 | API Token | 界面权限 | 说明 |
+|--------|-----------|----------|------|
+| **StatsAPI 功能要求** | ✅ 必须 | ❌ 不需要 | API Token 需要高级订阅 |
+| **速率限制** | ✅ 强制 | ❌ 无 | API 有严格的请求配额 |
+| **认证方式** | Bearer Token | Session Cookie | 完全不同的认证机制 |
+| **权限模型** | Scopes (字符串前缀匹配) | Roles (原子枚举值) | 不同的权限表达 |
+| **共享链接** | ❌ 不支持 | ✅ 支持 | 界面特有的公开访问方式 |
+
+#### 5.3.2 功能可用性边界
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        功能可用性边界                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  订阅功能依赖 (Feature Availability)                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │  API Token 访问                                                        │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 需要: Feature.StatsAPI.check_availability(team) == :ok       │   │  │
+│  │  │                                                                  │   │  │
+│  │  │ 通常需要: Business 或 Enterprise 订阅                           │   │  │
+│  │  │ 包含:                                                           │   │  │
+│  │  │   • /api/v1/stats/* (aggregate, breakdown, timeseries)        │   │  │
+│  │  │   • /api/v2/query                                               │   │  │
+│  │  │   • /api/v1/sites/* (需要 StatsAPI + SitesAPI)                 │   │  │
+│  │  └──────────────────────────────────────────────────────────────┘   │  │
+│  │                              │                                         │  │
+│  │                              ▼                                         │  │
+│  │  界面访问                                                               │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 只需要: not Teams.locked?(team)                                │   │  │
+│  │  │                                                                  │   │  │
+│  │  │ 任何活跃订阅都可以:                                             │   │  │
+│  │  │   • Starter, Business, Enterprise 都支持                        │   │  │
+│  │  │   • 只要订阅没有过期 (团队没被锁定)                              │   │  │
+│  │  │                                                                  │   │  │
+│  │  │ 额外功能检查 (在控制器中):                                       │   │  │
+│  │  │   • Funnels: 需要 Feature.Funnels (EE only)                   │   │  │
+│  │  │   • Props: 需要 Feature.Props (Business+)                      │   │  │
+│  │  │   • ConsolidatedView: 需要 Feature.ConsolidatedView            │   │  │
+│  │  └──────────────────────────────────────────────────────────────┘   │  │
+│  │                                                                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  关键差异:                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │  场景: 团队有 Starter 订阅 (活跃，但不含 StatsAPI)                    │  │
+│  │                                                                       │  │
+│  │    API Token 访问 → ❌ 402 Payment Required (需要 StatsAPI)          │  │
+│  │    界面访问     → ✅ 正常使用 (只需要团队没被锁定)                    │  │
+│  │                                                                       │  │
+│  │  这是设计上的边界，不是 Bug！                                          │  │
+│  │  - API Token 设计为第三方集成，需要明确的功能授权                      │  │
+│  │  - 界面是产品的核心体验，应该对所有付费用户开放                        │  │
+│  │                                                                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.3.3 端点可访问性边界
+
+| 端点组 | API Token (Public API) | 界面权限 (Internal API) | 说明 |
+|--------|------------------------|-------------------------|------|
+| `/api/v1/stats/*` | ✅ 可用 | ❌ 不存在 | 公共 API v1 专用端点 |
+| `/api/v2/query` | ✅ 可用 | ❌ 不存在 | 公共 API v2 专用端点 |
+| `/api/stats/:domain/query` | ❌ 不存在 | ✅ 可用 | 内部 API 专用端点 |
+| `/api/stats/:domain/*` (breakdown) | ❌ 不存在 | ✅ 可用 | 内部 API 专用端点 |
+| `/:domain/*` (Web 界面) | ❌ 不适用 | ✅ 可用 | 仅浏览器访问 |
+| `/share/:domain/*` (共享链接) | ❌ 不支持 | ✅ 可用 | 界面特有功能 |
+
+#### 5.3.4 错误处理边界
+
+| 错误场景 | API Token 响应 | 界面权限响应 | 边界原因 |
+|----------|---------------|-------------|----------|
+| 无效凭据 | 401 `{"error": "Invalid API key..."}` | 404 页面 | 安全考虑：界面不暴露详细错误 |
+| 缺少权限 | 401 `{"error": "Invalid API key..."}` | 404 页面 | 同上 |
+| 速率限制 | 429 `{"error": "Too many API requests..."}` | N/A | API 特有保护 |
+| 升级要求 | 402 `{"error": "The account that owns..."}` | 页面提示 | API 明确，界面友好 |
+| 站点锁定 | 402 `{"error": "This Plausible site is locked..."}` | `site_locked.html` | 相同含义，不同表现 |
+| 查询参数错误 | 400 `{"error": "..."}` | 400 或静默失败 | 界面需要更好的用户体验 |
+
+### 5.4 复用限制的设计意图
+
+| 限制项 | 设计意图 | 架构决策 |
+|--------|----------|----------|
+| **StatsAPI 功能检查** | API Token 作为付费功能 | 区分"使用界面"和"API 集成"两种使用模式 |
+| **速率限制** | 保护系统免受脚本滥用 | API 更易被自动化工具调用 |
+| **不同的端点路径** | 清晰的职责分离 | Public API  vs Internal API |
+| **不同的错误格式** | 不同的消费方 | API 面向机器（JSON），界面向用户（HTML） |
+| **共享链接支持** | 界面特有的公开访问 | API Token 已提供类似能力（生成受限 key） |
+
+### 5.5 跨越边界的场景
+
+#### 5.5.1 可以跨越边界的场景
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        可以跨越边界的场景                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 核心查询逻辑的完全复用                                                   │
+│     ┌─────────────────────────────────────────────────────────────────┐   │
+│     │ Stats.breakdown(site, query, metrics, pagination)               │   │
+│     │                                                                   │   │
+│     │ 无论是 API Token 还是界面权限，只要：                              │   │
+│     │   • 提供相同的 site 对象                                          │   │
+│     │   • 构建相同的 Query 结构体                                       │   │
+│     │   • 传入相同的 metrics 和 pagination                              │   │
+│     │                                                                   │   │
+│     │ 就会得到完全相同的查询结果！                                       │   │
+│     └─────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  2. CSV 导出中的控制器方法复用                                               │
+│     ┌─────────────────────────────────────────────────────────────────┐   │
+│     │ StatsController.csv_export/2                                     │   │
+│     │   │                                                               │   │
+│     │   ├──► Api.StatsController.sources(conn, params)                 │   │
+│     │   ├──► Api.StatsController.channels(conn, params)                │   │
+│     │   ├──► Api.StatsController.pages(conn, params)                   │   │
+│     │   └──► ... (所有 breakdown 方法)                                   │   │
+│     │                                                                   │   │
+│     │ 界面控制器直接调用 API 控制器的方法，实现代码级复用                  │   │
+│     └─────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  3. Query 结构体的完全互操作性                                               │
+│     ┌─────────────────────────────────────────────────────────────────┐   │
+│     │ 用 API Token 的参数构建的 Query，在界面上下文中完全可用            │   │
+│     │ 反之亦然                                                          │   │
+│     │                                                                   │   │
+│     │ Query 结构体不包含任何授权相关的信息                                │   │
+│     │ 它是纯粹的"查询描述"数据结构                                       │   │
+│     └─────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.5.2 无法跨越边界的场景
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        无法跨越边界的场景                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 授权层的本质差异                                                         │
+│     ┌─────────────────────────────────────────────────────────────────┐   │
+│     │ 无法用 Bearer Token "模拟" Session 认证                           │   │
+│     │ 无法用 Session Cookie "模拟" API Token 认证                        │   │
+│     │                                                                   │   │
+│     │ 原因：                                                             │   │
+│     │   • 不同的认证插件 (AuthorizePublicAPI vs AuthorizeSiteAccess)   │   │
+│     │   • 不同的权限模型 (Scopes vs Roles)                              │   │
+│     │   • 不同的 conn.assigns 结构                                       │   │
+│     │       - API: :current_user, :current_team, :site                 │   │
+│     │       - 界面: :current_user, :current_team, :site, :site_role,   │   │
+│     │                :shared_link                                        │   │
+│     └─────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  2. 端点路径的硬性隔离                                                       │
+│     ┌─────────────────────────────────────────────────────────────────┐   │
+│     │ /api/v1/stats/breakdown 只能通过 API Token 访问                   │   │
+│     │ /api/stats/:domain/sources 只能通过界面权限访问                    │   │
+│     │                                                                   │   │
+│     │ 即使你有有效的 API Token，也无法调用内部 API 端点                   │   │
+│     │ 即使你已登录界面，也无法调用公共 API 端点                           │   │
+│     │                                                                   │   │
+│     │ 原因：不同的路由 pipeline                                           │   │
+│     │   - Public API: pipe_through [:public_api, AuthorizePublicAPI]   │   │
+│     │   - Internal API: pipe_through :internal_stats_api                │   │
+│     │                (包含 AuthPlug + AuthorizeSiteAccess)               │   │
+│     └─────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  3. 功能可用性的硬性检查                                                     │
+│     ┌─────────────────────────────────────────────────────────────────┐   │
+│     │ 场景：Starter 订阅团队（无 StatsAPI 功能）                         │   │
+│     │                                                                   │   │
+│     │ 界面访问：✅ 正常工作                                              │   │
+│     │   - 只检查 Teams.locked?(team)                                    │   │
+│     │                                                                   │   │
+│     │ API Token 访问：❌ 402 Payment Required                          │   │
+│     │   - 检查 Feature.StatsAPI.check_availability(team)               │   │
+│     │   - 返回 {:error, :upgrade_required}                              │   │
+│     │                                                                   │   │
+│     │ 这是设计决策，不是缺陷！                                            │   │
+│     └─────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 6. 稳定性取舍分析
+
+### 6.1 API Token 稳定性保障
+
+#### 6.1.1 速率限制策略
 
 | 限制类型 | 实现位置 | 目的 |
 |----------|----------|------|
@@ -489,7 +1004,7 @@ with {:ok, api_key, limit_key, hourly_limit} <- find_api_key(conn, token, contex
 end
 ```
 
-#### 4.1.2 速率限制 Key 策略
+#### 6.1.2 速率限制 Key 策略
 
 ```elixir
 # 遗留 API key (无 team_id): 基于用户限制
@@ -504,7 +1019,7 @@ end
 - **遗留模式**: 每个用户独立限制，适合个人开发者
 - **团队模式**: 整个团队共享配额，适合企业用户
 
-#### 4.1.3 订阅功能检查
+#### 6.1.3 订阅功能检查
 
 ```elixir
 # 必须检查 StatsAPI 功能是否可用
@@ -520,9 +1035,9 @@ end
 - **优点**: 防止未付费用户滥用付费功能
 - **缺点**: 增加了数据库查询开销（检查团队订阅状态）
 
-### 4.2 界面权限稳定性考量
+### 6.2 界面权限稳定性考量
 
-#### 4.2.1 无速率限制的设计决策
+#### 6.2.1 无速率限制的设计决策
 
 界面权限（通过用户会话）**没有速率限制**，原因：
 
@@ -542,7 +1057,7 @@ role =
   end
 ```
 
-#### 4.2.2 共享链接的安全/稳定权衡
+#### 6.2.2 共享链接的安全/稳定权衡
 
 | 特性 | 安全性 | 稳定性影响 |
 |------|--------|-----------|
@@ -562,9 +1077,9 @@ def authenticate_shared_link(conn, %{"slug" => slug, "password" => password}) do
 end
 ```
 
-### 4.3 查询层稳定性机制
+### 6.3 查询层稳定性机制
 
-#### 4.3.1 采样机制
+#### 6.3.1 采样机制
 
 ```elixir
 # query.ex:10
@@ -573,7 +1088,7 @@ sample_threshold: 20_000_000,  # 2000 万行后启用采样
 
 **目的**: 防止大数据量查询拖慢系统
 
-#### 4.3.2 导入数据跳过机制
+#### 6.3.2 导入数据跳过机制
 
 ```elixir
 # query.ex:191-210
@@ -600,7 +1115,7 @@ end
 }
 ```
 
-#### 4.3.3 错误处理策略
+#### 6.3.3 错误处理策略
 
 | 错误类型 | API Token 响应 | 界面权限响应 |
 |----------|---------------|-------------|
@@ -611,12 +1126,12 @@ end
 | 站点锁定 | 402 Payment Required | 专用锁定页面 |
 | 查询参数错误 | 400 Bad Request | 400 或静默失败 |
 
-### 4.4 稳定性取舍总结表
+### 6.4 稳定性取舍总结表
 
 | 维度 | API Token 策略 | 界面权限策略 | 设计考量 |
 |------|---------------|-------------|---------|
 | **速率限制** | 强制启用（每小时 + 突发） | 无速率限制 | API 更易被脚本滥用 |
-| **功能检查** | 显式检查订阅功能 | 隐式通过角色 | API 需要严格计费 |
+| **功能检查** | 显式检查 StatsAPI 功能 | 仅检查团队锁定 | API 需要严格计费，界面是核心体验 |
 | **错误信息** | 详细 JSON 响应 | 模糊 404 或用户友好页面 | 安全性 vs 用户体验 |
 | **数据采样** | 共享采样机制 | 共享采样机制 | 统一保护查询性能 |
 | **导入数据** | 条件性包含 | 条件性包含 | 兼容性 vs 完整性 |
@@ -624,9 +1139,9 @@ end
 
 ---
 
-## 5. 关键代码引用
+## 7. 关键代码引用
 
-### 5.1 授权层
+### 7.1 授权层
 
 | 文件 | 关键函数/结构 | 行号 |
 |------|--------------|------|
@@ -636,16 +1151,30 @@ end
 | `authorize_site_access.ex` | `call/2` (主流程) | 78-140 |
 | `authorize_site_access.ex` | `maybe_get_shared_link/2` (共享链接) | 200-220 |
 | `auth_plug.ex` | `call/2` (会话填充) | 18-93 |
+| `stats_controller.ex` | `stats/2` (团队锁定检查) | 51-114 |
 
-### 5.2 控制器层
+### 7.2 路由层
+
+| 文件 | 关键配置 | 行号 |
+|------|----------|------|
+| `router.ex` | `:internal_stats_api` pipeline | 72-78 |
+| `router.ex` | `:public_api` + `AuthorizePublicAPI` | 91-93, 337-358 |
+| `router.ex` | `:docs_stats_api` pipeline | 80-89 |
+| `router.ex` | `/api/v1/stats` 路由 | 337-345 |
+| `router.ex` | `/api/v2/query` 路由 | 347-358 |
+| `router.ex` | `/api/stats/:domain` 路由 | 277-327 |
+
+### 7.3 控制器层
 
 | 文件 | 关键函数/结构 | 行号 |
 |------|--------------|------|
 | `api/stats_controller.ex` | `sources/2` (示例端点) | 59-97 |
 | `api/stats_controller.ex` | `query/2` (新查询端点) | 40-57 |
 | `stats_controller.ex` | `csv_export/2` (复用 API 方法) | 134-196 |
+| `api/external_stats_controller.ex` | 公共 API v1 端点 | - |
+| `api/external_query_api_controller.ex` | 公共 API v2 端点 | - |
 
-### 5.3 核心查询层
+### 7.4 核心查询层
 
 | 文件 | 关键函数/结构 | 行号 |
 |------|--------------|------|
@@ -654,7 +1183,7 @@ end
 | `stats/query.ex` | `from/3` (查询构建入口) | 75-82 |
 | `stats/filters.ex` | `parse/1` (过滤器解析) | 69-82 |
 
-### 5.4 前端层
+### 7.5 前端层
 
 | 文件 | 关键函数/结构 | 行号 |
 |------|--------------|------|
@@ -663,28 +1192,30 @@ end
 
 ---
 
-## 6. 架构优势与潜在改进点
+## 8. 架构优势与潜在改进点
 
-### 6.1 当前架构优势
+### 8.1 当前架构优势
 
 1. **查询能力完全复用**: API 和界面使用相同的 `Stats.breakdown/4` 等核心函数
 2. **授权层清晰分离**: 两种授权方式独立实现，但最终都设置相同的 `conn.assigns`
 3. **参数统一抽象**: `Query` 结构体作为中间层，隔离了入口差异
 4. **渐进式演进**: 支持遗留 `Query.from/3` 和新的 `Query.parse_and_build/3` 两种方式
 5. **稳定保障机制**: 采样、速率限制、导入数据跳过等多层保护
+6. **明确的权限边界**: API Token 和界面权限有清晰的职责划分和功能边界
 
-### 6.2 潜在改进点
+### 8.2 潜在改进点
 
 1. **速率限制一致性**: 界面权限也可考虑添加软速率限制，防止恶意刷新
 2. **错误处理统一**: 当前 API 返回详细 JSON，界面返回页面，可考虑统一错误格式
 3. **监控可观测性**: 可考虑在授权层添加更多 metrics，区分 API 和界面的访问模式
 4. **缓存策略**: 两种入口可共享查询结果缓存，进一步提升性能
+5. **端点命名统一**: 考虑是否需要统一 Public API 和 Internal API 的端点路径设计
 
 ---
 
-## 7. 总结
+## 9. 总结
 
-API Token、Stats API 和界面权限通过以下方式实现查询能力复用：
+### 9.1 核心复用机制
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -696,26 +1227,9 @@ API Token、Stats API 和界面权限通过以下方式实现查询能力复用�
 │  │ API Token   │              │             │              │         │ │
 │  │ (Bearer)    │──assigns──► │  conn.site  │──Query──►   │ Stats.  │ │
 │  │             │              │  conn.user  │   struct     │breakdown│ │
-│  ├─────────────┤              │ conn.team   │              │         │ │
+│  │ 🔍 Scopes   │              │ conn.team   │              │         │ │
+│  │ 🔍 StatsAPI │              │             │              │Stats.   │ │
+│  │ 🔍 速率限制 │              │             │              │aggregate│ │
+│  ├─────────────┤              ├─────────────┤              │         │ │
 │  │             │              │             │              │Stats.   │ │
-│  │ 界面权限     │──assigns──► │  conn.site  │──Query──►   │aggregate│ │
-│  │ (Session)   │              │ conn.user   │   struct     │         │ │
-│  │             │              │ conn.role   │              │Stats.   │ │
-│  │ (共享链接)   │              │shared_link  │              │timeseries││
-│  └─────────────┘              └─────────────┘              └─────────┘ │
-│                                                                          │
-│  关键差异点:                                                              │
-│  • 授权方式不同 (Token vs Session)                                       │
-│  • 速率限制不同 (API 有限制，界面无)                                      │
-│  • 错误响应不同 (JSON vs 页面)                                           │
-│                                                                          │
-│  关键复用点:                                                              │
-│  • 相同的 conn.assigns 结构 (site, user, team)                          │
-│  • 相同的 Query 结构体构建                                                │
-│  • 相同的 Stats 核心函数调用                                              │
-│  • 相同的稳定性机制 (采样、导入数据跳过)                                  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**最终结论**: 这套架构通过"授权层隔离 + 中间层统一 + 核心层共享"的设计，成功实现了三种入口方式的查询能力复用，同时保持了各自的授权特性和稳定性保障。
+│  │ 界面权限     │
