@@ -281,31 +281,53 @@ Tagged Events > Outbound Links > File Downloads
 
 **原因**: `getLinkEl` 函数通过 `tagName` 检查，但 SVG 命名空间内的元素行为不同
 
-#### 场景 4: 中键/新标签页打开
+#### 场景 4: 导航拦截决策（Compat 模式特有）
 
-**行为**:
-- 左键点击（正常）: 追踪事件
-- Ctrl/Meta + 左键: 追踪事件，**不拦截**导航
-- 中键点击 (`auxclick`): 追踪事件，**不拦截**导航
-- `target="_blank"`: 追踪事件，**不拦截**导航
+**重要说明**: 以下条件只影响 **Compat 模式下的导航拦截行为**，不影响**事件是否发送**。
 
 **拦截条件** (`tracker/src/custom-events.js:53-73`):
 ```javascript
 function shouldInterceptNavigation(event, link) {
-  // 不拦截: event.defaultPrevented
-  // 不拦截: target 不是 _self/_parent/_top
-  // 不拦截: ctrlKey || metaKey || shiftKey
-  // 不拦截: event.type !== 'click'
+  // 不拦截: event.defaultPrevented (其他脚本已阻止默认行为)
+  // 不拦截: target 不是 _self/_parent/_top (如新标签页)
+  // 不拦截: ctrlKey || metaKey || shiftKey (修饰键点击)
+  // 不拦截: event.type !== 'click' (如中键点击 auxclick)
 }
 ```
 
-#### 场景 5: 链接被其他脚本阻止
+**导航拦截行为**:
+| 场景 | 拦截导航? | 事件发送? |
+|------|----------|----------|
+| 左键点击（正常） | ✅ 是 | ✅ 是 |
+| Ctrl/Meta + 左键 | ❌ 否 | ✅ 是 |
+| 中键点击 (`auxclick`) | ❌ 否 | ✅ 是 |
+| `target="_blank"` | ❌ 否 | ✅ 是 |
+| `event.preventDefault()` 被调用 | ❌ 否 | ✅ 是 |
 
-**情况**: 链接有 `onclick="event.preventDefault()"`
+#### 场景 5: 链接被其他脚本阻止默认行为
 
-**结果**: **不追踪**该链接
+**情况**: 链接有 `onclick="event.preventDefault()"` 或其他脚本在事件冒泡阶段调用了 `preventDefault()`
 
-**原因**: `event.defaultPrevented` 检查优先
+**测试验证**: `tracker/test/outbound-links.spec.ts:322-379`
+
+**结果**: 
+- ✅ **事件仍然会被发送** (`Outbound Link: Click` 或 `File Download`)
+- ❌ **导航不会发生**（因为其他脚本阻止了它）
+
+**关键代码分析**:
+
+1. **`handleLinkClickEvent`** (`tracker/src/custom-events.js:75-109`):
+   - **不检查** `event.defaultPrevented`
+   - 只要是出站链接或文件下载，就会调用 `sendLinkClickEvent`
+
+2. **`sendLinkClickEvent`** (`tracker/src/custom-events.js:111-146`):
+   - **Compat 模式**: 调用 `shouldInterceptNavigation` 决定是否拦截导航，但**无论结果如何都会调用 `track()`**
+   - **非 Compat 模式**: 直接调用 `track()`，**不检查任何条件**
+
+3. **`shouldInterceptNavigation`** (`tracker/src/custom-events.js:53-73`):
+   - 只影响**导航拦截决策**，不影响**事件发送**
+   - 当 `event.defaultPrevented` 为 `true` 时返回 `false`（不拦截导航）
+   - 但 `sendLinkClickEvent` 的 `else` 分支**仍然会调用 `track()`**
 
 #### 场景 6: 子元素点击
 
