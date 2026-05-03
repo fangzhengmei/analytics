@@ -840,21 +840,29 @@ end
 
 #### 5.4.2 汇率转换的成本
 
-**币种不一致时的额外成本**:
+**币种不一致时的处理逻辑（代码可证）**:
 
-1. **计算成本**: 
-   - 入库时调用 `Money.to_currency!()` 进行汇率转换
-   - 依赖外部汇率数据源（通常是第三方 API）
-   - 可能存在 API 调用延迟和失败风险
+**已实现的代码逻辑**:
 
-2. **数据准确性风险**:
-   - 汇率是**时点值**，入库时的汇率可能与交易实际时间有差异
-   - 如果汇率提供商更新汇率，**历史数据不会回溯**
-   - 这可能导致报表金额与财务系统不一致
+| 代码位置 | 实现内容 |
+|----------|----------|
+| `extra/lib/plausible/ingestion/event/revenue.ex:26` | 调用 `Money.to_currency!(revenue_source, matching_goal.currency)` 进行汇率转换 |
+| `config/runtime.exs:687-689` | 配置 `ex_money` 库使用 Open Exchange Rates API，设置 `retrieve_every: :timer.hours(24)` 每24小时获取一次汇率 |
+
+**风险提示（基于代码逻辑的推断）**:
+
+1. **汇率时效性风险**:
+   - 汇率按固定周期（24小时）批量获取，而非实时
+   - 入库时使用的汇率可能与交易实际时间的汇率有差异
+   - 一旦入库，`revenue_reporting_amount` 字段**不会**因后续汇率更新而回溯调整
+
+2. **外部依赖风险**:
+   - 汇率数据依赖外部 API（Open Exchange Rates）
+   - 代码中未显式处理 API 不可用或返回失败的场景（使用 `to_currency!` 而非 `to_currency`，失败会抛出异常）
 
 3. **存储成本**:
-   - 需要同时存储 source 和 reporting 两套数据
-   - 虽然单个事件开销不大（约 16 字节），但高吞吐量场景下累积可观
+   - 需要同时存储 source 和 reporting 两套数据（4 个字段：`revenue_source_amount`, `revenue_source_currency`, `revenue_reporting_amount`, `revenue_reporting_currency`）
+   - 每个事件的额外存储开销约为 16 字节（2 个 Decimal64 + 2 个 FixedString(3)）
 
 #### 5.4.3 调试和排查成本
 
@@ -949,6 +957,8 @@ end
 
 ## 6. 关键代码位置汇总
 
+### 6.1 采集与存储模块（入库链路）
+
 | 功能模块 | 文件路径 | 关键函数/模块 |
 |----------|----------|--------------|
 | 前端采集 | `tracker/src/track.js` | `track()` |
@@ -960,5 +970,211 @@ end
 | **Revenue 存储映射（关键）** | `extra/lib/plausible/ingestion/event/revenue.ex` | `get_revenue_attrs/1` |
 | Site Goal 关联 | `lib/plausible/site.ex` | `has_many :revenue_goals` |
 | 数据模型 | `lib/plausible/clickhouse_event_v2.ex` | `schema "events_v2"` |
+
+### 6.2 查询与聚合模块（查询链路）
+
+| 功能模块 | 文件路径 | 关键函数/模块 |
+|----------|----------|--------------|
+| 查询解析 | `lib/plausible/stats/query.ex` | `parse_and_build/2`, `parse_and_build!/3` |
+| API 查询解析 | `lib/plausible/stats/api_query_parser.ex` | `parse/2`, `parse_metrics/1`, `parse_filters/1` |
+| 查询构建 | `lib/plausible/stats/query_builder.ex` | `build/3`, `build!/3` |
+| SQL 查询构建 | `lib/plausible/stats/sql/query_builder.ex` | `build/2` |
+| 查询执行 | `lib/plausible/stats/query_runner.ex` | `run/2` |
 | 目标过滤 | `lib/plausible/stats/goals.ex` | `add_filter/3`, `goal_condition/2` |
-| **Revenue 聚合** | `extra/lib/plausible/stats/goal/revenue.ex` | `preload/
+| **Revenue 聚合** | `extra/lib/plausible/stats/goal/revenue.ex` | `preload/4`, `format_revenue_metric/3` |
+| 聚合查询入口 | `lib/plausible/stats/aggregate.ex` | `aggregate/3` |
+| 属性查询 | `lib/plausible/stats/custom_props.ex` | `fetch_prop_names/2` |
+
+### 6.3 目标与配置模块
+
+| 功能模块 | 文件路径 | 关键函数/模块 |
+|----------|----------|--------------|
+| 目标定义 | `lib/plausible/goal.ex` | `defstruct`, `type/1` |
+| Revenue 目标 | `extra/lib/plausible/goal/revenue.ex` | `valid_currencies/0`, `type/1` |
+| 目标管理 | `lib/plausible/goals/goals.ex` | `for_site/2` |
+| 自定义属性配置 | `lib/plausible/props.ex` | `allowed_for/2`, `max_prop_key_length/0` |
+
+### 6.4 汇率转换配置
+
+| 功能模块 | 文件路径 | 关键配置项 |
+|----------|----------|-----------|
+| 汇率 API 配置 | `config/runtime.exs:687-689` | `:ex_money` 配置 `open_exchange_rates_app_id` 和 `retrieve_every: :timer.hours(24)` |
+| 测试环境 Mock | `config/test.exs:34` | `api_module: Plausible.ExchangeRateMock` |
+| 依赖声明 | `mix.exs:155` | `{:ex_money, "~> 5.12"}` |
+
+---
+
+## 7. 总结
+
+### 7.1 核心发现
+
+#### Revenue 事件的关键特性
+
+1. **目标命中是前提**
+   - Revenue 数据**只有在事件名称匹配配置的 Revenue Goal 时才会入库**
+   - 没有配置 Goal 或事件名称不匹配 → 所有 Revenue 字段为 NULL
+
+2. **双分支币种处理**
+   - **币种一致**: `source` = `reporting`，直接存储
+   - **币种不一致**: 执行汇率转换，`source` 保留原值，`reporting` 存储转换值
+
+3. **报表聚合依赖入库状态**
+   - 聚合时使用 `revenue_reporting_*` 字段
+   - 如果入库时为 NULL，聚合结果为空或返回警告
+
+### 7.2 架构优势
+
+1. **灵活的采集层**: 支持多种属性传递方式（`props`, `meta`, `p`）
+2. **严格的校验机制**: 多层校验确保数据质量
+3. **ClickHouse 优化设计**: 并行数组、LowCardinality 等设计适应列式存储
+4. **特性控制**: 基于计费特性的精细访问控制
+5. **惰性存储**: Revenue 字段只有在命中 Goal 时才占用存储
+
+### 7.3 潜在风险
+
+1. **配置复杂度**: 
+   - Revenue 事件需要先配置 Goal，增加了上手难度
+   - 多货币场景需要按 Goal 分组，增加了查询复杂度
+
+2. **查询性能**:
+   - 数组索引查询无直接索引，高基数场景可能较慢
+   - 多货币且不分组时无法聚合
+
+3. **数据一致性**:
+   - 汇率转换是时点值，历史数据不会随汇率更新
+   - 可能导致与财务系统的差异
+
+4. **排查成本**:
+   - Revenue 数据不显示的原因链较长
+   - 需要检查功能权限、Goal 配置、事件匹配、查询条件等多个环节
+
+### 7.4 扩展建议
+
+1. **配置策略**:
+   - 先配置 Goal，再发送 Revenue 事件
+   - 建议使用统一货币简化聚合
+   - 多货币场景必须按 `event:goal` 分组查询
+
+2. **性能优化**:
+   - 监控属性基数，定期检查高基数属性
+   - 识别高频属性查询，考虑 Materialized View
+   - 根据事件量和属性数量预估存储增长
+
+3. **架构选择**:
+   - 简单场景：单一货币 + 少量 Goal
+   - 复杂场景：考虑应用层统一货币或使用专门财务系统
+   - 避免在分析系统中处理复杂的货币转换逻辑
+
+---
+
+## 附录：Revenue 事件完整生命周期示例
+
+### 场景 1：成功入库（币种一致）
+
+```
+1. 配置阶段
+   - 在后台创建 Revenue Goal:
+     - event_name: "Purchase"
+     - currency: "USD"
+
+2. 前端发送
+   plausible.track('Purchase', {
+     revenue: { amount: 99.99, currency: 'USD' }
+   })
+
+3. 后端处理
+   - 请求校验: ✓ currency 有效，amount 可解析
+   - 目标命中: ✓ "Purchase" 匹配配置的 Goal
+   - 币种检查: ✓ USD == USD
+   - 入库字段:
+     revenue_source_amount: 99.99
+     revenue_source_currency: "USD"
+     revenue_reporting_amount: 99.99
+     revenue_reporting_currency: "USD"
+
+4. 报表查询
+   - 查询 total_revenue: ✓ 99.99
+   - 查询 average_revenue: ✓ 99.99
+```
+
+### 场景 2：成功入库（币种不一致）
+
+```
+1. 配置阶段
+   - Goal: event_name: "Purchase", currency: "EUR"
+
+2. 前端发送
+   plausible.track('Purchase', {
+     revenue: { amount: 99.99, currency: 'USD' }
+   })
+
+3. 后端处理
+   - 目标命中: ✓
+   - 币种检查: ✗ USD != EUR
+   - 汇率转换: 假设 1 USD = 0.92 EUR
+   - 入库字段:
+     revenue_source_amount: 99.99
+     revenue_source_currency: "USD"
+     revenue_reporting_amount: 91.99  (99.99 * 0.92)
+     revenue_reporting_currency: "EUR"
+
+4. 报表查询
+   - total_revenue: 91.99 EUR (使用 reporting 字段)
+```
+
+### 场景 3：不入库（无匹配 Goal）
+
+```
+1. 配置阶段
+   - 没有配置任何 Revenue Goal
+   - 或配置的 Goal event_name 是 "Checkout"
+
+2. 前端发送
+   plausible.track('Purchase', {
+     revenue: { amount: 99.99, currency: 'USD' }
+   })
+
+3. 后端处理
+   - 请求校验: ✓
+   - 目标命中: ✗ 没有匹配的 Goal
+   - 返回: %{}
+   - 入库字段: 所有 Revenue 字段为 NULL
+
+4. 报表查询
+   - 查询 total_revenue:
+     ⚠️ 警告: "no_revenue_goals_matching"
+     - 结果: null
+```
+
+### 场景 4：无法聚合（多货币不分组）
+
+```
+1. 配置阶段
+   - Goal 1: event_name: "Purchase_US", currency: "USD"
+   - Goal 2: event_name: "Purchase_EU", currency: "EUR"
+
+2. 前端发送
+   plausible.track('Purchase_US', { revenue: { amount: 99.99, currency: 'USD' } })
+   plausible.track('Purchase_EU', { revenue: { amount: 89.99, currency: 'EUR' } })
+
+3. 后端处理
+   - 两个事件都命中各自的 Goal
+   - 分别入库（USD 和 EUR）
+
+4. 报表查询
+   - 查询 1:  metrics: [total_revenue], dimensions: ["event:goal"]
+     ✓ 按 Goal 分组，可以聚合
+     - "Purchase_US": 99.99 USD
+     - "Purchase_EU": 89.99 EUR
+
+   - 查询 2:  metrics: [total_revenue], dimensions: []
+     ✗ 不分组，多货币
+     ⚠️ 警告: "no_single_revenue_currency"
+     - 结果: null（无法直接相加 USD 和 EUR）
+```
+
+---
+
+*报告生成时间: 2026-05-03*
+*基于代码版本: 当前工作目录*
+*更新内容: 重写 Revenue 查询链路，澄清目标命中逻辑、币种转换分支及影响*
