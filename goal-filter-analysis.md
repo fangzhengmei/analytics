@@ -1,45 +1,61 @@
 # 目标转化与过滤查询分析报告
 
-## 1. 整体架构与数据流
+## 1. 整体架构与查询入口分类
 
-### 1.1 数据流概览
+### 1.1 三种主要查询入口
 
-从页面状态到分析查询的完整数据流分为以下几个阶段：
+系统存在**三个独立的查询入口**，各自有不同的参数处理路径和验证规则：
 
-```
-页面状态（LiveView/API参数）
-    ↓
-API Query Parser 解析
-    ↓
-ParsedQueryParams 结构
-    ↓
-Query Builder 构建与验证
-    ↓
-Query 结构
-    ↓
-SQL Query Builder 构建
-    ↓
-Ecto 查询 → 数据库执行
-```
+| 入口类型 | 控制器 | 端点示例 | 解析器 | 目标存在性检查 |
+|---------|--------|---------|--------|---------------|
+| 内部仪表盘新API | `Api.StatsController.query/2` | `POST /api/stats/:domain/query` | `Dashboard.QueryParser` | **跳过** (`skip_goal_existence_check: true`) |
+| 内部仪表盘旧API | `Api.StatsController.sources/2` 等 | `GET /api/stats/:domain/sources` | `Legacy.QueryBuilder` | **无显式验证**（依赖SQL匹配） |
+| 公开API v1 | `Api.ExternalStatsController.aggregate/2` 等 | `GET /api/v1/stats/:domain/aggregate` | `Legacy.QueryBuilder` | **强制验证**（控制器层面） |
 
-### 1.2 入口点分析
+### 1.2 查询入口对比详解
 
-系统提供了两种主要的查询入口方式：
+#### 入口1：内部仪表盘新API (`/query`)
 
-**方式一：新API查询（推荐）**
+**位置**：`lib/plausible_web/controllers/api/stats_controller.ex:40-57`
+
 ```elixir
-# lib/plausible/stats/query.ex:50-59
-def parse_and_build(site, params, opts \\ []) do
-  with {:ok, %ParsedQueryParams{} = parsed_query_params} <-
-         ApiQueryParser.parse(params, opts) do
-    QueryBuilder.build(site, parsed_query_params, Keyword.get(opts, :debug_metadata, %{}))
+def query(conn, params) do
+  site = conn.assigns.site
+  now = conn.private[:now]
+
+  with {:ok, %ParsedQueryParams{} = params} <- Dashboard.QueryParser.parse(params, now: now),
+       {:ok, %Query{} = query} <- QueryBuilder.build(site, params, debug_metadata(conn)) do
+    # ...
+    json(conn, Plausible.Stats.query(site, query))
+  else
+    {:error, %QueryError{message: message}} -> bad_request(conn, message)
   end
 end
 ```
 
-**方式二：旧API兼容查询**
+**关键特征**：
+- 使用 `Dashboard.QueryParser` 解析参数
+- 该解析器设置 `skip_goal_existence_check: true`
+- 目标过滤器不进行存在性验证，未配置的目标在SQL层面匹配不到数据
+
+#### 入口2：内部仪表盘旧API (`/sources`, `/channels` 等)
+
+**位置**：`lib/plausible_web/controllers/api/stats_controller.ex:59-97` (以`sources/2`为例)
+
 ```elixir
-# lib/plausible/stats/query.ex:74-82
+def sources(conn, params) do
+  site = conn.assigns[:site]
+  params = Map.put(params, "property", "visit:source")
+  query = Query.from(site, params, debug_metadata: debug_metadata(conn))
+  # ...
+  %{results: results, meta: meta} = Stats.breakdown(site, query, metrics, pagination)
+  # ...
+end
+```
+
+**位置**：`lib/plausible/stats/query.ex:74-82`
+
+```elixir
 def from(site, params, opts \\ []) do
   Legacy.QueryBuilder.from(
     site,
@@ -50,163 +66,470 @@ def from(site, params, opts \\ []) do
 end
 ```
 
-**控制器中的实际使用**：
-```elixir
-# lib/plausible_web/controllers/api/stats_controller.ex:40-57
-def query(conn, params) do
-  site = conn.assigns.site
-  now = conn.private[:now]
+**关键特征**：
+- 使用 `Legacy.QueryBuilder` 直接构建 `%Query{}` 结构
+- **不经过** `QueryBuilder.build/3` 的验证流程
+- 目标过滤器没有显式的存在性验证，依赖SQL层面的匹配
+- 预加载目标用于构建查询条件，但不验证请求的目标是否存在
 
-  with {:ok, %ParsedQueryParams{} = params} <- Dashboard.QueryParser.parse(params, now: now),
-       {:ok, %Query{} = query} <- QueryBuilder.build(site, params, debug_metadata(conn)) do
+#### 入口3：公开API v1 (`/api/v1/stats`)
+
+**位置**：`lib/plausible_web/controllers/api/external_stats_controller.ex:33-55` (以`breakdown/2`为例)
+
+```elixir
+def breakdown(conn, params) do
+  site = Repo.preload(conn.assigns.site, :owners)
+
+  with :ok <- validate_period(params),
+       :ok <- validate_date(params),
+       :ok <- validate_property(params),
+       query <- Query.from(site, params, debug_metadata: debug_metadata(conn)),
+       :ok <- validate_filters(site, query.filters),  # 强制验证！
+       {:ok, metrics} <- parse_and_validate_metrics(params, query),
+       {:ok, limit} <- validate_or_default_limit(params),
+       :ok <- ensure_custom_props_access(site, query) do
     # ...
-    json(conn, Plausible.Stats.query(site, query))
   end
 end
 ```
 
-## 2. 模块协作关系
-
-### 2.1 核心模块职责划分
-
-| 模块 | 文件位置 | 主要职责 |
-|------|---------|---------|
-| `ApiQueryParser` | `lib/plausible/stats/api_query_parser.ex` | 解析原始API参数，转换为结构化数据 |
-| `ParsedQueryParams` | `lib/plausible/stats/parsed_query_params.ex` | 解析后参数的数据结构，提供辅助方法 |
-| `QueryBuilder` | `lib/plausible/stats/query_builder.ex` | 构建Query结构，执行所有验证逻辑 |
-| `Query` | `lib/plausible/stats/query.ex` | 最终查询结构，提供查询操作方法 |
-| `Filters` | `lib/plausible/stats/filters/filters.ex` | 过滤器解析、遍历、转换工具函数 |
-| `Goals` | `lib/plausible/stats/goals.ex` | 目标转化相关的查询逻辑 |
-| `SQL.QueryBuilder` | `lib/plausible/stats/sql/query_builder.ex` | 构建Ecto SQL查询 |
-| `SQL.WhereBuilder` | `lib/plausible/stats/sql/where_builder.ex` | 构建WHERE条件子句 |
-
-### 2.2 模块协作流程
-
-#### 阶段1：参数解析
-
-`ApiQueryParser.parse` 负责将原始参数映射为内部结构：
+**位置**：`lib/plausible_web/controllers/api/external_stats_controller.ex:330-359`
 
 ```elixir
-# lib/plausible/stats/api_query_parser.ex:25-46
-def parse(params, opts \\ []) when is_map(params) do
-  with :ok <- JSONSchema.validate(params),
-       {:ok, input_date_range} <- parse_input_date_range(params["date_range"]),
-       {:ok, metrics} <- parse_metrics(Map.fetch!(params, "metrics")),
-       {:ok, filters} <- parse_filters(params["filters"]),
-       {:ok, dimensions} <- parse_dimensions(params["dimensions"]),
-       {:ok, order_by} <- parse_order_by(params["order_by"]),
-       {:ok, pagination} <- parse_pagination(params["pagination"]),
-       {:ok, include} <- parse_include(params["include"]) do
-    {:ok,
-     Plausible.Stats.ParsedQueryParams.new!(%{
-       input_date_range: input_date_range,
-       metrics: metrics,
-       filters: filters,
-       dimensions: dimensions,
-       order_by: order_by,
-       pagination: pagination,
-       include: include,
-       now: Keyword.get(opts, :now)
-     })}
-  end
-end
-```
-
-**过滤器解析细节**：
-```elixir
-# lib/plausible/stats/api_query_parser.ex:69-75
-defp parse_filter(filter) do
-  with {:ok, operator} <- parse_operator(filter),
-       {:ok, second} <- parse_filter_second(operator, filter),
-       {:ok, rest} <- parse_filter_rest(operator, filter) do
-    {:ok, [operator, second | rest]}
-  end
-end
-```
-
-支持的操作符包括：
-- 基础过滤：`:is`, `:is_not`, `:contains`, `:contains_not`
-- 模式匹配：`:matches`, `:matches_not`, `:matches_wildcard`, `:matches_wildcard_not`
-- 逻辑组合：`:and`, `:or`, `:not`
-- 行为过滤：`:has_done`, `:has_not_done`
-
-#### 阶段2：查询构建与验证
-
-`QueryBuilder.build` 是核心的协调器，负责：
-
-1. 解析段落在过滤器中的引用
-2. 构建日期时间范围
-3. 预加载目标和收入数据
-4. 执行一系列验证
-5. 应用额外的查询设置
-
-```elixir
-# lib/plausible/stats/query_builder.ex:29-60
-def build(site, %ParsedQueryParams{} = parsed_query_params, debug_metadata) do
-  with {:ok, parsed_query_params} <- resolve_segments_in_filters(parsed_query_params, site),
-       query = do_build(parsed_query_params, site, debug_metadata),
-       :ok <- validate_order_by(query),
-       :ok <- validate_custom_props_access(site, query),
-       :ok <- validate_case_sensitive_filter_modifier(query),
-       :ok <- validate_toplevel_only_filter_dimension(query),
-       :ok <- validate_time_dimension_granularity(query),
-       :ok <- validate_special_metrics_filters(query),
-       :ok <- validate_behavioral_filters(query),
-       :ok <- validate_filtered_goals_exist(query, parsed_query_params),
-       :ok <- validate_revenue_metrics_access(site, query),
-       :ok <- validate_metrics(query),
-       :ok <- validate_include(query) do
-    query =
-      query
-      |> set_time_on_page_data(site)
-      |> put_comparison_utc_time_range()
-      |> Query.put_imported_opts(site)
-
-    # ... 采样设置
-    {:ok, query}
-  end
-end
-```
-
-**日期时间范围构建**：
-```elixir
-# lib/plausible/stats/query_builder.ex:88-150
-defp build_datetime_range(input_date_range, _site, _relative_date, now)
-     when input_date_range in [:realtime, :realtime_30m] do
-  duration_minutes =
-    case input_date_range do
-      :realtime -> 5
-      :realtime_30m -> 30
+defp validate_filters(site, filters) do
+  Enum.reduce_while(filters, :ok, fn filter, _ ->
+    case validate_filter(site, filter) do
+      :ok -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, reason}}
     end
+  end)
+end
 
-  first_datetime = DateTime.shift(now, minute: -duration_minutes)
-  last_datetime = DateTime.shift(now, second: 5)
+defp validate_filter(site, [_type, "event:goal", goal_filter | _rest]) do
+  site = Plausible.Repo.preload(site, :team)
+  props_available? = Plausible.Billing.Feature.Props.check_availability(site.team) == :ok
 
-  DateTimeRange.new!(first_datetime, last_datetime)
+  configured_goals =
+    site
+    |> Plausible.Goals.for_site(include_goals_with_custom_props?: props_available?)
+    |> Enum.map(& &1.display_name)
+
+  goals_in_filter = List.wrap(goal_filter)
+
+  if found = Enum.find(goals_in_filter, &(&1 not in configured_goals)) do
+    msg =
+      goal_not_configured_message(found) <>
+        "Find out how to configure goals here: https://plausible.io/docs/stats-api#filtering-by-goals"
+
+    {:error, msg}
+  else
+    :ok
+  end
 end
 ```
 
-#### 阶段3：目标预加载
+**关键特征**：
+- 控制器层面有**强制的目标存在性验证**
+- 使用 `Enum.find(goals_in_filter, &(&1 not in configured_goals))` 检查
+- 未配置的目标会立即返回错误响应，**不会到达SQL执行阶段**
+- 这是**唯一**会在查询执行前拒绝未配置目标的入口
 
-```elixir
-# lib/plausible/stats/query_builder.ex:222-234
-def preload_goals_and_revenue(site, metrics, filters, dimensions) do
-  preloaded_goals =
-    Plausible.Stats.Goals.preload_needed_goals(site, dimensions, filters)
+---
 
-  {revenue_warning, revenue_currencies} =
-    preload_revenue(site, preloaded_goals, metrics, dimensions)
+## 2. 前端URL参数到后端查询的完整路径
 
-  {
-    preloaded_goals,
-    revenue_warning,
-    revenue_currencies
+### 2.1 完整数据流图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              前端层 (Browser)                                         │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  ┌─────────────────┐                                                                │
+│  │  URL地址栏       │                                                                │
+│  │  可读格式参数     │                                                                │
+│  │  ?f=is,goal,Purchase&period=30d                  │                                                                │
+│  └────────┬────────┘                                                                │
+│           │                                                                          │
+│           ▼                                                                          │
+│  ┌──────────────────────────────────────────────────────────────┐                  │
+│  │  url-search-params.ts                                         │                  │
+│  │  - parseSearch(): 解析URL参数 → DashboardState                │                  │
+│  │  - stringifySearch(): DashboardState → URL参数                │                  │
+│  │  - 自定义序列化格式 (非JSON)                                   │                  │
+│  └──────────────────────────────┬───────────────────────────────┘                  │
+│                                 │                                                    │
+│                                 ▼                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐                  │
+│  │  dashboard-state.ts                                            │                  │
+│  │  - DashboardState: period, date, filters, labels 等           │                  │
+│  │  - filters: [["is", "event:goal", ["Purchase"]]]              │                  │
+│  └──────────────────────────────┬───────────────────────────────┘                  │
+│                                 │                                                    │
+│                                 ▼                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐                  │
+│  │  api.ts                                                        │                  │
+│  │  - dashboardStateToParams(): 转换为API请求参数                 │                  │
+│  │  - serializeApiFilters(): 过滤器序列化为JSON字符串            │                  │
+│  │  - stats(): POST /api/stats/:domain/query (JSON body)        │                  │
+│  │  - get(): GET /api/stats/:domain/sources (URL query params)   │                  │
+│  └──────────────────────────────┬───────────────────────────────┘                  │
+│                                 │                                                    │
+└─────────────────────────────────┼────────────────────────────────────────────────────┘
+                                  │
+                                  │ HTTP Request
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              后端层 (Phoenix Server)                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐                  │
+│  │  Phoenix Router / Plug                                        │                  │
+│  │  - 解析URL查询参数 (conn.query_params)                        │                  │
+│  │  - 解析JSON请求体 (conn.body_params)                          │                  │
+│  │  - 参数自动解码 (URI.decode_www_form)                         │                  │
+│  └──────────────────────────────┬───────────────────────────────┘                  │
+│                                 │                                                    │
+│                                 ▼                                                    │
+│          ┌──────────────────────┴──────────────────────┐                          │
+│          │                                             │                          │
+│          ▼                                             ▼                          │
+│  ┌───────────────────┐                    ┌──────────────────────────┐          │
+│  │  新API /query     │                    │  旧API /sources等        │          │
+│  │  (POST JSON)      │                    │  (GET query params)      │          │
+│  └─────────┬─────────┘                    └─────────────┬────────────┘          │
+│            │                                            │                         │
+│            ▼                                            ▼                         │
+│  ┌─────────────────────────┐              ┌─────────────────────────────┐       │
+│  │ Dashboard.QueryParser   │              │ Legacy.QueryBuilder         │       │
+│  │ - 解析JSON格式参数       │              │ - 解析URL query params      │       │
+│  │ - skip_goal_existence_  │              │ - 直接构建%Query{}          │       │
+│  │   check: true           │              │ - 不经过QueryBuilder.build   │       │
+│  └─────────┬───────────────┘              └─────────────┬───────────────┘       │
+│            │                                            │                         │
+│            ▼                                            │                         │
+│  ┌─────────────────────────┐                           │                         │
+│  │ QueryBuilder.build      │                           │                         │
+│  │ - 14项验证检查          │                           │                         │
+│  │ - 目标检查被跳过        │                           │                         │
+│  └─────────┬───────────────┘                           │                         │
+│            │                                            │                         │
+│            └──────────────────────┬─────────────────────┘                         │
+│                                   │                                                  │
+│                                   ▼                                                  │
+│                          ┌─────────────────┐                                        │
+│                          │  %Query{} 结构   │                                        │
+│                          │  - filters       │                                        │
+│                          │  - preloaded_    │                                        │
+│                          │    goals         │                                        │
+│                          └────────┬────────┘                                        │
+│                                   │                                                  │
+│                                   ▼                                                  │
+│                          ┌─────────────────┐                                        │
+│                          │ SQL.QueryBuilder │                                        │
+│                          │ - 构建Ecto查询   │                                        │
+│                          │ - Goals.add_     │                                        │
+│                          │   filter()       │                                        │
+│                          └────────┬────────┘                                        │
+│                                   │                                                  │
+│                                   ▼                                                  │
+│                          ┌─────────────────┐                                        │
+│                          │  ClickHouse     │                                        │
+│                          │  - 执行SQL查询   │                                        │
+│                          │  - 未配置目标    │                                        │
+│                          │    匹配不到数据  │                                        │
+│                          └─────────────────┘                                        │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 前端URL参数编码详解
+
+**位置**：`assets/js/dashboard/util/url-search-params.ts`
+
+#### 自定义序列化格式（可读性优先）
+
+为了URL的可读性，系统使用**自定义逗号分隔格式**而非标准JSON：
+
+```typescript
+// 序列化示例
+// 输入: [["is", "event:goal", ["Purchase", "Signup"]]]
+// 输出: f=is,event:goal,Purchase,Signup
+
+export function serializeFilter([operator, dimension, clauses]: Filter) {
+  const serializedFilter = [
+    encodeURIComponentPermissive(operator, NOT_URL_ENCODED_CHARACTERS),
+    encodeURIComponentPermissive(dimension, NOT_URL_ENCODED_CHARACTERS),
+    ...clauses.map((clause) =>
+      encodeURIComponentPermissive(
+        clause.toString(),
+        NOT_URL_ENCODED_CHARACTERS
+      )
+    )
+  ].join(',')
+  return serializedFilter
+}
+```
+
+**关键设计**：
+- `NOT_URL_ENCODED_CHARACTERS = ':/'` - 这些字符不进行URL编码以提高可读性
+- 格式：`f=<operator>,<dimension>,<clause1>,<clause2>,...`
+- 示例：`?f=is,event:page,/blog,/news&period=30d`
+
+#### API请求时的参数转换
+
+**位置**：`assets/js/dashboard/api.ts:60-103`
+
+```typescript
+export function dashboardStateToParams(
+  dashboardState: DashboardState,
+  extraQuery: unknown[] = []
+): Record<string, string> {
+  const queryObj: Record<string, string> = {}
+  if (dashboardState.period) {
+    queryObj.period = dashboardState.period
   }
+  // ...
+  if (dashboardState.filters) {
+    queryObj.filters = serializeApiFilters(dashboardState.filters)  // 序列化为JSON!
+  }
+  // ...
+  return queryObj
+}
+```
+
+**重要差异**：
+- URL地址栏：自定义逗号分隔格式
+- API请求：JSON格式（通过`serializeApiFilters`）
+
+### 2.3 后端参数解析路径
+
+#### 路径A：新API `/query` (POST JSON)
+
+```
+前端发送:
+POST /api/stats/example.com/query
+Content-Type: application/json
+Body: {
+  "date_range": "30d",
+  "metrics": ["visitors", "conversion_rate"],
+  "filters": [["is", "event:goal", ["Purchase"]]],
+  "dimensions": ["event:goal"]
+}
+
+后端处理:
+1. Phoenix解析JSON → conn.body_params (Map)
+2. Dashboard.QueryParser.parse(params)
+   - parse_input_date_range("30d") → {:last_n_days, 30}
+   - ApiQueryParser.parse_filters([["is", "event:goal", ["Purchase"]]])
+     → [[:is, "event:goal", ["Purchase"]]]
+   - 设置 skip_goal_existence_check: true
+3. QueryBuilder.build(site, parsed_params)
+   - 所有验证执行...
+   - validate_filtered_goals_exist → 跳过 (skip_goal_existence_check: true)
+4. 返回 %Query{}
+```
+
+#### 路径B：旧API `/sources` (GET query params)
+
+```
+前端发送:
+GET /api/stats/example.com/sources?period=30d&filters=%5B%5B%22is%22%2C%22event%3Agoal%22%2C%5B%22Purchase%22%5D%5D%5D
+
+后端处理:
+1. Phoenix解析URL query params → conn.query_params
+   - "filters" = "[[\"is\",\"event:goal\",[\"Purchase\"]]]" (JSON字符串)
+2. Query.from(site, params) → Legacy.QueryBuilder.from(...)
+   - put_parsed_filters: Filters.parse(params["filters"])
+     → 解析JSON字符串 → [[:is, "event:goal", ["Purchase"]]]
+   - 直接构建%Query{}，**不经过QueryBuilder.build的验证**
+3. 返回 %Query{} (无目标存在性验证)
+```
+
+#### 路径C：公开API v1 `/api/v1/stats/breakdown`
+
+```
+前端发送:
+GET /api/v1/stats/example.com/breakdown
+  ?period=30d
+  &property=visit:source
+  &filters=%5B%5B%22is%22%2C%22event%3Agoal%22%2C%5B%22Purchase%22%5D%5D%5D
+
+后端处理:
+1. Phoenix解析URL query params → conn.query_params
+2. Query.from(site, params) → Legacy.QueryBuilder.from(...)
+   - 同路径B，构建%Query{}
+3. ExternalStatsController.validate_filters(site, query.filters)
+   - 遍历filters，检查每个"event:goal"过滤器
+   - 从数据库加载已配置的目标
+   - Enum.find(goals_in_filter, &(&1 not in configured_goals))
+   - 找到未配置目标 → {:error, msg} → 返回400错误
+4. 验证通过才执行查询
+```
+
+---
+
+## 3. 目标存在性检查的真相
+
+### 3.1 之前报告的错误口径
+
+**错误说法**：
+> "QueryBuilder.validate_filtered_goals_exist 会验证目标存在性，`:is`操作符需要配置的目标名"
+
+**实际真相**：
+这个验证**只在特定条件下执行**，且三个查询入口的行为完全不同。
+
+### 3.2 验证逻辑的实际执行条件
+
+**位置**：`lib/plausible/stats/query_builder.ex:409-431`
+
+```elixir
+defp validate_filtered_goals_exist(_query, %ParsedQueryParams{skip_goal_existence_check: true}),
+  do: :ok  # 直接跳过！
+
+defp validate_filtered_goals_exist(query, %ParsedQueryParams{}) do
+  # 仅检查 :is 操作符的 event:goal 过滤器
+  goal_filter_clauses =
+    query.filters
+    |> Filters.all_leaf_filters()
+    |> Enum.flat_map(fn
+      [:is, "event:goal", clauses] -> clauses  # 只检查 :is
+      _ -> []  # :contains 等其他操作符不检查
+    end)
+
+  # 验证是否在 preloaded_goals 中
+  # ...
 end
 ```
 
+**关键条件**：
+1. `skip_goal_existence_check` 必须为 `false`（默认值）
+2. 仅检查 `:is` 操作符，**不检查** `:contains` 操作符
+3. 仅 `Dashboard.QueryParser` 会设置 `skip_goal_existence_check: true`
+
+### 3.3 三个入口的验证行为总结
+
+| 入口 | 是否经过 QueryBuilder.build | skip_goal_existence_check | 实际是否验证目标 |
+|------|----------------------------|---------------------------|-----------------|
+| 内部新API `/query` | **是** | `true` (设置于 Dashboard.QueryParser) | **否，跳过** |
+| 内部旧API `/sources`等 | **否** (直接用Legacy.QueryBuilder) | 不相关 | **否，无此验证** |
+| 公开API v1 | **否** (直接用Legacy.QueryBuilder) | 不相关 | **是，控制器层面验证** |
+
+### 3.4 公开API v1的验证逻辑详解
+
+**位置**：`lib/plausible_web/controllers/api/external_stats_controller.ex:339-359`
+
 ```elixir
-# lib/plausible/stats/goals.ex:14-34
+defp validate_filter(site, [_type, "event:goal", goal_filter | _rest]) do
+  site = Plausible.Repo.preload(site, :team)
+  props_available? = Plausible.Billing.Feature.Props.check_availability(site.team) == :ok
+
+  configured_goals =
+    site
+    |> Plausible.Goals.for_site(include_goals_with_custom_props?: props_available?)
+    |> Enum.map(& &1.display_name)
+
+  goals_in_filter = List.wrap(goal_filter)
+
+  if found = Enum.find(goals_in_filter, &(&1 not in configured_goals)) do
+    msg =
+      goal_not_configured_message(found) <>
+        "Find out how to configure goals here: https://plausible.io/docs/stats-api#filtering-by-goals"
+
+    {:error, msg}  # 返回错误，不会执行SQL
+  else
+    :ok
+  end
+end
+```
+
+**与QueryBuilder验证的区别**：
+1. **位置不同**：控制器层面 vs 查询构建层面
+2. **覆盖范围**：公开API验证所有`event:goal`过滤器，QueryBuilder只验证`:is`操作符
+3. **错误处理**：公开API立即返回400错误，QueryBuilder在构建阶段返回错误
+
+---
+
+## 4. 模块协作与数据结构
+
+### 4.1 核心模块职责
+
+| 模块 | 文件位置 | 主要职责 | 入口使用情况 |
+|------|---------|---------|-------------|
+| `Dashboard.QueryParser` | `lib/plausible/stats/dashboard/query_parser.ex` | 解析仪表盘API的JSON参数，设置`skip_goal_existence_check: true` | **仅**新API `/query` |
+| `ApiQueryParser` | `lib/plausible/stats/api_query_parser.ex` | 解析标准API参数格式，通用解析器 | 被Dashboard.QueryParser内部调用 |
+| `Legacy.QueryBuilder` | `lib/plausible/stats/legacy/legacy_query_builder.ex` | 直接从URL params构建Query，**绕过**大部分验证 | 旧API、公开API v1 |
+| `QueryBuilder` | `lib/plausible/stats/query_builder.ex` | 执行14项验证，构建最终Query | **仅**新API `/query` |
+
+### 4.2 ParsedQueryParams 结构
+
+**位置**：`lib/plausible/stats/parsed_query_params.ex:4-22`
+
+```elixir
+defstruct input_date_range: nil,
+          relative_date: nil,
+          metrics: [],
+          filters: [],
+          dimensions: [],
+          order_by: nil,
+          pagination: nil,
+          now: nil,
+          include: %Plausible.Stats.QueryInclude{},
+          skip_goal_existence_check: false  # 关键标志！
+```
+
+**关键方法**：
+
+```elixir
+# 检查是否有目标转化过滤器
+def conversion_goal_filter?(%__MODULE__{filters: filters}) do
+  Plausible.Stats.Filters.filtering_on_dimension?(filters, "event:goal",
+    max_depth: 0,
+    behavioral_filters: :ignore
+  )
+end
+```
+
+### 4.3 Query 结构
+
+**位置**：`lib/plausible/stats/query.ex:4-34`
+
+```elixir
+defstruct utc_time_range: nil,
+          comparison_utc_time_range: nil,
+          interval: nil,
+          input_date_range: nil,
+          dimensions: [],
+          filters: [],
+          sample_threshold: 20_000_000,
+          imports_exist: false,
+          imports_in_range: [],
+          include_imported: false,
+          skip_imported_reason: nil,
+          now: nil,
+          metrics: [],
+          order_by: nil,
+          timezone: nil,
+          legacy_breakdown: false,
+          preloaded_goals: [],  # 预加载的目标（用于构建查询条件，非验证）
+          include: Plausible.Stats.ApiQueryParser.default_include(),
+          debug_metadata: %{},
+          pagination: nil,
+          revenue_currencies: %{},
+          revenue_warning: nil,
+          site_id: nil,
+          consolidated_site_ids: nil,
+          site_native_stats_start_at: nil,
+          time_on_page_data: %{},
+          sql_join_type: :left,
+          smear_session_metrics: false
+```
+
+### 4.4 预加载目标的作用
+
+**位置**：`lib/plausible/stats/goals.ex:14-34`
+
+```elixir
 def preload_needed_goals(site, dimensions, filters) do
   if Enum.member?(dimensions, "event:goal") or
        Filters.filtering_on_dimension?(filters, "event:goal") do
@@ -227,165 +550,45 @@ def preload_needed_goals(site, dimensions, filters) do
 end
 ```
 
-#### 阶段4：SQL查询构建
+**预加载目标的用途**：
+1. **构建SQL查询条件** (`Goals.add_filter/3`) - 根据目标类型生成不同的WHERE条件
+2. **派生名称过滤优化** (`SQL.WhereBuilder.derived_name_filter/1`) - 限制查询的事件名称范围
+3. **ARRAY JOIN分组数据** (`Goals.goal_join_data/1`) - 用于按目标分组
+4. **验证**（仅QueryBuilder在`skip_goal_existence_check: false`时）
+
+**重要**：预加载目标**不代表**会验证请求的目标是否存在。预加载的是**所有已配置的目标**，用于构建查询条件。
+
+---
+
+## 5. 边界条件与验证逻辑
+
+### 5.1 QueryBuilder的14项验证（仅新API `/query`）
+
+**位置**：`lib/plausible/stats/query_builder.ex:31-60`
 
 ```elixir
-# lib/plausible/stats/sql/query_builder.ex:17-28
-def build(query, site) do
-  query
-  |> QueryOptimizer.split()
-  |> Enum.map(fn {table_type, table_query} ->
-    q = build_table_query(table_type, site, table_query)
-    {table_type, table_query, q}
-  end)
-  |> join_query_results(query)
-  |> build_order_by(query)
-  |> paginate(query.pagination)
-  |> select_total_rows(query.include.total_rows)
-end
-```
-
-**事件表查询构建**：
-```elixir
-# lib/plausible/stats/sql/query_builder.ex:34-53
-defp build_table_query(:events, site, events_query) do
-  q =
-    from(
-      e in "events_v2",
-      where: ^SQL.WhereBuilder.build(:events, events_query),
-      where: ^SQL.WhereBuilder.derived_name_filter(events_query),
-      select: ^select_event_metrics(events_query)
-    )
-
-  # ... 采样提示
-
-  q
-  |> join_sessions_if_needed(events_query)
-  |> build_group_by(:events, events_query)
-  |> merge_imported(site, events_query)
-  |> SQL.SpecialMetrics.add(site, events_query)
-  |> TimeOnPage.merge_legacy_time_on_page(events_query)
-end
-```
-
-## 3. 边界条件与验证逻辑
-
-### 3.1 目标存在性验证
-
-**位置**：`lib/plausible/stats/query_builder.ex:409-444`
-
-```elixir
-defp validate_filtered_goals_exist(_query, %ParsedQueryParams{skip_goal_existence_check: true}),
-  do: :ok
-
-defp validate_filtered_goals_exist(query, %ParsedQueryParams{}) do
-  goal_filter_clauses =
-    query.filters
-    |> Filters.all_leaf_filters()
-    |> Enum.flat_map(fn
-      [:is, "event:goal", clauses] -> clauses
-      _ -> []
-    end)
-
-  if length(goal_filter_clauses) > 0 do
-    configured_goal_names =
-      query.preloaded_goals.all
-      |> Enum.map(&Plausible.Goal.display_name/1)
-
-    validate_list(goal_filter_clauses, &validate_goal_filter(&1, configured_goal_names))
-  else
-    :ok
-  end
-end
-
-defp validate_goal_filter(clause, configured_goal_names) do
-  if Enum.member?(configured_goal_names, clause) do
-    :ok
-  else
-    {:error,
-     %QueryError{
-       code: :invalid_filters,
-       message: "Invalid filters. The goal `#{clause}` is not configured for this site."
-     }}
+def build(site, %ParsedQueryParams{} = parsed_query_params, debug_metadata) do
+  with {:ok, parsed_query_params} <- resolve_segments_in_filters(parsed_query_params, site),
+       query = do_build(parsed_query_params, site, debug_metadata),
+       :ok <- validate_order_by(query),                           # 1. 排序字段验证
+       :ok <- validate_custom_props_access(site, query),         # 2. 自定义属性访问
+       :ok <- validate_case_sensitive_filter_modifier(query),     # 3. 大小写修饰符
+       :ok <- validate_toplevel_only_filter_dimension(query),     # 4. 仅顶层维度
+       :ok <- validate_time_dimension_granularity(query),         # 5. 时间粒度
+       :ok <- validate_special_metrics_filters(query),            # 6. 特殊指标过滤器
+       :ok <- validate_behavioral_filters(query),                 # 7. 行为过滤器
+       :ok <- validate_filtered_goals_exist(query, parsed_query_params),  # 8. 目标存在性
+       :ok <- validate_revenue_metrics_access(site, query),       # 9. 收入指标访问
+       :ok <- validate_metrics(query),                             # 10. 指标验证
+       :ok <- validate_include(query) do                           # 11-14? 实际计数
+    # ...
   end
 end
 ```
 
-**设计要点**：
-- 仅验证 `:is` 操作符的目标过滤器，`:contains` 操作符允许匹配空结果
-- 提供 `skip_goal_existence_check` 选项用于兼容旧版API
-- 使用预加载的目标列表进行验证，避免额外数据库查询
+### 5.2 关键验证详解
 
-### 3.2 行为过滤器嵌套限制
-
-**位置**：`lib/plausible/stats/query_builder.ex:370-407`
-
-```elixir
-defp validate_behavioral_filters(query) do
-  query.filters
-  |> Filters.traverse(0, fn behavioral_depth, operator ->
-    if operator in [:has_done, :has_not_done] do
-      behavioral_depth + 1
-    else
-      behavioral_depth
-    end
-  end)
-  |> Enum.reduce_while(:ok, fn {[_operator, dimension | _rest], behavioral_depth}, :ok ->
-    cond do
-      behavioral_depth == 0 ->
-        {:cont, :ok}
-
-      behavioral_depth > 1 ->
-        {:halt,
-         {:error,
-          %QueryError{
-            code: :invalid_filters,
-            message: "Invalid filters. Behavioral filters (has_done, has_not_done) cannot be nested."
-          }}}
-
-      not String.starts_with?(dimension, "event:") ->
-        {:halt,
-         {:error,
-          %QueryError{
-            code: :invalid_filters,
-            message: "Invalid filters. Behavioral filters (has_done, has_not_done) can only be used with event dimension filters."
-          }}}
-
-      true ->
-        {:cont, :ok}
-    end
-  end)
-end
-```
-
-**限制规则**：
-1. 行为过滤器不能嵌套（深度>1时报错）
-2. 行为过滤器只能用于事件维度（以 `event:` 开头）
-
-**过滤器遍历机制**：
-```elixir
-# lib/plausible/stats/filters/filters.ex:199-217
-def traverse(filters, state \\ nil, state_transformer \\ fn state, _ -> state end) do
-  filters
-  |> Enum.flat_map(&traverse_tree(&1, state, state_transformer))
-end
-
-defp traverse_tree(filter, state, state_transformer) do
-  case filter do
-    [operation, child_filter]
-    when operation in [:not, :ignore_in_totals_query, :has_done, :has_not_done] ->
-      traverse_tree(child_filter, state_transformer.(state, operation), state_transformer)
-
-    [operation, filters] when operation in [:and, :or] ->
-      traverse(filters, state_transformer.(state, operation), state_transformer)
-
-    _ ->
-      [{filter, state}]
-  end
-end
-```
-
-### 3.3 仅顶层可用的维度
+#### 验证1：仅顶层可用的维度
 
 **位置**：`lib/plausible/stats/query_builder.ex:314-331`
 
@@ -399,48 +602,62 @@ defp validate_toplevel_only_filter_dimension(query) do
     |> Enum.filter(&(&1 in @only_toplevel))
 
   if Enum.count(not_toplevel) > 0 do
-    {:error,
-     %QueryError{
-       code: :invalid_filters,
-       message: "Invalid filters. Dimension `#{List.first(not_toplevel)}` can only be filtered at the top level."
-     }}
+    {:error, %QueryError{
+      code: :invalid_filters,
+      message: "Dimension `#{List.first(not_toplevel)}` can only be filtered at the top level."
+    }}
   else
     :ok
   end
 end
 ```
 
-**原因分析**：
-- `event:goal`：目标过滤需要特殊处理，涉及预加载目标列表和构建复杂的SQL条件
-- `event:hostname`：主机名过滤可能涉及特殊的路由逻辑
+**触发条件**：
+- `event:goal` 或 `event:hostname` 出现在嵌套过滤器中（min_depth: 1）
+- 例如：`[:and, [[:is, "visit:country", ["US"]], [:is, "event:goal", ["Purchase"]]]]`
 
-### 3.4 时间维度粒度限制
+**原因**：
+- 目标过滤需要特殊的SQL构建逻辑，嵌套时难以正确处理
+- 主机名过滤可能涉及特殊的路由逻辑
 
-**位置**：`lib/plausible/stats/query_builder.ex:333-347`
+#### 验证2：行为过滤器限制
+
+**位置**：`lib/plausible/stats/query_builder.ex:370-407`
 
 ```elixir
-@max_hours_for_minute_interval 30
-
-defp validate_time_dimension_granularity(query) do
-  if Time.time_dimension(query) == "time:minute" and
-       DateTimeRange.length(query.utc_time_range, :minute) > @max_hours_for_minute_interval * 60 do
-    {:error,
-     %QueryError{
-       code: :invalid_dimensions,
-       message: "Invalid dimensions. Dimension `time:minute` is only supported for time ranges up to 30 hours."
-     }}
-  else
-    :ok
-  end
+defp validate_behavioral_filters(query) do
+  query.filters
+    |> Filters.traverse(0, fn behavioral_depth, operator ->
+      if operator in [:has_done, :has_not_done] do
+        behavioral_depth + 1
+      else
+        behavioral_depth
+      end
+    end)
+    |> Enum.reduce_while(:ok, fn {[_operator, dimension | _rest], behavioral_depth}, :ok ->
+      cond do
+        behavioral_depth == 0 -> {:cont, :ok}
+        behavioral_depth > 1 ->
+          {:halt, {:error, %QueryError{
+            code: :invalid_filters,
+            message: "Behavioral filters cannot be nested."
+          }}}
+        not String.starts_with?(dimension, "event:") ->
+          {:halt, {:error, %QueryError{
+            code: :invalid_filters,
+            message: "Behavioral filters can only be used with event dimension filters."
+          }}}
+        true -> {:cont, :ok}
+      end
+    end)
 end
 ```
 
-**性能考量**：
-- 分钟级时间维度会产生大量数据点
-- 30小时的限制平衡了精度和性能
-- 超过此范围应使用更粗的时间粒度（小时、天等）
+**限制规则**：
+1. **不能嵌套**：`[:has_done, [:has_done, ...]]` → 错误
+2. **只能用于事件维度**：`[:has_done, [:is, "visit:country", ...]]` → 错误
 
-### 3.5 特殊指标与深度过滤器冲突
+#### 验证3：特殊指标与深度过滤器冲突
 
 **位置**：`lib/plausible/stats/query_builder.ex:349-368`
 
@@ -452,50 +669,44 @@ defp validate_special_metrics_filters(query) do
 
   deep_custom_property? =
     query.filters
-    |> Filters.dimensions_used_in_filters(min_depth: 1)
-    |> Enum.any?(fn dimension -> String.starts_with?(dimension, "event:props:") end)
+      |> Filters.dimensions_used_in_filters(min_depth: 1)
+      |> Enum.any?(fn dimension -> String.starts_with?(dimension, "event:props:") end)
 
   if special_metric? and deep_custom_property? do
-    {:error,
-     %QueryError{
-       code: :invalid_filters,
-       message: "Invalid filters. When `conversion_rate` or `group_conversion_rate` metrics are used, custom property filters can only be used on top level."
-     }}
+    {:error, %QueryError{
+      code: :invalid_filters,
+      message: "When `conversion_rate` metrics are used, custom property filters can only be used on top level."
+    }}
   else
     :ok
   end
 end
 ```
 
-**技术限制原因**：
-- 转化率计算需要特殊的会话级别的聚合逻辑
+**技术原因**：
+- 转化率计算需要特殊的会话级聚合
 - 深度嵌套的自定义属性过滤器在子查询中难以正确处理
-- 这是SQL查询复杂性与性能之间的权衡
+- SQL复杂度与性能之间的权衡
 
-### 3.6 指标验证
+#### 验证4：指标依赖验证
 
-**位置**：`lib/plausible/stats/query_builder.ex:475-570`
+**位置**：`lib/plausible/stats/query_builder.ex:481-570`
 
 ```elixir
-defp validate_metrics(query) do
-  with :ok <- validate_list(query.metrics, &validate_metric(&1, query)) do
-    TableDecider.validate_no_metrics_dimensions_conflict(query)
-  end
-end
-
+# 转化率指标
 defp validate_metric(metric, query) when metric in [:conversion_rate, :group_conversion_rate] do
   if Enum.member?(query.dimensions, "event:goal") or
        Filters.filtering_on_dimension?(query, "event:goal", behavioral_filters: :ignore) do
     :ok
   else
-    {:error,
-     %QueryError{
-       code: :invalid_metrics,
-       message: "Metric `#{metric}` can only be queried with event:goal filters or dimensions."
-     }}
+    {:error, %QueryError{
+      code: :invalid_metrics,
+      message: "Metric `#{metric}` can only be queried with event:goal filters or dimensions."
+    }}
   end
 end
 
+# 滚动深度指标
 defp validate_metric(:scroll_depth = metric, query) do
   page_dimension? = Enum.member?(query.dimensions, "event:page")
   toplevel_page_filter? = not is_nil(Filters.get_toplevel_filter(query, "event:page"))
@@ -503,87 +714,78 @@ defp validate_metric(:scroll_depth = metric, query) do
   if page_dimension? or toplevel_page_filter? do
     :ok
   else
-    {:error,
-     %QueryError{
-       code: :invalid_metrics,
-       message: "Metric `#{metric}` can only be queried with event:page filters or dimensions."
-     }}
-  end
-end
-
-defp validate_metric(:exit_rate = metric, query) do
-  case {query.dimensions, TableDecider.sessions_join_events?(query)} do
-    {["visit:exit_page"], false} ->
-      :ok
-
-    {["visit:exit_page"], true} ->
-      {:error,
-       %QueryError{
-         code: :invalid_metrics,
-         message: "Metric `#{metric}` cannot be queried when filtering on event dimensions."
-       }}
-
-    _ ->
-      {:error,
-       %QueryError{
-         code: :invalid_metrics,
-         message: "Metric `#{metric}` requires a `\"visit:exit_page\"` dimension. No other dimensions are allowed."
-       }}
+    {:error, %QueryError{
+      code: :invalid_metrics,
+      message: "Metric `#{metric}` can only be queried with event:page filters or dimensions."
+    }}
   end
 end
 ```
 
-### 3.7 自定义属性访问验证
+### 5.3 过滤器深度计算
 
-**位置**：`lib/plausible/stats/query_builder.ex:446-473`
+**位置**：`lib/plausible/stats/filters/filters.ex:91-115`
 
 ```elixir
-defp validate_custom_props_access(site, query) do
-  allowed_props = Plausible.Props.allowed_for(site, bypass_setup?: true)
+def dimensions_used_in_filters(filters, opts \\ []) do
+  min_depth = Keyword.get(opts, :min_depth, 0)
+  max_depth = Keyword.get(opts, :max_depth, 999)
+  behavioral_filter_option = Keyword.get(opts, :behavioral_filters, nil)
 
-  validate_custom_props_access(site, query, allowed_props)
-end
-
-defp validate_custom_props_access(_site, _query, :all), do: :ok
-
-defp validate_custom_props_access(_site, query, allowed_props) do
-  valid? =
-    query.filters
-    |> Filters.dimensions_used_in_filters()
-    |> Enum.concat(query.dimensions)
-    |> Enum.all?(fn
-      "event:props:" <> prop -> prop in allowed_props
-      _ -> true
+  filters
+    |> traverse(
+      {0, false},
+      fn {depth, is_behavioral_filter}, operator ->
+        {depth + 1, is_behavioral_filter or operator in [:has_done, :has_not_done]}
+      end
+    )
+    |> Enum.filter(fn {_filter, {depth, is_behavioral_filter}} ->
+      # ...
     end)
-
-  if valid? do
-    :ok
-  else
-    {:error,
-     %QueryError{
-       code: :feature_access,
-       message: "The owner of this site does not have access to the custom properties feature."
-     }}
-  end
 end
 ```
 
-## 4. 性能取舍与优化策略
+**深度计算规则**：
+- 顶层过滤器：depth = 0
+- 逻辑组合内的过滤器：depth = 1 及以上
+- 行为过滤器（`:has_done`, `:has_not_done`）会标记 `is_behavioral_filter = true`
 
-### 4.1 派生名称过滤（Derived Name Filter）
+**示例**：
+```elixir
+# 顶层 - depth 0
+[[:is, "event:goal", ["Purchase"]]]
+
+# 嵌套在AND内 - depth 1
+[[:and, [
+  [:is, "visit:country", ["US"]],       # depth 1
+  [:is, "event:goal", ["Purchase"]]     # depth 1 (触发错误!)
+]]]
+
+# 行为过滤器内 - 标记为 behavioral
+[[:has_done, [:is, "event:name", ["AddToCart"]]]]
+```
+
+---
+
+## 6. 性能取舍与优化策略
+
+### 6.1 派生名称过滤（Derived Name Filter）
 
 **位置**：`lib/plausible/stats/sql/where_builder.ex:29-56`
 
 ```elixir
 def derived_name_filter(query) do
   cond do
+    # 情况1：有目标过滤器 - 不添加额外限制
     Plausible.Stats.Filters.filtering_on_dimension?(query.filters, "event:goal") ->
       true
 
+    # 情况2：有预加载目标 - 限制为相关事件名称
     query.preloaded_goals.matching_toplevel_filters != [] ->
       names = goal_event_names(query.preloaded_goals.matching_toplevel_filters)
       dynamic([e], e.name in ^names)
 
+    # 情况3：无特殊需求 - 排除engagement事件
     :time_on_page not in query.metrics and :scroll_depth not in query.metrics ->
       dynamic([e], e.name != "engagement")
 
@@ -591,34 +793,14 @@ def derived_name_filter(query) do
       true
   end
 end
-
-defp goal_event_names(goals) do
-  goals
-  |> Enum.map(fn goal ->
-    case Plausible.Goal.type(goal) do
-      :event -> goal.event_name
-      :page -> "pageview"
-      :scroll -> "engagement"
-    end
-  end)
-  |> Enum.uniq()
-end
 ```
 
-**优化效果**：
-1. **有目标过滤时**：不添加额外限制，让`Goals.add_filter`处理精确条件
-2. **有预加载目标时**：限制为相关的事件名称，减少扫描的数据量
-3. **无特殊需求时**：排除`engagement`事件，这些事件只用于滚动深度和页面停留时间计算
+**性能优化效果**：
+- **情况2**：通过预加载的目标知道相关的事件名称，添加 `name IN (...)` 条件
+- **情况3**：`engagement` 事件仅用于滚动深度和页面停留时间，默认排除以减少扫描数据量
+- **情况1**：目标过滤器本身会添加精确的名称条件，无需额外限制
 
-### 4.2 目标过滤的特殊处理
-
-**位置**：`lib/plausible/stats/sql/where_builder.ex:160-162`
-
-```elixir
-defp add_filter(:events, query, [_, "event:goal" | _rest] = filter) do
-  Plausible.Stats.Goals.add_filter(query, filter)
-end
-```
+### 6.2 目标过滤的SQL构建
 
 **位置**：`lib/plausible/stats/goals.ex:52-64`
 
@@ -630,20 +812,54 @@ def add_filter(query, [operation, "event:goal", clauses | _] = filter, opts \\ [
   Enum.reduce(clauses, false, fn clause, dynamic_statement ->
     condition =
       query.preloaded_goals.all
-      |> filter_preloaded(filter, clause)
-      |> build_condition(imported?)
+        |> filter_preloaded(filter, clause)  # 从预加载列表筛选匹配的目标
+        |> build_condition(imported?)       # 构建该目标的SQL条件
 
-    dynamic([e], ^condition or ^dynamic_statement)
+    dynamic([e], ^condition or ^dynamic_statement)  # OR组合所有目标条件
   end)
 end
 ```
 
-**设计特点**：
-1. **预加载目标**：目标列表在查询构建阶段就已预加载，避免运行时数据库查询
-2. **构建动态条件**：根据目标类型（事件、页面、滚动）构建不同的SQL条件
-3. **OR组合**：多个目标之间使用OR连接
+**目标类型对应的SQL条件**：
 
-### 4.3 目标分组的ARRAY JOIN优化
+```elixir
+# 事件目标
+defp goal_condition(:event, goal, _) do
+  name_condition = dynamic([e], e.name == ^goal.event_name)
+
+  if Plausible.Goal.has_custom_props?(goal) do
+    custom_props_condition = build_custom_props_condition(goal.custom_props)
+    dynamic([e], ^name_condition and ^custom_props_condition)
+  else
+    name_condition
+  end
+end
+
+# 页面目标
+defp goal_condition(:page, goal, false = _imported?) do
+  name_condition = dynamic([e], e.name == "pageview")
+  pathname_condition = page_path_condition(goal.page_path, _imported? = false)
+  base_condition = dynamic([e], ^pathname_condition and ^name_condition)
+  # ... 自定义属性条件
+end
+
+# 滚动目标
+defp goal_condition(:scroll, goal, false = _imported?) do
+  pathname_condition = page_path_condition(goal.page_path, _imported? = false)
+  name_condition = dynamic([e], e.name == "engagement")
+
+  scroll_condition =
+    dynamic([e], e.scroll_depth <= 100 and e.scroll_depth >= ^goal.scroll_threshold)
+  # ...
+end
+```
+
+**性能考虑**：
+- 预加载目标避免了运行时的数据库查询
+- 使用Ecto Dynamic构建条件，保持查询的可组合性
+- OR组合允许一次查询匹配多个目标
+
+### 6.3 ARRAY JOIN 分组优化
 
 **位置**：`lib/plausible/stats/sql/query_builder.ex:173-197`
 
@@ -683,45 +899,46 @@ def goal_join_data(query) do
   goals = query.preloaded_goals.matching_toplevel_filters
 
   goals
-  |> Enum.with_index(1)
-  |> Enum.reduce(
-    %{
-      indices: [],
-      types: [],
-      event_names_imports: [],
-      event_names_by_type: [],
-      page_regexes: [],
-      scroll_thresholds: [],
-      custom_props_keys: [],
-      custom_props_values: []
-    },
-    fn {goal, idx}, acc ->
-      goal_type = Plausible.Goal.type(goal)
-      {prop_keys, prop_values} = Enum.unzip(goal.custom_props)
-
+    |> Enum.with_index(1)
+    |> Enum.reduce(
       %{
-        indices: [idx | acc.indices],
-        types: [to_string(goal_type) | acc.types],
-        event_names_imports: [to_string(goal.event_name) | acc.event_names_imports],
-        event_names_by_type: [event_name_by_type(goal_type, goal) | acc.event_names_by_type],
-        page_regexes: [page_regex_for_goal(goal_type, goal) | acc.page_regexes],
-        scroll_thresholds: [goal.scroll_threshold | acc.scroll_thresholds],
-        custom_props_keys: [prop_keys | acc.custom_props_keys],
-        custom_props_values: [prop_values | acc.custom_props_values]
-      }
-    end
-  )
-  |> Enum.map(fn {key, list} -> {key, Enum.reverse(list)} end)
-  |> Map.new()
+        indices: [],
+        types: [],
+        event_names_imports: [],
+        event_names_by_type: [],
+        page_regexes: [],
+        scroll_thresholds: [],
+        custom_props_keys: [],
+        custom_props_values: []
+      },
+      fn {goal, idx}, acc ->
+        goal_type = Plausible.Goal.type(goal)
+        {prop_keys, prop_values} = Enum.unzip(goal.custom_props)
+
+        %{
+          indices: [idx | acc.indices],
+          types: [to_string(goal_type) | acc.types],
+          event_names_imports: [to_string(goal.event_name) | acc.event_names_imports],
+          event_names_by_type: [event_name_by_type(goal_type, goal) | acc.event_names_by_type],
+          page_regexes: [page_regex_for_goal(goal_type, goal) | acc.page_regexes],
+          scroll_thresholds: [goal.scroll_threshold | acc.scroll_thresholds],
+          custom_props_keys: [prop_keys | acc.custom_props_keys],
+          custom_props_values: [prop_values | acc.custom_props_values]
+        }
+      end
+    )
+    |> Enum.map(fn {key, list} -> {key, Enum.reverse(list)} end)
+    |> Map.new()
 end
 ```
 
-**性能优化**：
-1. **ARRAY JOIN**：使用ClickHouse的ARRAY JOIN特性，一次性处理所有目标
-2. **预计算数据**：将目标配置转换为数组形式，避免在SQL中进行复杂的条件判断
-3. **分情况处理**：根据是否有自定义属性使用不同的JOIN表达式
+**ClickHouse ARRAY JOIN 优化**：
+- 将所有目标配置转换为并行数组
+- 使用 `hints: "ARRAY"` 提示ClickHouse优化器
+- 一次JOIN完成所有目标的分组，避免多次扫描
+- 按是否有自定义属性选择不同的JOIN表达式
 
-### 4.4 会话表时间范围优化
+### 6.4 会话表时间范围优化
 
 **位置**：`lib/plausible/stats/sql/where_builder.ex:100-120`
 
@@ -731,6 +948,7 @@ defp filter_time_range(:sessions, query) do
 
   dynamic(
     [s],
+    # 额外添加 start 条件以确保主键过滤
     s.start >= ^NaiveDateTime.add(first_datetime, -7, :day) and
       s.timestamp >= ^first_datetime and
       s.start <= ^last_datetime
@@ -739,380 +957,195 @@ end
 ```
 
 **优化原因**：
-- ClickHouse的sessions表主键只包含`start`列
-- 仅使用`timestamp`过滤会导致采样因子估计偏差
-- 额外添加`start >= first_datetime - 7 days`确保主键条件存在
-- 同时使用`start <= last_datetime`限制扫描范围
+- ClickHouse的 `sessions_v2` 表主键只包含 `start` 列
+- 仅使用 `timestamp` 过滤会导致采样因子估计偏差
+- 额外添加 `start >= first_datetime - 7 days` 确保主键条件存在
+- 同时使用 `start <= last_datetime` 限制扫描范围
 
-### 4.5 表连接决策
+---
 
-**位置**：`lib/plausible/stats/sql/query_builder.ex:74-107`
+## 7. 典型查询场景分析
 
-```elixir
-defp join_sessions_if_needed(q, query) do
-  if TableDecider.events_join_sessions?(query) do
-    %{session: dimensions} = TableDecider.partition_dimensions(query)
+### 7.1 场景1：仪表盘查询目标转化
 
-    sessions_q =
-      from(
-        s in "sessions_v2",
-        where: ^SQL.WhereBuilder.build(:sessions, query),
-        where: s.sign == 1,
-        select: %{session_id: s.session_id},
-        group_by: s.session_id
-      )
-
-    sessions_q =
-      Enum.reduce(dimensions, sessions_q, fn dimension, acc ->
-        Plausible.Stats.SQL.Expression.select_dimension_internal(acc, dimension)
-      end)
-
-    from(
-      e in q,
-      join: sq in subquery(sessions_q),
-      on: e.session_id == sq.session_id
-    )
-  else
-    q
-  end
-end
-```
-
-**连接策略**：
-1. 当查询包含仅会话表有的维度（如`entry_page`, `exit_page`）时，需要JOIN会话表
-2. 先构建会话子查询，按session_id分组
-3. 选择需要的会话维度列
-4. 使用INNER JOIN（或LEFT JOIN，取决于`sql_join_type`）连接事件和会话
-
-### 4.6 采样支持（企业版）
-
-**位置**：`lib/plausible/stats/sql/query_builder.ex:43-45, 63-65, 95-97, 121-123`
-
-```elixir
-on_ee do
-  q = Plausible.Stats.Sampling.add_query_hint(q, events_query)
-end
-```
-
-**性能考虑**：
-- 对于大数据量的站点，使用采样可以显著提高查询性能
-- 采样阈值在`Query`结构中定义：`sample_threshold: 20_000_000`
-- 通过添加查询提示（query hint）实现采样
-
-### 4.7 自定义属性的高效查询
-
-**位置**：`lib/plausible/stats/sql/where_builder.ex:217-297`
-
-```elixir
-defp filter_custom_prop(prop_name, column_name, [:is, _, clauses | _rest] = filter) do
-  none_value_included = Enum.member?(clauses, "(none)")
-  prop_value_expr = custom_prop_value(column_name, prop_name)
-
-  dynamic(
-    [t],
-    (has_key(t, column_name, ^prop_name) and ^in_clause(prop_value_expr, filter)) or
-      (^none_value_included and not has_key(t, column_name, ^prop_name))
-  )
-end
-```
-
-**使用的SQL函数**（在`Fragments`模块中定义）：
-- `has_key(t, column, key)`：检查数组中是否存在键
-- `get_by_key(t, column, key)`：按键获取值
-- 利用ClickHouse的Array类型特性高效处理键值对
-
-## 5. 数据结构定义
-
-### 5.1 ParsedQueryParams
-
-```elixir
-# lib/plausible/stats/parsed_query_params.ex:4-22
-defstruct input_date_range: nil,
-          relative_date: nil,
-          metrics: [],
-          filters: [],
-          dimensions: [],
-          order_by: nil,
-          pagination: nil,
-          now: nil,
-          include: %Plausible.Stats.QueryInclude{},
-          skip_goal_existence_check: false
-```
-
-**辅助方法**：
-- `add_or_replace_filter/2`：添加或替换过滤器，会移除同维度的现有过滤器
-- `conversion_goal_filter?/1`：检查是否有目标转化过滤器
-
-### 5.2 Query
-
-```elixir
-# lib/plausible/stats/query.ex:4-34
-defstruct utc_time_range: nil,
-          comparison_utc_time_range: nil,
-          interval: nil,
-          input_date_range: nil,
-          dimensions: [],
-          filters: [],
-          sample_threshold: 20_000_000,
-          imports_exist: false,
-          imports_in_range: [],
-          include_imported: false,
-          skip_imported_reason: nil,
-          now: nil,
-          metrics: [],
-          order_by: nil,
-          timezone: nil,
-          legacy_breakdown: false,
-          preloaded_goals: [],
-          include: Plausible.Stats.ApiQueryParser.default_include(),
-          debug_metadata: %{},
-          pagination: nil,
-          revenue_currencies: %{},
-          revenue_warning: nil,
-          site_id: nil,
-          consolidated_site_ids: nil,
-          site_native_stats_start_at: nil,
-          time_on_page_data: %{},
-          sql_join_type: :left,
-          smear_session_metrics: false
-```
-
-### 5.3 过滤器结构
-
-过滤器是一个列表，格式如下：
-
-```elixir
-# 简单过滤
-[:is, "visit:country", ["US", "CA"]]
-[:is, "event:page", ["/checkout"], %{case_sensitive: false}]
-
-# 目标过滤
-[:is, "event:goal", ["Purchase", "Signup"]]
-
-# 逻辑组合
-[:and, [
-  [:is, "visit:country", ["US"]],
-  [:is, "event:goal", ["Purchase"]]
-]]
-
-# 行为过滤
-[:has_done, [:is, "event:name", ["AddToCart"]]]
-
-# 嵌套否定
-[:not, [:is, "visit:device", ["Desktop"]]]
-```
-
-## 6. 关键协作流程图
+**请求路径**：新API `/query`
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           查询请求入口                                         │
-│  StatsController.query / LiveView事件处理                                     │
-└─────────────────────────────────────┬───────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      API Query Parser 阶段                                    │
-│  lib/plausible/stats/api_query_parser.ex                                     │
-│                                                                               │
-│  职责：                                                                        │
-│  - JSONSchema.validate 验证参数格式                                            │
-│  - parse_input_date_range 解析日期范围                                         │
-│  - parse_metrics 解析指标列表                                                  │
-│  - parse_filters 解析过滤器（递归处理嵌套结构）                                 │
-│  - parse_dimensions 解析维度                                                   │
-│  - parse_order_by 解析排序                                                     │
-│  - parse_pagination 解析分页                                                   │
-│  - parse_include 解析附加选项                                                  │
-│                                                                               │
-│  输出：%ParsedQueryParams{}                                                   │
-└─────────────────────────────────────┬───────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Query Builder 阶段                                        │
-│  lib/plausible/stats/query_builder.ex                                        │
-│                                                                               │
-│  步骤：                                                                        │
-│  1. resolve_segments_in_filters - 解析段落在过滤器中的引用                     │
-│  2. do_build - 构建基础Query结构                                               │
-│     - build_datetime_range - 构建UTC时间范围                                   │
-│     - preload_goals_and_revenue - 预加载目标和收入数据                         │
-│  3. validate_order_by - 验证排序字段                                           │
-│  4. validate_custom_props_access - 验证自定义属性访问权限                       │
-│  5. validate_case_sensitive_filter_modifier - 验证大小写修饰符                  │
-│  6. validate_toplevel_only_filter_dimension - 验证仅顶层维度                   │
-│  7. validate_time_dimension_granularity - 验证时间粒度                          │
-│  8. validate_special_metrics_filters - 验证特殊指标与过滤器冲突                 │
-│  9. validate_behavioral_filters - 验证行为过滤器                                │
-│  10. validate_filtered_goals_exist - 验证目标存在性                            │
-│  11. validate_revenue_metrics_access - 验证收入指标访问权限                     │
-│  12. validate_metrics - 验证指标有效性                                          │
-│  13. validate_include - 验证附加选项                                            │
-│                                                                               │
-│  后处理：                                                                      │
-│  - set_time_on_page_data - 设置页面停留时间数据                                 │
-│  - put_comparison_utc_time_range - 设置对比时间范围                              │
-│  - Query.put_imported_opts - 设置导入数据选项                                   │
-│  - Sampling.put_threshold - 设置采样阈值（企业版）                              │
-│                                                                               │
-│  输出：%Query{} 或 {:error, %QueryError{}}                                    │
-└─────────────────────────────────────┬───────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      SQL Query Builder 阶段                                    │
-│  lib/plausible/stats/sql/query_builder.ex                                    │
-│                                                                               │
-│  步骤：                                                                        │
-│  1. QueryOptimizer.split - 优化查询，可能拆分为多个子查询                       │
-│  2. build_table_query - 为每个表类型构建查询                                   │
-│     - events_v2 表：                                                          │
-│       - SQL.WhereBuilder.build - 构建WHERE条件                                │
-│       - SQL.WhereBuilder.derived_name_filter - 派生名称过滤（优化）            │
-│       - select_event_metrics - 选择指标                                        │
-│       - join_sessions_if_needed - 按需JOIN会话表                               │
-│       - build_group_by - 构建GROUP BY                                         │
-│       - merge_imported - 合并导入数据                                          │
-│       - SQL.SpecialMetrics.add - 添加特殊指标                                  │
-│     - sessions_v2 表：                                                         │
-│       - 类似流程，但针对会话数据                                                 │
-│  3. join_query_results - 合并多表查询结果                                       │
-│  4. build_order_by - 构建ORDER BY                                              │
-│  5. paginate - 添加LIMIT/OFFSET                                                │
-│  6. select_total_rows - 选择总行数（如果需要）                                  │
-│                                                                               │
-│  输出：Ecto.Query 结构                                                         │
-└─────────────────────────────────────┬───────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      WHERE Builder 详细流程                                     │
-│  lib/plausible/stats/sql/where_builder.ex                                    │
-│                                                                               │
-│  入口：build(table, query)                                                    │
-│                                                                               │
-│  基础条件：                                                                    │
-│  - filter_site_time_range(table, query)                                      │
-│    - filter_site_id: site_id 或 consolidated_site_ids IN (...)                │
-│    - filter_time_range: 时间范围条件                                          │
-│                                                                               │
-│  过滤器处理（递归）：                                                           │
-│  - :ignore_in_totals_query -> 递归处理内部过滤器                               │
-│  - :not -> 取反内部条件                                                        │
-│  - :and -> 多个条件AND组合                                                     │
-│  - :or -> 多个条件OR组合                                                       │
-│  - :has_done -> 子查询（session_id IN 子查询）                                 │
-│  - :has_not_done -> 取反:has_done                                             │
-│  - [:is, "event:goal", ...] -> Goals.add_filter 特殊处理                       │
-│  - 其他 -> 常规字段过滤                                                         │
-│                                                                               │
-│  目标过滤特殊处理：                                                             │
-│  lib/plausible/stats/goals.ex:add_filter                                      │
-│  - 遍历每个目标条款                                                             │
-│  - filter_preloaded: 从预加载列表中筛选匹配的目标                               │
-│  - build_condition: 根据目标类型构建条件                                        │
-│    - :event -> e.name == event_name AND 自定义属性条件（如果有）                │
-│    - :page -> e.name == "pageview" AND pathname条件                           │
-│    - :scroll -> e.name == "engagement" AND scroll_depth条件                   │
-│  - OR组合所有条件                                                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+前端状态:
+DashboardState {
+  period: "30d",
+  filters: [["is", "event:goal", ["Purchase", "Signup"]]],
+  metrics: ["visitors", "conversion_rate"],
+  dimensions: ["event:goal"]
+}
 
-## 7. 边界条件与验证总结
-
-| 验证项 | 位置 | 错误码 | 触发条件 |
-|--------|------|--------|----------|
-| 目标存在性 | `validate_filtered_goals_exist` | `:invalid_filters` | 使用未配置的目标名（:is操作符） |
-| 行为过滤器嵌套 | `validate_behavioral_filters` | `:invalid_filters` | :has_done/:has_not_done嵌套深度>1 |
-| 行为过滤器维度限制 | `validate_behavioral_filters` | `:invalid_filters` | 行为过滤器用于非event:维度 |
-| 仅顶层维度 | `validate_toplevel_only_filter_dimension` | `:invalid_filters` | event:goal或event:hostname在嵌套过滤器中使用 |
-| 时间粒度 | `validate_time_dimension_granularity` | `:invalid_dimensions` | time:minute用于超过30小时的范围 |
-| 特殊指标与深度过滤 | `validate_special_metrics_filters` | `:invalid_filters` | conversion_rate与深度自定义属性过滤共用 |
-| 转化率指标依赖 | `validate_metric(:conversion_rate)` | `:invalid_metrics` | 无event:goal过滤器或维度时使用转化率 |
-| 滚动深度指标依赖 | `validate_metric(:scroll_depth)` | `:invalid_metrics` | 无event:page过滤器或维度时使用滚动深度 |
-| 退出率指标限制 | `validate_metric(:exit_rate)` | `:invalid_metrics` | 维度不是[visit:exit_page]，或有事件维度过滤 |
-| 自定义属性访问 | `validate_custom_props_access` | `:feature_access` | 无权限时使用自定义属性 |
-| 大小写修饰符限制 | `validate_case_sensitive_filter_modifier` | `:invalid_filters` | 模式匹配操作符使用case_sensitive修饰符 |
-| 排序字段验证 | `validate_order_by` | `:invalid_order_by` | 排序字段不是查询的指标或维度 |
-| 包含选项验证 | `validate_include` | `:invalid_include` | time_labels需要时间维度 |
-
-## 8. 性能优化策略总结
-
-| 优化策略 | 位置 | 实现方式 | 效果 |
-|----------|------|----------|------|
-| 派生名称过滤 | `derived_name_filter` | 预加载目标事件名，添加`name IN (...)`条件 | 减少扫描的事件数量 |
-| 目标预加载 | `preload_needed_goals` | 查询构建阶段一次性加载所有相关目标 | 避免运行时N+1查询 |
-| ARRAY JOIN分组 | `event_goal_join` | 使用ClickHouse ARRAY JOIN一次性处理所有目标 | 避免多次扫描或复杂条件判断 |
-| 会话表主键优化 | `filter_time_range(:sessions)` | 额外添加`start >= first_datetime - 7d` | 确保采样因子估计准确 |
-| 按需表连接 | `join_sessions_if_needed` | 仅当需要会话维度时才JOIN | 避免不必要的JOIN开销 |
-| 采样支持 | `Sampling.add_query_hint` | 大数据量时使用采样 | 显著提高查询性能（牺牲精度） |
-| 自定义属性数组操作 | `filter_custom_prop` | 使用ClickHouse Array函数 | 高效处理键值对数据 |
-| 分表查询优化 | `QueryOptimizer.split` | 可能拆分为events和sessions表分别查询 | 利用各自的索引和存储特性 |
-
-## 9. 扩展阅读与相关文件
-
-- `lib/plausible/stats/table_decider.ex` - 表连接决策逻辑
-- `lib/plausible/stats/sql/expression.ex` - SQL表达式构建
-- `lib/plausible/stats/query_optimizer.ex` - 查询优化器
-- `lib/plausible/stats/imported/` - 导入数据处理
-- `lib/plausible/stats/legacy/` - 旧版API兼容
-
-## 10. 典型查询示例
-
-### 示例1：目标转化查询
-
-**输入参数**：
-```json
-{
-  "site_id": "example.com",
+API请求:
+POST /api/stats/example.com/query
+Body: {
   "date_range": "30d",
-  "metrics": ["visitors", "conversion_rate"],
   "filters": [["is", "event:goal", ["Purchase", "Signup"]]],
+  "metrics": ["visitors", "conversion_rate"],
   "dimensions": ["event:goal"]
 }
+
+后端处理:
+1. Dashboard.QueryParser.parse
+   - skip_goal_existence_check: true
+2. QueryBuilder.build
+   - validate_filtered_goals_exist → 跳过!
+   - preload_goals_and_revenue → 加载所有已配置目标
+3. 假设 "UnknownGoal" 未配置:
+   - 不会报错
+   - SQL中该目标条件匹配不到数据
+   - 返回结果中不包含该目标
 ```
 
-**执行流程**：
-1. `ApiQueryParser.parse` 解析为 `ParsedQueryParams`
-2. `QueryBuilder.build` 验证并构建 `Query`：
-   - 预加载目标配置（Purchase和Signup）
-   - 验证 `conversion_rate` 需要 `event:goal` 维度（满足）
-   - 验证目标存在性（假设已配置）
-3. `SQL.QueryBuilder.build` 构建SQL：
-   - `derived_name_filter` 限制 `name IN ("Purchase", "pageview", ...)`
-   - `Goals.add_filter` 构建OR条件：
-     - Purchase（事件目标）：`name = 'Purchase'`
-     - Signup（页面目标）：`name = 'pageview' AND pathname = '/signup'`
-   - `ARRAY JOIN` 进行目标分组
+### 7.2 场景2：公开API查询目标转化
 
-### 示例2：行为过滤器查询
+**请求路径**：公开API v1 `/api/v1/stats/breakdown`
 
-**输入参数**：
-```json
-{
-  "site_id": "example.com",
-  "date_range": "7d",
-  "metrics": ["visitors"],
-  "filters": [
-    ["has_done", ["is", "event:name", ["AddToCart"]]],
-    ["is_not", "event:goal", ["Purchase"]]
-  ],
-  "dimensions": ["visit:source"]
-}
+```
+API请求:
+GET /api/v1/stats/example.com/breakdown
+  ?period=30d
+  &property=visit:source
+  &metrics=visitors,conversion_rate
+  &filters=%5B%5B%22is%22%2C%22event%3Agoal%22%2C%5B%22Purchase%22%2C%22UnknownGoal%22%5D%5D%5D
+
+后端处理:
+1. Query.from → Legacy.QueryBuilder (无验证)
+2. ExternalStatsController.validate_filters
+   - 加载已配置目标: ["Purchase", "Signup"]
+   - 检查过滤器中的目标: ["Purchase", "UnknownGoal"]
+   - 发现 "UnknownGoal" 未配置
+3. 返回错误:
+   {
+     "error": "The goal `UnknownGoal` is not configured for this site. 
+              Find out how to configure goals here: ..."
+   }
+   
+4. SQL查询**不会执行**
 ```
 
-**执行流程**：
-1. 验证行为过滤器：
-   - 检查是否嵌套（未嵌套，通过）
-   - 检查是否用于event维度（是，通过）
-2. 验证目标过滤器：
-   - `:is_not` 操作符不触发存在性检查
-3. SQL构建：
-   - `:has_done` 转换为子查询：`session_id IN (SELECT session_id FROM events WHERE name = 'AddToCart')`
-   - `:is_not` 目标过滤：`NOT (目标条件)`
+### 7.3 场景3：使用 `:contains` 操作符
+
+**请求路径**：任意入口
+
+```
+过滤器: [[:contains, "event:goal", ["Purchase"]]]
+
+验证行为:
+- QueryBuilder.validate_filtered_goals_exist:
+  - 只检查 [:is, "event:goal", clauses]
+  - :contains 操作符返回 [] → 不检查
+- ExternalStatsController.validate_filter:
+  - 检查所有 "event:goal" 过滤器
+  - :contains 也会验证
+
+关键差异:
+- 新API /query: :contains 不会验证目标存在性
+- 公开API v1: :contains 仍会验证目标存在性
+```
+
+---
+
+## 8. 关键纠正与总结
+
+### 8.1 之前报告的主要错误
+
+| 错误说法 | 正确事实 |
+|---------|---------|
+| "QueryBuilder.validate_filtered_goals_exist 会验证目标存在性" | 这个验证**默认启用**，但 `Dashboard.QueryParser` 会设置 `skip_goal_existence_check: true` 来**跳过**它 |
+| 三个查询入口使用相同的验证逻辑 | 三个入口**完全不同**：新API跳过验证、旧API无此验证、公开API强制验证 |
+| `:is` 和 `:contains` 都验证 | QueryBuilder只验证`:is`，但公开API验证所有`event:goal`过滤器 |
+| 预加载目标用于验证 | 预加载目标**主要用于构建查询条件**，验证只是副产品（且可跳过） |
+
+### 8.2 查询入口决策树
+
+```
+收到查询请求
+    │
+    ▼
+是 POST /api/stats/:domain/query ?
+    │
+    ├── 是 → 新API入口
+    │         │
+    │         ▼
+    │    Dashboard.QueryParser
+    │         │
+    │         ├── skip_goal_existence_check: true
+    │         │
+    │         ▼
+    │    QueryBuilder.build
+    │         │
+    │         ├── 14项验证执行
+    │         └── 目标验证被跳过
+    │         │
+    │         ▼
+    │    未配置目标 → SQL层面匹配不到数据（不报错）
+    │
+    └── 否
+         │
+         ▼
+    是 GET /api/v1/stats/* ?
+         │
+         ├── 是 → 公开API v1入口
+         │         │
+         │         ▼
+         │    Legacy.QueryBuilder (无验证)
+         │         │
+         │         ▼
+         │    ExternalStatsController.validate_filters
+         │         │
+         │         └── 强制验证目标存在性
+         │         │
+         │         ▼
+         │    未配置目标 → 立即返回400错误（不执行SQL）
+         │
+         └── 否 → 内部旧API入口
+                   │
+                   ▼
+              Legacy.QueryBuilder
+                   │
+                   └── 直接构建Query，无目标验证
+                   │
+                   ▼
+              未配置目标 → SQL层面匹配不到数据（不报错）
+```
+
+### 8.3 设计意图分析
+
+**为什么新API跳过目标验证？**
+
+1. **用户体验优先**：仪表盘用户可能正在探索数据，使用`:contains`或模糊匹配时，即使目标不存在也应返回空结果而非错误
+2. **向后兼容**：旧版API端点（如`top_stats`）的行为是"缺失的目标匹配空"，新API保持一致
+3. **灵活性**：允许用户查询可能尚未配置但预期存在的目标
+
+**为什么公开API强制验证？**
+
+1. **API契约严格**：外部API应该有明确的契约，无效参数应返回错误
+2. **调试友好**：集成方可以立即发现配置错误，而不是困惑于空结果
+3. **文档明确**：公开API文档明确说明了目标需要先配置
+
+### 8.4 性能优化总结
+
+| 优化策略 | 位置 | 效果 |
+|---------|------|------|
+| 派生名称过滤 | `derived_name_filter/1` | 减少扫描的事件数量，排除无关事件类型 |
+| 目标预加载 | `preload_needed_goals/3` | 避免运行时N+1数据库查询 |
+| ARRAY JOIN分组 | `event_goal_join/1` | 利用ClickHouse特性，一次JOIN完成所有目标分组 |
+| 会话表主键条件 | `filter_time_range(:sessions, query)` | 确保采样因子估计准确，避免过度采样 |
+| 按需表连接 | `join_sessions_if_needed/2` | 仅在需要会话维度时才JOIN，避免不必要开销 |
+| 自定义属性数组操作 | `filter_custom_prop/4` | 利用ClickHouse Array类型高效处理键值对 |
 
 ---
 
 **报告生成时间**：2026-05-03  
-**分析范围**：目标转化与过滤查询从页面状态到分析查询的完整流程
+**分析范围**：前端URL参数编码 → 后端参数解析 → 三个查询入口 → 验证逻辑 → SQL构建 → 性能优化
+
+**关键文件参考**：
+- `assets/js/dashboard/util/url-search-params.ts` - 前端URL参数编码
+- `lib/plausible/stats/dashboard/query_parser.ex` - 仪表盘API参数解析
+- `lib/plausible/stats/legacy/legacy_query_builder.ex` - 旧版查询构建器
+- `lib/plausible/stats/query_builder.ex` - 查询构建与验证
+- `lib/plausible_web/controllers/api/external_stats_controller.ex` - 公开API控制器（强制验证）
