@@ -147,13 +147,493 @@ def put_imported_opts(query, site) do
 end
 ```
 
-**跳过导入数据的原因**（`lib/plausible/stats/query.ex:191-210`）：
-| 原因 | 说明 |
-|------|------|
-| `:unsupported_interval` | 使用了 `time:minute` 或 `time:hour` 维度（导入数据只有日级） |
-| `:no_imported_data` | 站点没有完成的导入 |
-| `:out_of_range` | 查询时间范围与导入数据范围无重叠 |
-| `:unsupported_query` | 查询维度/过滤器组合不被导入表支持 |
+### 2.2 导入合并的开启条件与降级条件
+
+#### 开启导入合并的必要条件
+
+查询是否会合并导入数据，需要**同时满足**以下所有条件（`lib/plausible/stats/query.ex:149-170`）：
+
+```elixir
+def put_imported_opts(query, site) do
+  requested? = query.include.imports  # 条件1: 用户主动请求
+
+  query =
+    if site && Imported.schema_supports_interval?(query) do  # 条件2: 时间间隔支持
+      site = Plausible.Repo.preload(site, :completed_imports)
+      struct!(query,
+        imports_exist: Plausible.Imported.any_completed_imports?(site),  # 条件3: 有导入数据
+        imports_in_range: get_imports_in_range(site, query)  # 条件4: 范围内有数据
+      )
+    else
+      query
+    end
+
+  skip_imported_reason = get_skip_imported_reason(query)  # 条件5: 查询模式支持
+
+  struct!(query,
+    include_imported: requested? and is_nil(skip_imported_reason),
+    skip_imported_reason: skip_imported_reason
+  )
+end
+```
+
+**详细条件说明**：
+
+| 条件 | 检查内容 | 代码位置 |
+|------|----------|----------|
+| **1. 用户主动请求** | `include.imports = true` 或 `include.imports_meta = true` | API 参数 |
+| **2. 时间间隔支持** | 不使用 `time:minute` 或 `time:hour` 维度 | `schema_supports_interval?/1` |
+| **3. 存在导入数据** | 站点有 `status = completed` 的导入记录 | `any_completed_imports?/1` |
+| **4. 时间范围重叠** | 查询时间范围与导入数据范围有交集 | `completed_imports_in_query_range/2` |
+| **5. 查询模式支持** | 维度/过滤器组合可被导入表支持 | `schema_supports_query?/1` |
+
+#### API 参数控制
+
+导入合并的开启由 API 的 `include` 参数控制：
+
+```json
+{
+  "include": {
+    "imports": true,        // 是否合并导入数据到结果
+    "imports_meta": true    // 是否返回导入相关元数据（即使不合并）
+  }
+}
+```
+
+**参数行为**：
+- `include.imports = true`：尝试合并导入数据，如果失败则降级为仅本地查询
+- `include.imports_meta = true`：即使不合并数据，也在响应中返回 `imports_included`、`imports_skip_reason` 等元信息
+- Dashboard 默认会设置 `include.imports = true`
+
+#### 降级为仅本地查询的原因
+
+当不满足上述条件时，查询会**降级为仅查询原生数据**，并在响应中返回 `imports_skip_reason`。
+
+**所有降级原因**（`lib/plausible/stats/query.ex:191-210`）：
+
+```elixir
+@spec get_skip_imported_reason(t()) ::
+        nil | :no_imported_data | :out_of_range | :unsupported_interval | :unsupported_query
+
+def get_skip_imported_reason(query) do
+  cond do
+    not Imported.schema_supports_interval?(query) ->
+      :unsupported_interval
+
+    not query.imports_exist ->
+      :no_imported_data
+
+    query.imports_in_range == [] ->
+      :out_of_range
+
+    not Imported.schema_supports_query?(query) ->
+      :unsupported_query
+
+    true ->
+      nil
+  end
+end
+```
+
+**详细降级原因表**：
+
+| 原因值 | 触发条件 | 用户感知 |
+|--------|----------|----------|
+| `:unsupported_interval` | 使用 `time:minute` 或 `time:hour` 维度 | 导入数据只有日级，无法按小时/分钟合并 |
+| `:no_imported_data` | 站点没有已完成的导入记录 | 用户还未导入任何 GA 数据 |
+| `:out_of_range` | 查询时间范围与导入数据范围无重叠 | 例如：导入的是 2023 年数据，查询的是 2025 年 |
+| `:unsupported_query` | 维度/过滤器组合不被导入表支持 | 见下文详细说明 |
+
+#### `:unsupported_query` 的详细触发场景
+
+当查询的维度或过滤器组合无法用预聚合的导入数据表示时，会触发此降级原因。
+
+**场景 1：行为过滤器**（`lib/plausible/stats/imported/base.ex:77-91`）：
+```elixir
+def decide_tables(query) do
+  behavioral_filters = dimensions_used_in_filters(query.filters, behavioral_filters: :only)
+
+  cond do
+    # 行为过滤器无法通过聚合的导入数据模拟
+    length(behavioral_filters) > 0 ->
+      []  # 返回空表列表，不支持导入查询
+    ...
+  end
+end
+```
+
+**行为过滤器包括**：
+- `visit:entry_page` - 入口页面（需要行为序列分析）
+- `visit:exit_page` - 退出页面（需要行为序列分析）
+- 某些复杂的自定义属性组合
+
+**场景 2：多维度组合映射到不同表**：
+
+导入数据是按维度预聚合到不同表的，一次查询只能从**单张** `imported_*` 表查询：
+
+```elixir
+# lib/plausible/stats/imported/base.ex:182-208
+defp do_decide_tables(query) do
+  table_candidates =
+    dimensions_used_in_filters(query.filters)
+    |> Enum.concat(query.dimensions)
+    |> Enum.reject(&(&1 in @queriable_time_dimensions or &1 == "event:goal"))
+    |> Enum.map(&@property_to_table_mappings[&1])
+
+  case Enum.uniq(table_candidates) do
+    [] -> ["imported_visitors"]      # 无维度：使用总表
+    [nil] -> []                       # 存在不支持的维度
+    [candidate] -> [candidate]        # 单一维度：使用对应表
+    _ -> []                           # 多维度映射到不同表：不支持
+  end
+end
+```
+
+**示例**：
+| 查询 | 支持？ | 原因 |
+|------|--------|------|
+| `dimensions: ["visit:source"]` | ✅ | 只需要 `imported_sources` |
+| `dimensions: ["visit:country"]` | ✅ | 只需要 `imported_locations` |
+| `dimensions: ["visit:source", "visit:country"]` | ❌ | `imported_sources` 和 `imported_locations` 是两张不同表 |
+
+**场景 3：自定义属性的复杂使用**：
+
+自定义属性导入支持有限（仅 `event:props:url` 和 `event:props:path`），且需要配合特定事件名过滤器：
+
+```elixir
+# lib/plausible/stats/imported/base.ex:125-150
+defp do_decide_custom_prop_table(query, property) do
+  "event:props:" <> prop_key = property
+
+  has_required_event_or_goal_name_filter? =
+    query.filters
+    |> Enum.flat_map(fn
+      [:is, "event:name", event_names | _rest] -> event_names
+      [:is, "event:goal", goal_names | _rest] -> goal_names
+      _ -> []
+    end)
+    |> Enum.any?(fn event_or_goal_name ->
+      event_or_goal_name in Plausible.Event.SystemEvents.special_events_for_prop_key(prop_key)
+    end)
+
+  if has_required_event_or_goal_name_filter? and
+       not has_unsupported_filters? do
+    ["imported_custom_events"]
+  else
+    []
+  end
+end
+```
+
+**场景 4：实时查询**：
+
+```elixir
+# lib/plausible/stats/query.ex:172-175
+defp get_imports_in_range(_site, %__MODULE__{input_date_range: period})
+     when period in [:realtime, :realtime_30m] do
+  []  # 实时查询不使用导入数据
+end
+```
+
+---
+
+## 三、API 响应元数据字段说明
+
+### 3.1 元数据字段总览
+
+当 `include.imports = true` 或 `include.imports_meta = true` 时，API 响应的 `meta` 字段会包含以下导入相关信息：
+
+```json
+{
+  "results": [...],
+  "meta": {
+    "imports_included": true,
+    "imports_skip_reason": null,
+    "imports_warning": null,
+    "metric_warnings": {
+      "bounce_rate": {
+        "code": "no_imported_bounce_rate",
+        "warning": "imported bounce_rate is not available when using a page filter"
+      }
+    }
+  }
+}
+```
+
+**字段定义**（`lib/plausible/stats/query_result.ex:73-85`）：
+
+```elixir
+defp add_imports_meta(meta, %Query{include: include} = query) do
+  if include.imports or include.imports_meta do
+    %{
+      imports_included: query.include_imported,
+      imports_skip_reason: query.skip_imported_reason,
+      imports_warning: @imports_warnings[query.skip_imported_reason]
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.merge(meta)
+  else
+    meta
+  end
+end
+```
+
+### 3.2 `imports_included`
+
+**类型**：`boolean`
+
+**含义**：查询结果是否实际包含了导入数据。
+
+| 值 | 含义 |
+|----|------|
+| `true` | 结果是**原生数据 + 导入数据**的合并结果 |
+| `false` | 结果**仅包含原生数据**（可能是降级，可能是用户没请求） |
+
+**注意**：即使 `include.imports = true`，如果因为任何原因降级（如 `:unsupported_query`），`imports_included` 也会是 `false`。
+
+### 3.3 `imports_skip_reason`
+
+**类型**：`string | null`
+
+**含义**：为什么没有包含导入数据的机器可读原因码。
+
+| 值 | 含义 | 用户可采取的行动 |
+|----|------|------------------|
+| `null` | 已包含导入数据，或用户未请求 | 无 |
+| `"unsupported_interval"` | 使用了小时/分钟维度 | 改为按日/周/月查询 |
+| `"no_imported_data"` | 站点没有导入数据 | 先完成 GA 数据导入 |
+| `"out_of_range"` | 查询范围无导入数据 | 调整查询时间范围 |
+| `"unsupported_query"` | 查询模式不支持 | 简化维度/过滤器组合 |
+
+### 3.4 `imports_warning`
+
+**类型**：`string | null`
+
+**含义**：面向用户的友好警告消息，解释为什么没有包含导入数据。
+
+**警告消息映射**（`lib/plausible/stats/query_result.ex:18-24`）：
+
+```elixir
+@imports_warnings %{
+  unsupported_query:
+    "Imported stats are not included in the results because query parameters are not supported. " <>
+      "For more information, see: https://plausible.io/docs/stats-api#filtering-imported-stats",
+  unsupported_interval:
+    "Imported stats are not included because the time dimension (i.e. the interval) is too short."
+}
+```
+
+| `imports_skip_reason` | `imports_warning` 消息 |
+|-----------------------|------------------------|
+| `"unsupported_query"` | "Imported stats are not included in the results because query parameters are not supported..." |
+| `"unsupported_interval"` | "Imported stats are not included because the time dimension (i.e. the interval) is too short." |
+| `"no_imported_data"` | `null`（无警告消息） |
+| `"out_of_range"` | `null`（无警告消息） |
+
+**注意**：`no_imported_data` 和 `out_of_range` 不会产生 `imports_warning`，因为这些被认为是"正常"情况（用户可能知道自己在做什么）。
+
+### 3.5 `metric_warnings`（指标级告警）
+
+**类型**：`object | null`
+
+**含义**：某些特定指标在当前查询上下文中存在限制或数据缺失的警告。
+
+**结构**：
+```json
+{
+  "metric_warnings": {
+    "<metric_name>": {
+      "code": "<warning_code>",
+      "warning": "<human_readable_message>"
+    }
+  }
+}
+```
+
+**警告类型总览**：
+
+| 指标 | 警告代码 | 触发条件 | 消息 |
+|------|----------|----------|------|
+| `scroll_depth` | `no_imported_scroll_depth` | 包含导入数据但导入数据没有滚动深度信息 | "No imports with scroll depth data were found" |
+| `bounce_rate` | `no_imported_bounce_rate` | 包含导入数据且使用了页面过滤器/维度 | "imported bounce_rate is not available when using a page filter" |
+| `time_on_page` | `legacy_time_on_page_used` | 同时使用了新旧两种 time_on_page 计算方法 | "This period includes data calculated with the legacy time on page method up to..." |
+| `revenue_*` | 多种 | EE 版本的收入指标相关 | 见下文 |
+
+#### `scroll_depth` 警告
+
+**代码位置**：`lib/plausible/stats/query_result.ex:275-279`
+
+```elixir
+defp metric_warning(:scroll_depth, %Query{} = query) do
+  if query.include_imported and not Enum.any?(query.imports_in_range, & &1.has_scroll_depth) do
+    @no_imported_scroll_depth_warning
+  end
+end
+```
+
+**触发条件**：
+1. `include_imported = true`（正在使用导入数据）
+2. 范围内的导入数据都没有 `has_scroll_depth = true`
+
+**含义**：GA 导入数据中没有滚动深度指标，`scroll_depth` 指标将只包含原生数据部分。
+
+#### `bounce_rate` 警告
+
+**代码位置**：`lib/plausible/stats/query_result.ex:298-310`
+
+```elixir
+defp metric_warning(:bounce_rate, %Query{} = query) do
+  page_filter_or_dimension? =
+    Filters.filtering_on_dimension?(query, "event:page", behavioral_filters: :ignore) or
+      "event:page" in query.dimensions
+
+  if query.include_imported and page_filter_or_dimension? do
+    @no_imported_bounce_rate_warning
+  end
+end
+```
+
+**触发条件**：
+1. `include_imported = true`
+2. 查询包含 `event:page` 过滤器 **或** 维度
+
+**原因解释**（代码注释）：
+> Native queries (i.e. ones that don't include imported data) allow querying bounce rate with an `event:page` filter or dimension. In those cases, an `event:page` gets treated as `visit:entry_page`. While theoretically possible, this behaviour does not yet exist for imported data, which is why we're returning a metric warning here.
+
+**含义**：
+- 原生查询中，`event:page` 过滤器会被当作 `visit:entry_page` 处理
+- 导入数据查询**没有这个行为**
+- 因此 `bounce_rate` 指标可能不准确（缺少导入数据部分）
+
+#### `time_on_page` 警告
+
+**代码位置**：`lib/plausible/stats/query_result.ex:281-296`
+
+```elixir
+defp metric_warning(:time_on_page, %Query{} = query) do
+  case query.time_on_page_data do
+    %{new_metric_visible: true, include_legacy_metric: true, cutoff: cutoff} ->
+      cutoff_date =
+        cutoff |> DateTime.shift_zone!(query.timezone) |> Calendar.strftime("%Y-%m-%d")
+
+      %{
+        code: :legacy_time_on_page_used,
+        message:
+          "This period includes data calculated with the legacy time on page method up to #{cutoff_date}"
+      }
+
+    _ ->
+      nil
+  end
+end
+```
+
+**触发条件**：查询时间范围跨越了 `time_on_page` 计算方法变更的临界点。
+
+**背景**：Plausible 在某个时间点改变了 `time_on_page` 的计算方法。如果查询范围同时包含两种方法的数据，会产生此警告。
+
+#### 收入指标警告（EE 版本）
+
+**代码位置**：`lib/plausible/stats/query_result.ex:250-273`
+
+```elixir
+on_ee do
+  @revenue_metrics Plausible.Stats.Goal.Revenue.revenue_metrics()
+
+  @revenue_metrics_warnings %{
+    revenue_goals_unavailable:
+      "The owner of this site does not have access to the revenue metrics feature.",
+    no_single_revenue_currency:
+      "Revenue metrics are null as there are multiple currencies for the selected event:goals.",
+    no_revenue_goals_matching:
+      "Revenue metrics are null as there are no matching revenue goals."
+  }
+
+  defp metric_warning(metric, %Query{} = query)
+       when metric in @revenue_metrics do
+    if query.revenue_warning do
+      %{
+        code: query.revenue_warning,
+        warning: @revenue_metrics_warnings[query.revenue_warning]
+      }
+    else
+      nil
+    end
+  end
+end
+```
+
+**收入警告类型**：
+
+| 警告代码 | 含义 |
+|----------|------|
+| `revenue_goals_unavailable` | 站点没有收入指标功能权限 |
+| `no_single_revenue_currency` | 匹配的目标使用了多种货币，无法统一计算 |
+| `no_revenue_goals_matching` | 没有匹配的收入目标 |
+
+---
+
+## 四、降级条件判定流程图
+
+```
+Dashboard API Request
+        │
+        ▼
+┌───────────────────────┐
+│ include.imports = true?│
+└───────────────────────┘
+        │
+        ├─── No ──────────────────────────────────────►
+        │                                              │
+        ▼                                              ▼
+┌───────────────────────┐                    ┌─────────────────────┐
+│ schema_supports_      │                    │ imports_included:   │
+│ interval?(query)       │                    │ false               │
+│ (不是 minute/hour)     │                    │ (用户未请求)        │
+└───────────────────────┘                    └─────────────────────┘
+        │
+        ├─── No ──────────────────────────────────────►
+        │                                              │
+        ▼                                              ▼
+┌───────────────────────┐                    ┌─────────────────────┐
+│ any_completed_        │                    │ imports_included:   │
+│ imports?(site)         │                    │ false               │
+│ (有已完成的导入)        │                    │ imports_skip_reason:│
+└───────────────────────┘                    │ "unsupported_       │
+        │                                    │ interval"           │
+        ├─── No ──────────────────────────► └─────────────────────┘
+        │
+        ▼
+┌───────────────────────┐
+│ completed_imports_    │
+│ in_query_range(...)   │
+│ (范围内有导入数据)      │
+└───────────────────────┘
+        │
+        ├─── No ──────────────────────────────────────►
+        │                                              │
+        ▼                                              ▼
+┌───────────────────────┐                    ┌─────────────────────┐
+│ schema_supports_      │                    │ imports_included:   │
+│ query?(query)          │                    │ false               │
+│ (维度/过滤器支持)        │                    │ imports_skip_reason:│
+└───────────────────────┘                    │ "out_of_range"      │
+        │                                    └─────────────────────┘
+        ├─── No ──────────────────────────►
+        │
+        ▼                                              ▼
+┌───────────────────────┐                    ┌─────────────────────┐
+│ ✓ 所有条件满足         │                    │ imports_included:   │
+│                       │                    │ false               │
+│ imports_included:     │                    │ imports_skip_reason:│
+│ true                  │                    │ "unsupported_query"  │
+└───────────────────────┘                    │ imports_warning:    │
+                                             │ "Imported stats are  │
+                                             │ not included..."     │
+                                             └─────────────────────┘
+```
+
+---
 
 ### 2.2 查询不支持导入数据的场景
 
