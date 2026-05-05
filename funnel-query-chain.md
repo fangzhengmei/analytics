@@ -1,6 +1,6 @@
 # Plausible 漏斗分析查询链详解
 
-本文档详细介绍 Plausible 漏斗分析从前端配置到后端 ClickHouse 查询再到 LiveView 实时展示的完整流程。
+本文档详细介绍 Plausible 漏斗分析从前端配置到后端 ClickHouse 查询再到 React 组件展示的完整流程。
 
 ## 一、整体架构概览
 
@@ -96,9 +96,15 @@ end
 
 **配置流程**：
 1. 用户通过 LiveView 界面选择已配置的 Goals 作为漏斗步骤
-2. 步骤顺序可调整，支持 2-5 个步骤 (`Funnel.min_steps()` 到 `Funnel.max_steps()`)
+2. 步骤顺序可调整，支持 **2-8 个步骤** (`Funnel.min_steps()` 到 `Funnel.max_steps()`)
+   - `Funnel.Const.min_steps()` = 2
+   - `Funnel.Const.max_steps()` = 8
 3. 支持 `strict_order` 模式（严格顺序）和非严格顺序
 4. 配置保存到 PostgreSQL 数据库的 `funnels` 表
+
+> **注意**：Exploration（用户行为探索）功能有不同的限制：
+> - 最大支持 20 个步骤 (`@max_steps 20`)
+> - `interesting_funnel` 默认使用 6 个步骤
 
 ### 2.2 Dashboard 状态共享机制
 
@@ -265,6 +271,11 @@ defp validate_funnel_query(query) do
   end
 end
 ```
+
+> **重要**：漏斗查询**不支持实时模式** (`realtime` period)。当用户选择实时时间范围时，漏斗组件会返回错误。这是因为：
+> 1. 漏斗分析需要完整的会话数据来计算用户旅程
+> 2. 实时数据是增量更新的，无法保证完整的用户旅程
+> 3. `windowFunnel` 函数依赖完整的事件序列
 
 ### 3.3 Query 结构构建
 
@@ -524,9 +535,22 @@ end
 
 ---
 
-## 五、并发查询机制
+## 五、并发查询机制与结果拼装
 
-### 5.1 ClickHouseRepo 并发任务
+### 5.1 并发查询场景概览
+
+**重要澄清**：漏斗查询本身（`Stats.funnel/3`）是**单次 ClickHouse 查询**，使用 `windowFunnel` 函数一次返回所有步骤的数据。它**不使用并发查询**。
+
+并发查询机制 (`ClickhouseRepo.parallel_tasks/2`) 主要用于以下场景：
+
+| 场景 | 函数位置 | 并发方式 | 结果拼装方式 |
+|-----|---------|---------|-------------|
+| CSV 多维度导出 | `StatsController` L177 | `parallel_tasks/2` (默认 3 并发) | `Enum.zip` + 按 key 匹配 |
+| 多站点用量统计 | `Clickhouse.usage_breakdown` L71 | `parallel_tasks/2` (10 并发) | `Enum.reduce` 累加 |
+| 多站点概览 | `Sparkline.parallel_overview` L13 | `Task.async_stream` | 直接返回 List |
+| 账单周期统计 | `Billing.usage_cycle` L370 | `Task.async_stream` | `Enum.into` 转为 Map |
+
+### 5.2 ClickHouseRepo 并发任务实现
 
 **文件位置**: `lib/plausible/clickhouse_repo.ex:1-79`
 
@@ -567,7 +591,46 @@ defmodule Plausible.ClickhouseRepo do
 end
 ```
 
-### 5.2 使用示例 (Usage Breakdown)
+**设计要点**：
+1. `queries` 参数是一个函数列表，每个函数包装一个查询
+2. 使用 `Task.async_stream` 实现背压控制
+3. `max_concurrency` 控制最大并发数（默认 3）
+4. 保持 OpenTelemetry 追踪上下文，确保分布式追踪的连续性
+5. 返回结果是按输入顺序排列的列表
+
+### 5.3 场景一：CSV 多维度导出（结果按 key 匹配）
+
+**文件位置**: `lib/plausible_web/controllers/stats_controller.ex:172-185`
+
+```elixir
+# 定义多个 CSV 查询任务
+csvs = %{
+  ~c"visitors.csv" => fn -> Api.StatsController.visitors(conn, params) end,
+  ~c"pageviews.csv" => fn -> Api.StatsController.pageviews(conn, params) end,
+  ~c"sources.csv" => fn -> Api.StatsController.sources(conn, params) end,
+  ~c"custom_props.csv" => fn -> Api.StatsController.all_custom_prop_values(conn, params) end
+}
+
+# 并发执行所有查询
+csv_values =
+  Map.values(csvs)
+  |> Plausible.ClickhouseRepo.parallel_tasks()
+
+# 结果拼装：按 key 匹配
+csvs =
+  Map.keys(csvs)
+  |> Enum.zip(csv_values)
+  |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+  |> Map.new()
+```
+
+**拼装逻辑**：
+1. 输入：`%{key1: fun1, key2: fun2, key3: fun3}`
+2. 并发执行：`[fun1_result, fun2_result, fun3_result]`（顺序保持）
+3. 拼装：`Enum.zip([key1, key2, key3], [result1, result2, result3])`
+4. 输出：`%{key1: result1, key2: result2, key3: result3}`
+
+### 5.4 场景二：多站点用量统计（结果累加）
 
 **文件位置**: `lib/plausible/stats/clickhouse.ex:53-75`
 
@@ -581,20 +644,136 @@ def usage_breakdown([sid | _] = site_ids, date_range) when is_integer(sid) do
       ClickhouseRepo.one(
         from(e in "events_v2",
           where: e.site_id in ^site_ids,
-          # ...
+          # 统计 pageviews 和 custom_events
+          select: %{
+            pageviews:
+              sum(fragment("if(? = 'pageview', 1, 0)", e.name)) / e._sample_factor,
+            custom_events:
+              sum(fragment("if(? != 'pageview' AND ? != 'engagement', 1, 0)", e.name, e.name))
+              / e._sample_factor
+          }
         )
       )
     end
   end)
   # 并发执行所有函数 (最大 10 并发)
   |> ClickhouseRepo.parallel_tasks(max_concurrency: 10)
+  # 结果拼装：累加所有块的统计结果
   |> Enum.reduce(fn {pageviews, custom_events}, {pageviews_total, custom_events_total} ->
     {pageviews_total + pageviews, custom_events_total + custom_events}
   end)
 end
 ```
 
-### 5.3 查询追踪与日志
+**拼装逻辑**：
+1. 输入：`[site_ids1, site_ids2, site_ids3]`（分块）
+2. 并发执行：返回 `[{pv1, ce1}, {pv2, ce2}, {pv3, ce3}]`
+3. 拼装：`Enum.reduce` 累加所有块的 pageviews 和 custom_events
+4. 输出：`{total_pv, total_ce}`
+
+### 5.5 场景三：Exploration 功能（迭代式，非并发）
+
+**重要**：Exploration（用户行为探索）使用的是**迭代式查询**，不是**并发查询**。
+
+**文件位置**: `extra/lib/plausible/stats/exploration.ex:146-226`
+
+```elixir
+def interesting_funnel(query, opts \\ []) do
+  max_steps = min(Keyword.get(opts, :max_steps, 6), @max_steps)
+  max_candidates = min(Keyword.get(opts, :max_candidates, 10), @max_candidates)
+
+  # 迭代构建旅程
+  with {:ok, result} <-
+         build_interesting_journey(query, max_steps, max_candidates, include_wildcard?),
+       # 最后再调用一次 journey_funnel 获取完整漏斗数据
+       {:ok, funnel} <- journey_funnel(query, result.journey) do
+    {:ok, %{funnel: funnel, candidates: result.candidates}}
+  end
+end
+
+defp do_build_journey(
+       query,
+       journey,
+       step_candidates,
+       seen,
+       max_steps,
+       max_candidates,
+       include_wildcard?
+     )
+     when length(journey) >= max_steps do
+  %{journey: journey, candidates: step_candidates}
+end
+
+defp do_build_journey(query, journey, step_candidates, seen, max_steps, max_candidates, include_wildcard?) do
+  # 每次迭代调用 next_steps 获取下一步候选
+  {:ok, candidates} =
+    next_steps(query, journey,
+      max_candidates: max_candidates,
+      include_wildcard?: include_wildcard?
+    )
+
+  case find_unseen_step(candidates, seen) do
+    nil ->
+      # 没有新步骤，结束迭代
+      %{journey: journey, candidates: step_candidates}
+
+    step ->
+      # 选择一个新步骤，继续迭代
+      new_seen = MapSet.put(seen, normalize_step_key(step))
+
+      do_build_journey(
+        query,
+        journey ++ [step],
+        step_candidates ++ [candidates],
+        new_seen,
+        max_steps,
+        max_candidates,
+        include_wildcard?
+      )
+  end
+end
+```
+
+**执行流程**：
+1. 初始状态：`journey = []`
+2. 迭代 1：`next_steps(query, [])` → 获取候选步骤 → 选择 step1 → `journey = [step1]`
+3. 迭代 2：`next_steps(query, [step1])` → 获取候选步骤 → 选择 step2 → `journey = [step1, step2]`
+4. ... 继续直到 max_steps
+5. 最后：`journey_funnel(query, journey)` → 计算完整漏斗数据
+
+这是**顺序迭代**，不是**并发执行**。每次查询依赖上一次的结果。
+
+### 5.6 前端多组件并行请求
+
+**文件位置**: `assets/js/dashboard/extra/funnel.js` 和相关组件
+
+前端层面，Dashboard 加载时多个组件会**并行发起 HTTP 请求**：
+
+```javascript
+// 主图表组件
+useEffect(() => {
+  fetchMainGraph(dashboardState)
+}, [dashboardState])
+
+// 来源列表组件
+useEffect(() => {
+  fetchSources(dashboardState)
+}, [dashboardState])
+
+// 漏斗组件
+useEffect(() => {
+  fetchFunnel(dashboardState)
+}, [dashboardState])
+```
+
+**管理机制**：
+1. 使用 `AbortController` 统一管理所有请求
+2. 当 `dashboardState` 变化时，取消所有旧请求，发起新请求
+3. 避免旧请求覆盖新数据
+
+但这是**浏览器层面的并行 HTTP 请求**，不是**后端层面的并发查询**。每个请求在后端都是独立处理的。
+
+### 5.7 查询追踪与日志
 
 **文件位置**: `lib/plausible/clickhouse_repo.ex:46-67`
 
@@ -728,6 +907,9 @@ funnel_data =
 │     - 时间范围改变                                                                      │
 │     - 过滤器添加/移除                                                                   │
 │     - 漏斗名称切换                                                                      │
+│                                                                                         │
+│  ⚠️ 注意：漏斗不支持实时模式 (realtime period)                                         │
+│     当 query.input_date_range == :realtime 时会返回错误                              │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -743,6 +925,9 @@ funnel_data =
 │     a. 检查 Funnels 功能权限 (Business Plan)                                          │
 │     b. Query.from(site, params) 构建 Query 结构                                      │
 │     c. validate_funnel_query(query) 验证过滤限制                                      │
+│        - 不允许 goal 过滤                                                              │
+│        - 不允许 page 过滤                                                              │
+│        - 不允许 realtime period                                                        │
 │     d. Stats.funnel(site, query, funnel_id) 执行查询                                 │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                           │
@@ -750,10 +935,11 @@ funnel_data =
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │  4. Plausible.Stats.Funnel.funnel/3 核心逻辑                                         │
 │     a. Funnels.get() 从 PostgreSQL 读取漏斗定义 (steps, strict_order)                │
+│        - 步骤数量限制：2-8 步                                                          │
 │     b. Query.set(preloaded_goals: ...) 注入步骤 goals                               │
 │     c. Base.base_event_query() 应用 dashboard 过滤器                                 │
 │     d. funnel_query() 构建 windowFunnel SQL                                          │
-│     e. ClickhouseRepo.all() 执行查询                                                 │
+│     e. ClickhouseRepo.all() 执行查询 (单次查询，非并发)                                │
 │     f. backfill_steps() 回填数据，计算转化率                                         │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                           │
@@ -772,6 +958,7 @@ funnel_data =
 │  │       e.name = 'pageview' AND path = '/landing',  -- 步骤1 条件              │   │
 │  │       e.name = 'pageview' AND path = '/product',  -- 步骤2 条件              │   │
 │  │       e.name = 'Purchase'                        -- 步骤3 条件 (自定义事件)   │   │
+│  │       -- ... 支持最多 8 个步骤                                                  │   │
 │  │     ) AS step                                                                    │   │
 │  │   FROM events_v2 e                                                               │   │
 │  │   WHERE e.site_id = 123                                                          │   │
@@ -816,49 +1003,15 @@ funnel_data =
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 多组件并发查询场景
+### 7.2 并发查询场景对比
 
-当 Dashboard 同时显示多个组件时（主图表、来源列表、漏斗等）：
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           Dashboard 页面加载                                            │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              ▼                           ▼                           ▼
-    ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-    │ 主图表组件       │         │ 来源列表组件     │         │ 漏斗组件         │
-    │ fetchMainGraph()│         │ fetchSources()  │         │ fetchFunnel()    │
-    └────────┬────────┘         └────────┬────────┘         └────────┬────────┘
-             │                           │                           │
-             ▼                           ▼                           ▼
-    ┌─────────────────────────────────────────────────────────────────────────────┐
-    │                    前端 AbortController 统一管理                               │
-    │  - 所有 fetch 请求共享同一个 signal                                           │
-    │  - 导航/筛选变化时调用 cancelAll() 取消所有请求                               │
-    │  - 避免旧请求覆盖新数据                                                       │
-    └─────────────────────────────────────────────────────────────────────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              ▼                           ▼                           ▼
-    ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-    │ GET /api/stats/ │         │ GET /api/stats/ │         │ GET /api/stats/ │
-    │ :domain/query   │         │ :domain/sources │         │ :domain/funnels/ │
-    └────────┬────────┘         └────────┬────────┘         └────────┬────────┘
-             │                           │                           │
-             ▼                           ▼                           ▼
-    ┌─────────────────────────────────────────────────────────────────────────────┐
-    │                         后端独立处理每个请求                                   │
-    │                                                                                 │
-    │  注意：当前漏斗查询是单次 ClickHouse 查询 (使用 windowFunnel)                  │
-    │        但对于复杂场景 (如按维度分解漏斗)，可能需要多次查询                      │
-    │                                                                                 │
-    │  如果是 Exploration 功能 (用户行为探索)，则会使用 parallel_tasks:            │
-    │  - 并发查询多个可能的用户路径                                                   │
-    │  - 然后聚合结果找出最有意义的漏斗                                               │
-    └─────────────────────────────────────────────────────────────────────────────┘
-```
+| 场景 | 查询类型 | 执行方式 | 结果拼装 |
+|-----|---------|---------|---------|
+| **标准漏斗查询** | 单次 `windowFunnel` | 顺序执行 | 无需拼装，直接返回 |
+| **CSV 多维度导出** | 多次独立查询 | `parallel_tasks` (后端并发) | 按 key 匹配 `Enum.zip` |
+| **多站点用量统计** | 多次分块查询 | `parallel_tasks` (后端并发) | 累加 `Enum.reduce` |
+| **Exploration** | 多次依赖查询 | 顺序迭代 | 逐步构建 journey |
+| **Dashboard 多组件** | 多次独立 HTTP 请求 | 浏览器并行 | 各组件独立处理 |
 
 ---
 
@@ -872,9 +1025,11 @@ funnel_data =
 | 漏斗配置 LiveView | `extra/lib/plausible_web/live/funnel_settings.ex` | `mount/3` L11, 事件处理 L112+ |
 | 漏斗数据 API | `lib/plausible_web/controllers/api/stats_controller.ex` | `funnel/2` L261, `validate_funnel_query/1` L297 |
 | 漏斗查询核心 | `extra/lib/plausible/stats/funnel.ex` | `funnel/3` L19, `funnel_query/2` L68, `backfill_steps/2` L121 |
+| 漏斗步骤常量 | `lib/plausible/funnel/const.ex` | `min_steps()`, `max_steps()` (2-8) |
 | 基础查询构建 | `lib/plausible/stats/base.ex` | `base_event_query/1` L7 |
 | 查询构建器 | `lib/plausible/stats/query_builder.ex` | `build/3` L29 |
 | ClickHouse 并发 | `lib/plausible/clickhouse_repo.ex` | `parallel_tasks/2` L18, `prepare_query/3` L47 |
+| Exploration 功能 | `extra/lib/plausible/stats/exploration.ex` | `interesting_funnel/2` L146, `do_build_journey/7` L181 |
 | 漏斗存储 | `extra/lib/plausible/funnels.ex` | `create/4`, `get/2`, `list/1` |
 
 ---
@@ -886,17 +1041,40 @@ funnel_data =
 1. **单一数据源**: 所有组件共享同一个 `DashboardState.filters`
 2. **自动传递**: 组件调用 API 时只需传递 `dashboardState` 对象
 3. **统一验证**: 后端 `QueryBuilder` 统一验证和处理所有过滤器
-4. **漏斗特殊限制**: 漏斗查询不允许 `event:goal` 和 `event:page` 过滤
+4. **漏斗特殊限制**: 
+   - 漏斗查询不允许 `event:goal` 和 `event:page` 过滤
+   - **不支持实时模式** (`realtime` period)
 
-### 9.2 查询并发机制
+### 9.2 步骤数量限制
 
-1. **前端层面**: 使用 `AbortController` 统一管理多个并发请求
-2. **后端层面**: 
-   - 单个漏斗查询是单次 `windowFunnel` 调用
-   - `ClickhouseRepo.parallel_tasks/2` 用于多查询场景 (如 Exploration)
-   - 保持 OpenTelemetry 追踪上下文
+| 功能 | 最小步骤 | 最大步骤 | 说明 |
+|-----|---------|---------|------|
+| **标准漏斗** | 2 | 8 | `Funnel.min_steps()` 到 `Funnel.max_steps()` |
+| **Exploration** | 1 | 20 | `@max_steps 20`，`interesting_funnel` 默认 6 步 |
 
-### 9.3 windowFunnel 工作原理
+### 9.3 并发查询机制澄清
+
+**重要区别**：
+
+| 类型 | 说明 | 示例场景 |
+|-----|------|---------|
+| **后端并发查询** | 使用 `parallel_tasks/2` 或 `Task.async_stream` | CSV 导出、多站点统计 |
+| **前端并行请求** | 浏览器同时发起多个 HTTP 请求 | Dashboard 多组件加载 |
+| **迭代式查询** | 顺序执行，每次依赖前一次结果 | Exploration 功能 |
+| **单次查询** | 一个 SQL 完成所有工作 | 标准漏斗查询 (`windowFunnel`) |
+
+**漏斗查询本身**：
+- 是**单次 `windowFunnel` 调用**，不是并发查询
+- 利用 ClickHouse 的 `windowFunnel` 函数一次计算所有步骤
+- 结果通过 `backfill_steps/2` 回填，不是通过并行查询拼装
+
+**真正使用后端并发的场景**：
+1. **CSV 多维度导出**：按 key 匹配拼装
+2. **多站点用量统计**：累加拼装
+3. **多站点概览**：直接返回列表
+4. **账单周期统计**：转为 Map
+
+### 9.4 windowFunnel 工作原理
 
 1. **用户分组**: 按 `user_id` 分组，每组独立分析
 2. **时间顺序**: 按 `timestamp` 排序扫描事件
@@ -905,7 +1083,7 @@ funnel_data =
 5. **时间窗口**: 24小时内完成的步骤才算有效
 6. **结果含义**: 返回值是用户达到的**最远**步骤索引
 
-### 9.4 结果回填逻辑
+### 9.5 结果回填逻辑
 
 ```
 原始 ClickHouse 结果 (windowFunnel 返回):
@@ -922,7 +1100,7 @@ funnel_data =
 步骤3 访客数 = 50人
 ```
 
-### 9.5 性能优化考虑
+### 9.6 性能优化考虑
 
 1. **采样机制**: 企业版支持 `Sampling.add_query_hint()` 处理大数据量
 2. **合并站点**: 支持 `consolidated_site_ids` 查询跨站点数据
