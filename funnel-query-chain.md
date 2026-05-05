@@ -96,9 +96,10 @@ end
 
 **配置流程**：
 1. 用户通过 LiveView 界面选择已配置的 Goals 作为漏斗步骤
-2. 步骤顺序可调整，支持 **2-8 个步骤** (`Funnel.min_steps()` 到 `Funnel.max_steps()`)
-   - `Funnel.Const.min_steps()` = 2
-   - `Funnel.Const.max_steps()` = 8
+2. 步骤顺序可调整，支持 **2-8 个步骤**
+   - 通过 `use Plausible.Funnel` 引入 `Funnel.min_steps()` 和 `Funnel.max_steps()` 宏
+   - 实际常量值：`@min_steps 2`, `@max_steps 8`（定义在 `extra/lib/plausible/funnel.ex:2-3`）
+   - 另有 `Plausible.Funnel.Const` 模块提供相同常量，主要用于 Schema 定义
 3. 支持 `strict_order` 模式（严格顺序）和非严格顺序
 4. 配置保存到 PostgreSQL 数据库的 `funnels` 表
 
