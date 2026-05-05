@@ -177,33 +177,115 @@ def put_imported_opts(query, site) do
 end
 ```
 
-**详细条件说明**：
+**重要区分：数据合并与元数据回显是两个独立的条件**
+
+| 参数 | 作用 | 影响 |
+|------|------|------|
+| `include.imports` | 决定是否**尝试合并**导入数据 | 直接影响 `include_imported` 的值 |
+| `include.imports_meta` | 只决定是否**返回元数据**字段 | 不影响数据合并，只影响响应中的 `meta` 字段 |
+
+---
+
+#### 三、数据合并的触发条件（`include.imports`）
+
+只有 `include.imports = true` 才会触发数据合并逻辑。
+
+**最终 `include_imported = true` 的必要条件**：
 
 | 条件 | 检查内容 | 代码位置 |
 |------|----------|----------|
-| **1. 用户主动请求** | `include.imports = true` 或 `include.imports_meta = true` | API 参数 |
+| **1. 用户请求合并** | `include.imports = true` | API 参数 |
 | **2. 时间间隔支持** | 不使用 `time:minute` 或 `time:hour` 维度 | `schema_supports_interval?/1` |
 | **3. 存在导入数据** | 站点有 `status = completed` 的导入记录 | `any_completed_imports?/1` |
 | **4. 时间范围重叠** | 查询时间范围与导入数据范围有交集 | `completed_imports_in_query_range/2` |
 | **5. 查询模式支持** | 维度/过滤器组合可被导入表支持 | `schema_supports_query?/1` |
 
-#### API 参数控制
+**数据合并的完整条件链**：
 
-导入合并的开启由 API 的 `include` 参数控制：
-
-```json
-{
-  "include": {
-    "imports": true,        // 是否合并导入数据到结果
-    "imports_meta": true    // 是否返回导入相关元数据（即使不合并）
-  }
-}
+```
+include.imports = true
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  检查 1: schema_supports_interval?(query)                    │
+│  └─ 检查是否使用 time:minute 或 time:hour 维度                │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├─── No ──► skip_imported_reason = :unsupported_interval
+         │              include_imported = false
+         │
+         ▼ Yes
+┌─────────────────────────────────────────────────────────────┐
+│  检查 2: imports_exist?                                        │
+│  └─ 站点是否有 status = completed 的导入记录                    │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├─── No ──► skip_imported_reason = :no_imported_data
+         │              include_imported = false
+         │
+         ▼ Yes
+┌─────────────────────────────────────────────────────────────┐
+│  检查 3: imports_in_range != []                                │
+│  └─ 查询时间范围是否与导入数据范围有交集                          │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├─── No ──► skip_imported_reason = :out_of_range
+         │              include_imported = false
+         │
+         ▼ Yes
+┌─────────────────────────────────────────────────────────────┐
+│  检查 4: schema_supports_query?(query)                        │
+│  └─ 维度/过滤器组合是否可被导入表支持                            │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├─── No ──► skip_imported_reason = :unsupported_query
+         │              include_imported = false
+         │
+         ▼ Yes
+┌─────────────────────────────────────────────────────────────┐
+│  ✓ include_imported = true                                    │
+│  ✓ skip_imported_reason = nil                                 │
+│  ✓ 数据将被合并（FULL JOIN / CROSS JOIN）                      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**参数行为**：
-- `include.imports = true`：尝试合并导入数据，如果失败则降级为仅本地查询
-- `include.imports_meta = true`：即使不合并数据，也在响应中返回 `imports_included`、`imports_skip_reason` 等元信息
-- Dashboard 默认会设置 `include.imports = true`
+---
+
+### 二、元数据回显的触发条件（`include.imports` 或 `include.imports_meta`）
+
+**元数据字段**（`imports_included`、`imports_skip_reason`、`imports_warning`）的返回由以下任一条件触发：
+
+```elixir
+# lib/plausible/stats/query_result.ex:73-85
+defp add_imports_meta(meta, %Query{include: include} = query) do
+  if include.imports or include.imports_meta do  # 两者任一为 true
+    %{
+      imports_included: query.include_imported,
+      imports_skip_reason: query.skip_imported_reason,
+      imports_warning: @imports_warnings[query.skip_imported_reason]
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.merge(meta)
+  else
+    meta
+  end
+end
+```
+
+**API 参数与行为对照表**：
+
+| `include.imports` | `include.imports_meta` | 尝试合并数据 | 返回元数据字段 |
+|-------------------|------------------------|-------------|---------------|
+| `false` | `false` | ❌ 否 | ❌ 否 |
+| `false` | `true` | ❌ 否 | ✅ 是（告知为什么没合并） |
+| `true` | `false` | ✅ 是 | ✅ 是（合并成功/失败的状态） |
+| `true` | `true` | ✅ 是 | ✅ 是 |
+
+**关键理解**：
+- `include.imports_meta = true` 但 `include.imports = false` 时：
+  - **不会**尝试合并数据
+  - **但会**计算并返回 `imports_skip_reason` 等元数据
+  - 用途：让用户/前端知道"如果我开启合并，会发生什么"
 
 #### 降级为仅本地查询的原因
 
