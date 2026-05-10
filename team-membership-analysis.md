@@ -38,7 +38,7 @@ has_one :subscription, Plausible.Billing.Subscription
 | **团队邀请** | 团队 `:owner` 或 `:admin` | `:owner` 可邀请任何角色，`:admin` 可邀请除 `:owner` 外的角色 |
 | **站点邀请（访客）** | 团队 `:owner` 或 `:admin` | 通过站点角色判断（必须是 `team_member` 类型） |
 | **站点所有权转移** | 团队 `:owner` 或 `:admin` | 通过 `team_member` 类型的 `:owner` 或 `:admin` |
-| **站点在团队间移动** | 源团队 `:owner` + 目标团队 `:owner` 或 `:admin` | 双重权限校验 |
+| **站点在团队间移动** | 源团队 `:owner` 或 `:admin` + 目标团队 `:owner` 或 `:admin` | 双重权限校验 |
 | **角色变更（团队）** | 团队 `:owner` 或 `:admin` | 有复杂的权限授予规则 |
 | **角色变更（访客）** | 团队 `:owner` 或 `:admin` | 仅在站点层面 |
 
@@ -47,7 +47,7 @@ has_one :subscription, Plausible.Billing.Subscription
 | 操作 | 接受者要求 | 说明 |
 |------|-----------|------|
 | 团队邀请/访客邀请 | 邮箱匹配 | 无需额外权限 |
-| 站点所有权转移 | 目标团队 `:owner` 或 `:admin` | `check_can_transfer_site(new_team, new_owner)` |
+| 站点所有权转移 | 目标团队 `:owner` 或 `:admin` | `check_can_transfer_site(new_team, new_owner) |
 
 ## 4. 端到端协作时序
 
@@ -94,7 +94,7 @@ has_one :subscription, Plausible.Billing.Subscription
 #### 发起阶段校验链
 
 ```
-发起方 (Team/Admin)
+发起方 (Team Owner/Admin)
         │
         ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -357,21 +357,60 @@ new_owner (接受者)
 
 **适用场景:** 站点在同一个用户的不同团队间移动
 
-**发起者要求:**
-- 源团队：必须是 `:owner`（因为需要有站点的所有权
-- 目标团队：必须是 `:owner` 或 `:admin`
+**发起者权限（两层校验）:**
+
+```
+用户（发起者）
+   │
+   ├── 控制器层（插件级权限）
+   │      └── plug AuthorizeSiteAccess, [:owner, :admin]
+   │           - 确保用户在源团队是 owner 或 admin
+   │
+   ├── 表单层（UI筛选
+   │      └── Plausible.Teams.Users.teams(user, roles: [:owner, :admin])
+   │           - 只显示用户是 owner/admin 的目标团队
+   │
+   └── 服务层（目标团队校验）
+          └── check_can_transfer_site(new_team, user)
+               - 确保用户在目标团队是 owner 或 admin
+```
+
+**发起者要求（实际权限总结:**
+- 源团队：通过 `AuthorizeSiteAccess` 保证是 `:owner` 或 `:admin`（站点访问权限）
+- 目标团队：通过 `check_can_transfer_site` 保证是 `:owner` 或 `:admin`
+
+**关键实现（membership_controller.ex:144-213）:**
+
+```elixir
+# 插件级权限（第17行）
+plug AuthorizeSiteAccess, [:owner, :admin] when action in [
+  :change_team_form, :change_team
+]
+
+# 可选择的目标团队（第157行）
+transferable_teams =
+  user
+  |> Plausible.Teams.Users.teams(roles: [:owner, :admin])
+  |> Enum.reject(&(&1.id == site.team_id)
+
+# 服务层调用（第181行）
+case Teams.Sites.Transfer.change_team(site, user, destination_team) do
+  # ...
+end
+```
 
 **完整流程（Sites.Transfer.change_team/3）:**
 
 ```
-user（源团队 Owner）                              系统
+user（源团队 Owner/Admin）                              系统
      │                                              │
      │ 1. change_team(site, user, new_team)      │
      │─────────────────────────────────────────────>│
      │                                              │
      │ ┌──────────────────────────────────────────┐     │
      │ │ 发起校验（隐含在业务逻辑中）        │     │
-     │ │ - 源团队: 必须拥有该站点           │     │
+     │ │ - 源团队: 通过控制器插件保证是      │     │
+     │ │   owner/admin（站点访问权限）      │     │
      │ │ - 目标团队: check_can_transfer_site │     │
      │ │   检查 user 在 new_team 的角色      │     │
      │ │   必须是 :owner 或 :admin        │     │
@@ -484,8 +523,8 @@ current_user（操作者）
 │                                                     │
 │  2. 授予给他人 (granting_to_self? = false) │
 │     - :owner 可授予任何角色                      │
-│     - :admin 有复杂规则（不能提升到 :admin     │
-│       不能授予 :owner                               │
+│     - :admin 可授予 admin/editor/viewer/billing 给  │
+│       editor/viewer/billing 给 admin/editor/viewer/billing │
 │     ○ 失败: {:error, :permission_denied}            │
 └─────────────────────────────────────────────────────────┘
          │
@@ -514,18 +553,69 @@ current_user（操作者）
 
 **角色授予规则（can_grant_role_to_other?）:**
 
-```elixir
-# Owner 授予他人:
-- 可授予任何角色（包括 :owner）
+代码位置：`lib/plausible/teams/memberships/update_role.ex:117-131`
 
-# Admin 授予他人:
-- 可授予 :admin → :admin/:editor/:viewer/:billing
-- 可授予 :editor → :admin/:editor/:viewer/:billing
-- 可授予 :viewer → :admin/:editor/:viewer/:billing
-- 可授予 :billing → :billing
-- 不可授予 :owner
-- 其他角色（:editor/:viewer/:billing/:guest:
-- 不可授予任何角色
+```elixir
+defp can_grant_role_to_other?(:owner, _, _), do: true
+defp can_grant_role_to_other?(:admin, :admin, :admin), do: true
+defp can_grant_role_to_other?(:admin, :admin, :editor), do: true
+defp can_grant_role_to_other?(:admin, :admin, :viewer), do: true
+defp can_grant_role_to_other?(:admin, :admin, :billing), do: true
+defp can_grant_role_to_other?(:admin, :editor, :admin), do: true   # ← admin 可提升 editor 为 admin
+defp can_grant_role_to_other?(:admin, :editor, :editor), do: true
+defp can_grant_role_to_other?(:admin, :editor, :viewer), do: true
+defp can_grant_role_to_other?(:admin, :editor, :billing), do: true
+defp can_grant_role_to_other?(:admin, :viewer, :admin), do: true   # ← admin 可提升 viewer 为 admin
+defp can_grant_role_to_other?(:admin, :viewer, :editor), do: true
+defp can_grant_role_to_other?(:admin, :viewer, :viewer), do: true
+defp can_grant_role_to_other?(:admin, :viewer, :billing), do: true
+defp can_grant_role_to_other?(:admin, :billing, :billing), do: true
+defp can_grant_role_to_other?(_, _, _), do: false
+```
+
+**Admin 角色授予矩阵（按代码逐项整理）:**
+
+| 目标角色（from_role） | 可授予的角色（to_role） | 说明 |
+|-------------------|-----------------------|------|
+| `:admin` | `:admin`, `:editor`, `:viewer`, `:billing` | admin 可以修改其他 admin 的角色（包括降级为 admin 自己） |
+| `:editor` | `:admin`, `:editor`, `:viewer`, `:billing` | admin 可以把 editor 提升为 admin！ |
+| `:viewer` | `:admin`, `:editor`, `:viewer`, `:billing` | admin 可以把 viewer 提升为 admin！ |
+| `:billing` | `:billing` | admin 只能修改 billing 为 billing（不允许提升） |
+| `:owner` | ❌ 不可修改 | admin 不能修改 owner 的角色（update_role_test.exs:71-83 验证） |
+| `:guest` | ❌ 不可授予 | guest 不是团队角色，不在授予范围 |
+
+**关键测试验证（update_role_test.exs:71-83）:**
+
+```elixir
+# ❌ 验证: admin 不能修改 owner 的角色
+test "admin can't update role of an owner" do
+  user = new_user()
+  owner = new_user()
+  _site = new_site(owner: owner)
+  team = team_of(owner)
+  _admin = add_member(team, user: user, role: :admin)
+  _another_owner = add_member(team, role: :owner)
+
+  assert {:error, :permission_denied} = UpdateRole.update(team, owner.id, "viewer", user)
+end
+```
+
+**Admin 授予权限总结:**
+
+```
+admin 授予权限：
+┌───────────────────────────────────────────────────────────────┐
+│ ✅ 可以做的：                                             │
+│   - admin   → admin / editor / viewer / billing            │
+│   - editor  → admin / editor / viewer / billing  ← 注意 │
+│   - viewer  → admin / editor / viewer / billing  ← 注意 │
+│   - billing → billing                                    │
+│                                                           │
+│ ❌ 不可以做的：                                           │
+│   - 不能授予 :owner 给任何人                              │
+│   - 不能修改 owner 的角色                                   │
+│   - 不能修改 guest 的角色                                 │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### 7.3 访客角色变更（Memberships.update_role/5）
@@ -623,7 +713,7 @@ current_user（操作者）
   │         │ - 发起权限    │            │            │            │            │            │
   │         │ check_invitation_permissions │            │            │            │            │
   │         │ 必须是 team_member:owner/admin │            │            │            │            │
-  │         │            │            │            │            │            │
+  │         │            │            │            │            │            │            │
   │         │ [校验点2] │            │            │            │            │            │
   │         │ - 配额检查  │            │            │            │            │            │
   │         │ :owner 不受限 │            │            │            │            │            │
@@ -643,7 +733,7 @@ current_user（操作者）
   │         │            │ 邮件       │───────────>│            │            │            │
   │         │            │            │            │            │            │            │
   │         │            │            │            │            │            │            │
-  │         │            │            │ 2. 接受   │            │            │            │
+  │         │            │            │ 2. 接受   │            │            │            │            │
   │         │            │            │ 转移      │            │            │            │
   │         │            │            │───────────>│            │            │
   │         │            │            │            │            │            │            │
@@ -668,7 +758,7 @@ current_user（操作者）
   │         │            │            │            │ [事务点2]  │            │            │
   │         │            │            │            │            │            │            │
   │         │            │            │            │            │ 1. site.  │            │            │
-  │         │            │            │            │ team_id   │            │            │
+  │         │            │            │            │            │ team_id   │            │            │
   │         │            │            │            │            │ = new_team│            │            │
   │         │            │            │            │            │            │            │
   │         │            │            │            │            │ 2. 迁移  │            │            │
@@ -680,7 +770,7 @@ current_user（操作者）
   │         │            │            │            │            │ 4. 原所有  │            │
   │         │            │            │            │            │ 者降级为  │            │
   │         │            │            │            │            │ 访客     │            │            │
-  │         │            │            │            │            │ editor   │            │
+  │         │            │            │            │            │ editor   │            │            │
   │         │            │            │            │            │            │            │
   │         │            │            │            │            │ ○ 任何   │            │            │
   │         │            │            │            │            │ 步骤失败  │            │
@@ -698,9 +788,193 @@ current_user（操作者）
   │         │            │            │            │            │            │            │
 ```
 
-## 10. 关键代码位置
+## 10. 邀请到角色变更再到站点转移或换团队的统一协作闭环
 
-### 10.1 核心服务模块
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                        统一协作闭环：邀请 → 角色变更 → 站点转移/换团队                      │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+阶段 1：邀请加入
+─────────────────────────────────────────────────────────────────────────────────────────────────
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 发起方（Team Owner/Admin）                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 选择邀请类型                                                 │   │
+│  │    - 团队邀请：任意角色                                         │   │
+│  │    - 站点邀请：访客角色                                          │   │
+│  │    - 站点所有权转移：邀请为 :owner                        │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│  │                                                                   │   │
+│  │ 发起权限校验：                                                      │   │
+│  │   - 团队邀请：check_invitation_permissions                             │   │
+│  │     :owner 可邀请任何角色                                        │   │
+│  │     :admin 可邀请除 :owner 外的角色                              │   │
+│  │   - 站点邀请：必须是 team_member:owner/admin                         │   │
+│  │   - 配额检查：check_team_member_limit                             │   │
+│  │   - 重复成员检查：ensure_new_membership                          │   │
+│  │                                                                   │   │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 2. 创建邀请记录                                                 │   │
+│  │    - 团队邀请：Teams.Invitation                                    │   │
+│  │    - 访客邀请：Teams.Invitation + GuestInvitation                      │   │
+│  │    - 站点转移：Teams.SiteTransfer                                │   │
+│  │    ○ 事务：失败回滚，记录不创建                                │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+                        发送邀请邮件
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 接受方                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 3. 接受邀请                                                       │   │
+│  │    - 团队邀请：create_team_membership                            │   │
+│  │    - 访客邀请：create_team_membership(:guest) + GuestMembership      │   │
+│  │    - 站点转移：check_can_transfer_site（目标团队权限）            │   │
+│  │                                                                   │   │
+│  │ 接受权限校验（站点转移）：                                              │   │
+│  │   - 目标团队必须是 :owner 或 :admin                          │   │
+│  │   - EE版本：ensure_can_take_ownership                          │   │
+│  │   ○ 失败：接受拒绝，状态不变                                      │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│  │                                                                   │   │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 4. 执行变更                                                       │   │
+│  │    - 团队邀请：清理旧访客会员（非 guest 角色）                      │   │
+│  │    - 访客邀请：创建访客会员                                       │   │
+│  │    - 站点转移：transfer_site 事务执行                            │   │
+│  │    ○ 事务：任何步骤失败全部回滚                                    │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+阶段 2：角色变更
+─────────────────────────────────────────────────────────────────────────────────────────────────
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 操作者（Team Owner/Admin）                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 5. 角色调整                                                         │   │
+│  │    - 团队角色变更：Memberships.UpdateRole.update/4                    │   │
+│  │    - 访客角色变更：Memberships.update_role/5                        │   │
+│  │                                                                   │   │
+│  │ 角色授予权限校验：                                                  │   │
+│  │   - :owner 可授予任何角色                                        │   │
+│  │   - :admin 可授予 admin/editor/viewer/billing 给 admin/editor/viewer     │   │
+│  │   - :admin 可把 editor/viewer 提升为 admin！                   │   │
+│  │   - :admin 不能授予 :owner 给任何人                               │   │
+│  │   - :admin 不能修改其他 owner 的角色                                 │   │
+│  │   - 自己降级：owner → admin/editor/viewer/billing               │   │
+│  │   - 自己降级：admin → editor/viewer/billing                         │   │
+│  │                                                                   │   │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 6. 执行角色变更                                                 │   │
+│  │    - 角色冲突处理：不降级现有角色                                    │   │
+│  │    - 访客升级：发送邀请邮件                                      │   │
+│  │    - 清理访客会员                                               │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+                        通知邮件（访客升级 → 团队成员
+                                 │
+                                 ▼
+
+阶段 3：站点转移或换团队
+─────────────────────────────────────────────────────────────────────────────────────────────────
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 方式 A：站点所有权转移（邀请机制）                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 7. 发起转移请求                                                       │   │
+│  │    - 邀请目标邮箱为 :owner                                      │   │
+│  │    - 发起者必须是 team_member:owner/admin                         │   │
+│  │    - 创建 SiteTransfer 记录                                         │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│  │                                                                   │   │
+│  │  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 8. 接受转移（目标团队 Owner/Admin）                                 │   │
+│  │    - check_can_transfer_site：目标团队权限校验                        │   │
+│  │    - ensure_can_take_ownership：目标配额校验                      │   │
+│  │    - transfer_site 事务执行：                                         │   │
+│  │      a. site.team_id = new_team                                    │   │
+│  │      b. 迁移访客邀请/会员                                           │   │
+│  │      c. 原所有者降级为访客 editor                                   │   │
+│  │    ○ 事务：任何步骤失败全部回滚                                    │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 方式 B：团队间移动（change_team）                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 7. 选择目标团队                                                       │   │
+│  │    - 控制器插件：AuthorizeSiteAccess [:owner, :admin]                  │   │
+│  │    - 源团队必须是 owner 或 admin（站点访问权限）                       │   │
+│  │    - 目标团队必须是 owner 或 admin（check_can_transfer_site）      │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│  │                                                                   │   │
+│  │  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 8. 执行移动                                                         │   │
+│  │    - transfer_ownership 执行：                                           │   │
+│  │      a. ensure_transfer_valid：不是转移到自身团队                      │   │
+│  │      b. check_can_transfer_site：目标团队权限                    │   │
+│  │      c. ensure_can_take_ownership：目标配额校验                  │   │
+│  │      d. transfer_site 事务执行：                                       │   │
+│  │         - 站点归属变更                                              │   │
+│  │         - 访客迁移                                                  │   │
+│  │         - 原所有者降级                                              │   │
+│  │    ○ 事务：任何步骤失败全部回滚                                    │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+闭环结束
+─────────────────────────────────────────────────────────────────────────────────────────────────
+
+新团队成员（Admin）
+    │
+    ├── 可以发起新的邀请
+    │
+    ├── 可以调整其他成员角色（如果是 owner/admin）
+    │
+    └── 可以转移/移动站点（如果是 owner/admin）
+
+权限链传递：
+  邀请 → 角色变更 → 新的邀请 → 站点转移/移动
+
+```
+
+**协作闭环要点总结:**
+
+1. **邀请是入口**：
+   - 通过 `InviteToTeam` 或 `InviteToSite` 服务发起
+   - 角色为 `:owner` 时自动转换为站点转移
+   - 接受后创建成员关系
+
+2. **角色变更是中间环节**：
+   - 成员加入后，通过 `UpdateRole` 调整角色
+   - `:admin` 可以把 `:editor`/`:viewer` 提升为 `:admin`
+   - 角色提升后获得更大权限
+
+3. **站点转移/换团队是闭环出口**：
+   - 两种方式实现团队间资源流动
+   - 站点转移：通过邀请机制（需接受
+   - 团队间移动：直接 `change_team`（直接执行
+   - 双重权限校验：源团队（owner/admin）+ 目标团队（owner/admin）
+
+4. **权限链传递**：
+   - 邀请 → 获得团队成员 → 角色变更 → 更大权限 → 发起新邀请/站点转移
+
+5. **事务一致性**：
+   - 每个阶段都在数据库事务中执行
+   - 任何步骤失败全部回滚
+   - 确保数据一致性
+
+## 11. 关键代码位置
+
+### 11.1 核心服务模块
 
 - `lib/plausible/teams/invitations.ex` - 邀请和站点转移的核心逻辑
   - `check_invitation_permissions/4` - 发起权限校验（第587-621行）
@@ -720,27 +994,28 @@ current_user（操作者）
 
 - `lib/plausible/teams/invitations/accept.ex` - 邀请接受统一入口
 
-### 10.2 控制器层
+### 11.2 控制器层
 
 - `lib/plausible_web/controllers/site/membership_controller.ex` - 站点层面的成员管理
-  - 插件级权限：`plug AuthorizeSiteAccess, [:owner, :admin]`（第20行）
+  - 插件级权限：`plug AuthorizeSiteAccess, [:owner, :admin]`（第17行）
+  - 目标团队筛选：`roles: [:owner, :admin]`（第157行）
 
 - `lib/plausible_web/controllers/invitation_controller.ex` - 邀请接受和拒绝
 
-### 10.3 数据模型
+### 11.3 数据模型
 
 - `lib/plausible/teams/team.ex` - 团队模型
 - `lib/plausible/teams/membership.ex` - 成员模型
 - `lib/plausible/teams/invitation.ex` - 邀请模型
 - `lib/plausible/teams/site_transfer.ex` - 站点转移模型
 
-## 11. 设计亮点与权限链总结
+## 12. 设计亮点与权限链总结
 
-### 11.1 统一的邀请系统
+### 12.1 统一的邀请系统
 - 通过 `Invitations.find_for_user/2` 统一查找所有类型的待处理邀请
 - 统一的接受入口 `Invitations.Accept.accept/3` 根据类型路由
 
-### 11.2 双重权限校验
+### 12.2 双重权限校验
 **发起方校验链：
 1. 插件级权限（控制器层）
 2. 服务级权限（`check_invitation_permissions`）
@@ -753,21 +1028,27 @@ current_user（操作者）
 3. 目标配额检查（`ensure_can_take_ownership`）
 4. 事务执行
 
-### 11.3 事务一致性
+### 12.3 事务一致性
 - 所有状态变更操作都在数据库事务中执行
 - 任何步骤失败全部回滚
 - 确保数据一致性
 
-### 11.4 角色保护机制
+### 12.4 角色保护机制
 - 接受邀请时不会降级现有成员的角色
 - `create_team_membership` 中的冲突处理：`CASE WHEN tm.role = 'guest' THEN new_role ELSE tm.role END
 
-### 11.5 灵活的转移策略
+### 12.5 灵活的转移策略
 - 完整转移：迁移所有访客和原所有者
 - 无成员转移：`skip_site_members_transfer?: true
 - 团队间移动：`change_team` 直接移动
 
-## 12. 测试覆盖情况
+### 12.6 Admin 授予权限设计亮点
+- `:admin` 可以把 `:editor`/`:viewer` 提升为 `:admin`
+- 这是一个有意的设计：admin 可以帮助 owner 管理团队
+- 但 `:admin` 不能授予 `:owner` 给任何人
+- `:admin` 也不能修改其他 `:owner` 的角色
+
+## 13. 测试覆盖情况
 
 测试文件位置：
 - `test/plausible/teams/invitations/invite_to_site_test.exs` - 站点邀请测试（含所有权转移发起权限）
@@ -783,4 +1064,5 @@ current_user（操作者）
 - 访客升级为团队成员
 - 多团队用户的转移选择
 - 无成员转移模式
-- 角色授予规则验证
+- 角色授予规则验证（admin 可以提升 editor/viewer 为 admin）
+- admin 不能修改 owner 的角色
