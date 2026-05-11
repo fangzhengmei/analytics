@@ -498,56 +498,92 @@ end
 #### 前端组件
 `assets/js/dashboard/stats/sources/index.js`
 
-**四个视图模式：**
+**三个视图模式：**
 
 1. **Channels（渠道）**
+   - Tab 名称：`Channels`
    - 维度：`visit:channel`
    - 展示：Organic Search, Direct, Paid Search, Paid Other, Social, Referral, Email 等
 
 2. **Sources（来源）**
-   - 维度：`visit:source`
-   - 展示来源网站图标（favicon）
+   - Tab 名称动态变化：
+     - 默认状态：`Sources` → 展示来源列表
+     - 过滤特定 source（非 Google）：`Top referrers` → 展示具体引用域名
+     - 过滤 source = Google：`Search terms` → 展示搜索关键词
+   - 核心维度：`visit:source`（顶层）、`visit:referrer`（下钻）
    - 支持下钻功能
 
-3. **UTM 参数**
-   - 下拉菜单包含：utm_medium, utm_source, utm_campaign, utm_content, utm_term
+3. **UTM 参数（下拉菜单）**
+   - 下拉菜单标签：默认显示 `Campaigns`，选中后显示对应名称
+   - 包含 5 个子项：
+     | 子项 | 标题 | 维度 | 接口 |
+     |------|------|------|------|
+     | utm_medium | UTM mediums | `visit:utm_medium` | `/utm_mediums` |
+     | utm_source | UTM sources | `visit:utm_source` | `/utm_sources` |
+     | utm_campaign | UTM campaigns | `visit:utm_campaign` | `/utm_campaigns` |
+     | utm_content | UTM contents | `visit:utm_content` | `/utm_contents` |
+     | utm_term | UTM terms | `visit:utm_term` | `/utm_terms` |
 
 #### 完整下钻路径
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    流量来源视图                             │
-├─────────────────────────────────────────────────────────────┤
-│  Channels(渠道)  │  Sources(来源)  │  UTM(参数)              │
-├──────────────────┼─────────────────┼────────────────────────┤
-│                  │ ┌─────────────┐ │                        │
-│                  │ │  Google     │ │── 点击 Google 来源    │
-│                  │ └──────┬──────┘ │   (特殊处理)           │
-│                  │        │        │                        │
-│                  │        ▼        │                        │
-│                  │ ┌─────────────┐ │   Search Console API  │
-│                  │ │ 关键词列表  │ │   → 搜索关键词         │
-│                  │ └─────────────┘ │                        │
-│                  │                 │                        │
-│                  │ ┌─────────────┐ │                        │
-│                  │ │  Twitter    │ │── 点击其他来源         │
-│                  │ └──────┬──────┘ │   (通用路径)           │
-│                  │        │        │                        │
-│                  │        ▼        │                        │
-│                  │ ┌─────────────┐ │   /referrers/:referrer│
-│                  │ │ 具体referrer│ │   → 引用域名列表       │
-│                  │ │ (twitter.com │ │                        │
-│                  │ │  github.com) │ │                        │
-│                  │ └─────────────┘ │                        │
-└──────────────────┴─────────────────┴────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      流量来源视图                                   │
+├──────────────┬──────────────────────────────┬───────────────────────┤
+│   Channels   │          Sources             │    UTM (Dropdown)     │
+│   (Tab)      │          (Tab)               │  ┌──────────────────┐  │
+│              │                              │  │ ▼ Campaigns      │  │
+│              │                              │  ├──────────────────┤  │
+│              │                              │  │ utm_medium       │  │
+│              │                              │  │ utm_source       │  │
+│              │                              │  │ utm_campaign     │  │
+│              │                              │  │ utm_content      │  │
+│              │                              │  │ utm_term         │  │
+│              │                              │  └──────────────────┘  │
+├──────────────┼──────────────────────────────┼───────────────────────┤
+│              │  点击来源列表中的某一项        │                       │
+│              │       │                      │                       │
+│              │       ▼                      │                       │
+│              │  应用过滤器 "source is X"    │                       │
+│              │       │                      │                       │
+│              │       ├──────────────────────┤                       │
+│              │       │                      │                       │
+│              │       ▼                      ▼                       │
+│              │  source == "Google"     source != "Google"           │
+│              │       │                      │                       │
+│              │       ▼                      ▼                       │
+│              │  Tab 标签显示         Tab 标签显示                    │
+│              │  "Search terms"       "Top referrers"               │
+│              │       │                      │                       │
+│              │       ▼                      ▼                       │
+│              │  Search Console API   GET /referrers/:referrer      │
+│              │  → 搜索关键词列表     → 具体引用域名列表              │
+│              │                              │                       │
+│              │                              ▼                       │
+│              │                        应用过滤器                   │
+│              │                        "referrer is X"              │
+└──────────────┴──────────────────────────────┴───────────────────────┘
 ```
 
-**1. Sources 列表组件**
-`assets/js/dashboard/stats/sources/index.js`
+**Sources Tab 逻辑（基于 dashboardState 过滤条件）**
+`assets/js/dashboard/stats/sources/index.js:302-334`
 
-点击某个来源后，如果是 "Google"，会有特殊处理；其他来源跳转到 ReferrerDrilldownModal。
+```javascript
+function renderSourceContent() {
+  if (isFilteringOnFixedValue(dashboardState, 'source', 'Google')) {
+    // 过滤条件为 source = Google → 显示搜索关键词
+    return <SearchTerms ... />
+  } else if (isFilteringOnFixedValue(dashboardState, 'source')) {
+    // 过滤条件为 source = 其他值 → 显示具体 referrer 列表
+    return <Referrers source={clauses[0]} ... />
+  } else {
+    // 无 source 过滤 → 显示来源列表
+    return <AllSources ... />
+  }
+}
+```
 
-**2. Referrer 下钻模态框**
+**Referrer 下钻模态框**
 `assets/js/dashboard/stats/modals/referrer-drilldown.js`
 
 ```javascript
@@ -560,7 +596,7 @@ const reportInfo = {
 }
 ```
 
-**3. 后端下钻 API**
+#### 后端下钻 API
 `lib/plausible_web/controllers/api/stats_controller.ex:526-612`
 
 **路由定义：** `lib/plausible_web/router.ex:306`
@@ -605,12 +641,19 @@ end
 
 **下钻路径示例：**
 ```
-GET /sources
-  ↓ 点击 "Twitter"
-  ├─ source == "Google" → 调用 Search Console API 返回关键词
-  └─ source != "Google" → GET /referrers/Twitter → 返回 twitter.com 等具体域名
-       ↓ 点击某个域名
-       └─ 应用过滤器 "referrer is twitter.com" 到整个仪表盘
+Sources Tab（显示来源列表）
+    ↓ 点击 "Twitter"
+    ↓ 应用过滤器 "source is Twitter"
+    ↓ Tab 标签变为 "Top referrers"
+    ├─ source == "Google"
+    │    ↓ Tab 标签变为 "Search terms"
+    │    ↓ Search Console API → 搜索关键词列表
+    │
+    └─ source != "Google"
+         ↓ GET /referrers/Twitter
+         ↓ 返回 twitter.com, t.co 等具体域名
+         ↓ 点击某个域名
+         ↓ 应用过滤器 "referrer is twitter.com" 到整个仪表盘
 ```
 
 ---
