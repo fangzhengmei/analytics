@@ -352,36 +352,99 @@ end
 4. **不是 localhost**
 
 #### 流量获取渠道推断
-`lib/plausible/ingestion/acquisition.ex:50-201`
 
-基于 Source + UTM 参数推断 Acquisition Channel：
+**核心机制：MATERIALIZED 列 + ClickHouse 函数**
 
-**渠道分类规则（优先级从高到低）：**
+`acquisition_channel` 是 **MATERIALIZED 列**，在数据写入时由 ClickHouse 自动计算并持久化存储。
 
-| 渠道 | 条件 |
-|------|------|
-| Cross-network | utm_campaign 包含 "cross-network" |
-| Paid Shopping | 购物来源 + 付费 medium |
-| Paid Search | 搜索来源 + 付费 medium/utm_source 或 gclid/msclkid |
-| Paid Social | 社交来源 + 付费 medium/utm_source |
-| Paid Video | 视频来源 + 付费 medium/utm_source |
-| Display | utm_medium 为 display/banner 等 |
-| Organic Shopping | 购物来源 |
-| Organic Social | 社交来源或 utm_medium 包含 social |
-| Organic Video | 视频来源或 utm_medium 包含 video |
-| Organic Search | 搜索来源 |
-| Email | 邮件来源或 utm 参数包含 email 关键词 |
-| Affiliates | utm_medium == "affiliate" |
-| Audio | utm_medium == "audio" |
-| SMS | utm_source/utm_medium == "sms" |
-| Mobile Push Notifications | utm_medium 包含 push/mobile/notification |
-| Referral | utm_medium 为 referral/app/link 或有 source |
-| Direct | 其他所有情况 |
+**1. ClickHouse 函数定义**
+`priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_functions.sql.eex:198-230`
 
-**付费 medium 匹配正则：**
-```elixir
-~r/^(.*cp.*|ppc|retargeting|paid.*)$/
+```sql
+CREATE OR REPLACE FUNCTION acquisition_channel AS
+(referrer_source, utm_medium, utm_campaign, utm_source, click_id_param) ->
+    acquisition_channel_lowered(
+        lower(referrer_source),
+        lower(utm_medium),
+        lower(utm_campaign),
+        lower(utm_source),
+        click_id_param
+    );
+
+CREATE OR REPLACE FUNCTION acquisition_channel_lowered AS
+(referrer_source, utm_medium, utm_campaign, utm_source, click_id_param) ->
+    multiIf(
+        acquisition_channel_cross_network(utm_campaign), 'Cross-network',
+        acquisition_channel_display(utm_medium), 'Display',
+        acquisition_channel_paid_shopping(referrer_source, utm_medium, utm_campaign), 'Paid Shopping',
+        acquisition_channel_paid_search(referrer_source, utm_medium, utm_source, click_id_param), 'Paid Search',
+        acquisition_channel_paid_social(referrer_source, utm_medium, utm_source), 'Paid Social',
+        acquisition_channel_paid_video(referrer_source, utm_medium, utm_source), 'Paid Video',
+        acquisition_channel_paid_medium(utm_medium), 'Paid Other',
+        acquisition_channel_organic_shopping(referrer_source, utm_campaign), 'Organic Shopping',
+        acquisition_channel_organic_social(referrer_source, utm_medium), 'Organic Social',
+        acquisition_channel_organic_video(referrer_source, utm_medium), 'Organic Video',
+        acquisition_channel_has_category_search(referrer_source), 'Organic Search',
+        acquisition_channel_email(referrer_source, utm_source, utm_medium), 'Email',
+        acquisition_channel_affiliates(utm_medium), 'Affiliates',
+        acquisition_channel_audio(utm_medium), 'Audio',
+        acquisition_channel_sms(utm_source), 'SMS',
+        acquisition_channel_sms(utm_medium), 'SMS',
+        acquisition_channel_mobile_push_notifications(utm_medium, referrer_source), 'Mobile Push Notifications',
+        acquisition_channel_referral(utm_medium, referrer_source), 'Referral',
+        'Direct'
+    );
 ```
+
+**2. 表列定义 - MATERIALIZED**
+`priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_add_materialized_column.sql.eex:1-4`
+
+```sql
+ALTER TABLE sessions_v2
+ADD COLUMN IF NOT EXISTS acquisition_channel LowCardinality(String)
+MATERIALIZED acquisition_channel(referrer_source, utm_medium, utm_campaign, utm_source, click_id_param)
+```
+
+**3. 写入时排除**
+`lib/plausible/ingestion/write_buffer.ex:153`
+
+```elixir
+defp fields_to_ignore(), do: [:acquisition_channel, :interactive?]
+```
+
+写入时不包含 `acquisition_channel` 字段，ClickHouse 会根据行数据自动计算并存盘。
+
+**4. 渠道分类完整列表（优先级从高到低，共 19 类）**
+
+| 序号 | 渠道 | 条件 |
+|------|------|------|
+| 1 | Cross-network | utm_campaign 包含 "cross-network" |
+| 2 | Display | utm_medium IN ('display', 'banner', 'expandable', 'interstitial', 'cpm') |
+| 3 | Paid Shopping | 购物来源 + 付费 medium 或 shopping campaign |
+| 4 | Paid Search | 搜索来源 + 付费 medium/utm_source 或 gclid/msclkid |
+| 5 | Paid Social | 社交来源 + 付费 medium/utm_source |
+| 6 | Paid Video | 视频来源 + 付费 medium/utm_source |
+| 7 | **Paid Other** | utm_medium 匹配 `^(.*cp.*\|ppc\|retargeting\|paid.*)$` |
+| 8 | Organic Shopping | 购物来源或 shopping campaign |
+| 9 | Organic Social | 社交来源或 utm_medium 包含 social |
+| 10 | Organic Video | 视频来源或 utm_medium 包含 video |
+| 11 | Organic Search | 搜索来源 |
+| 12 | Email | 邮件来源或 utm 参数包含 email 关键词 |
+| 13 | Affiliates | utm_medium == "affiliate" |
+| 14 | Audio | utm_medium == "audio" |
+| 15 | SMS | utm_source/utm_medium == "sms" |
+| 16 | Mobile Push Notifications | utm_medium 包含 push/mobile/notification 或 source == firebase |
+| 17 | Referral | utm_medium 为 referral/app/link 或有 source |
+| 18 | Direct | 其他所有情况 |
+
+**注意：** 此处共 17 种显式分类 + 1 个默认 Direct，共 18 个可返回值（SMS 被两个条件检查）。
+
+**5. 来源类别 Dictionary**
+
+ClickHouse 中创建了两个 Dictionary 用于来源分类：
+
+- `acquisition_channel_source_category_dict`：来源 → 类别（SEARCH/SOCIAL/SHOPPING/VIDEO/EMAIL）
+- `acquisition_channel_paid_sources_dict`：付费来源集合
 
 **自定义来源类别扩展：**
 `lib/plausible/ingestion/acquisition.ex:20-40`
@@ -399,52 +462,15 @@ end
   {"chatgpt.com", "SOURCE_CATEGORY_SEARCH"},    # AI 搜索
   {"brave", "SOURCE_CATEGORY_SEARCH"},
   {"discord", "SOURCE_CATEGORY_SOCIAL"},
+  {"temu.com", "SOURCE_CATEGORY_SHOPPING"},
   # ...
 ]
 ```
 
 **基础数据源：** `priv/ga4-source-categories.csv`（来自 Google Analytics 4 官方分类）
 
-### 4.2 流量来源数据展示
-
-#### 前端组件
-`assets/js/dashboard/stats/sources/index.js`
-
-**四个视图模式：**
-
-1. **Channels（渠道）**
-   - 维度：`visit:channel`
-   - 展示：Organic Search, Direct, Paid Search, Social, Referral, Email 等
-
-2. **Sources（来源）**
-   - 维度：`visit:source`
-   - 展示来源网站图标（favicon）
-   - 点击 Google 来源会显示搜索关键词（需配置 Google Search Console）
-   - 点击其他来源下钻到具体 referrer 页面
-
-3. **UTM Campaigns（广告系列）**
-   - 下拉菜单包含：utm_medium, utm_source, utm_campaign, utm_content, utm_term
-
-#### 后端 API
-`lib/plausible_web/controllers/api/stats_controller.ex:59-612`
-
-| 接口 | 维度 | 说明 |
-|------|------|------|
-| `GET /sources` | `visit:source` | 来源列表 |
-| `GET /channels` | `visit:channel` | 渠道列表 |
-| `GET /utm_mediums` | `visit:utm_medium` | UTM 媒介 |
-| `GET /utm_sources` | `visit:utm_source` | UTM 来源 |
-| `GET /utm_campaigns` | `visit:utm_campaign` | UTM 广告系列 |
-| `GET /utm_contents` | `visit:utm_content` | UTM 内容 |
-| `GET /utm_terms` | `visit:utm_term` | UTM 关键词 |
-| `GET /referrers` | `visit:referrer` | 具体引用页面 |
-
-**Google 搜索关键词特殊处理：**
-`lib/plausible_web/controllers/api/stats_controller.ex:526-578`
-
-当 source 为 "Google" 时，调用 Google Search Console API 获取搜索关键词，而非使用 Plausible 自身数据。
-
-**Click ID 自动推断：** `lib/plausible/ingestion/event.ex:312-322`
+**6. Click ID 自动推断**
+`lib/plausible/ingestion/event.ex:312-322`
 
 ```elixir
 defp maybe_infer_medium(%__MODULE__{} = event, _context) do
@@ -460,6 +486,121 @@ end
 ```
 
 支持的 Click ID 参数：`gclid`, `gbraid`, `wbraid`, `msclkid`, `fbclid`, `twclid`
+
+### 4.2 流量来源数据展示
+
+#### 前端组件
+`assets/js/dashboard/stats/sources/index.js`
+
+**四个视图模式：**
+
+1. **Channels（渠道）**
+   - 维度：`visit:channel`
+   - 展示：Organic Search, Direct, Paid Search, Paid Other, Social, Referral, Email 等
+
+2. **Sources（来源）**
+   - 维度：`visit:source`
+   - 展示来源网站图标（favicon）
+   - 支持下钻功能
+
+3. **UTM 参数**
+   - 下拉菜单包含：utm_medium, utm_source, utm_campaign, utm_content, utm_term
+
+#### 完整下钻路径
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    流量来源视图                             │
+├─────────────────────────────────────────────────────────────┤
+│  Channels(渠道)  │  Sources(来源)  │  UTM(参数)              │
+├──────────────────┼─────────────────┼────────────────────────┤
+│                  │ ┌─────────────┐ │                        │
+│                  │ │  Google     │ │── 点击 Google 来源    │
+│                  │ └──────┬──────┘ │   (特殊处理)           │
+│                  │        │        │                        │
+│                  │        ▼        │                        │
+│                  │ ┌─────────────┐ │   Search Console API  │
+│                  │ │ 关键词列表  │ │   → 搜索关键词         │
+│                  │ └─────────────┘ │                        │
+│                  │                 │                        │
+│                  │ ┌─────────────┐ │                        │
+│                  │ │  Twitter    │ │── 点击其他来源         │
+│                  │ └──────┬──────┘ │   (通用路径)           │
+│                  │        │        │                        │
+│                  │        ▼        │                        │
+│                  │ ┌─────────────┐ │   /referrers/:source  │
+│                  │ │ 具体referrer│ │   → 引用域名列表       │
+│                  │ │ (twitter.com │ │                        │
+│                  │ │  github.com) │ │                        │
+│                  │ └─────────────┘ │                        │
+└──────────────────┴─────────────────┴────────────────────────┘
+```
+
+**1. Sources 列表组件**
+`assets/js/dashboard/stats/sources/index.js`
+
+点击某个来源后，如果是 "Google"，会有特殊处理；其他来源跳转到 ReferrerDrilldownModal。
+
+**2. Referrer 下钻模态框**
+`assets/js/dashboard/stats/modals/referrer-drilldown.js`
+
+```javascript
+const reportInfo = {
+  title: 'Referrer drilldown',
+  dimension: 'referrer',
+  endpoint: url.apiPath(site, `/referrers/${url.maybeEncodeRouteParam(referrer)}`),
+  dimensionLabel: 'Referrer',
+  defaultOrder: ['visitors', SortDirection.desc]
+}
+```
+
+**3. 后端下钻 API**
+`lib/plausible_web/controllers/api/stats_controller.ex:526-612`
+
+**Google 来源特殊处理：**
+```elixir
+def referrer_drilldown(conn, %{"referrer" => "Google"} = params) do
+  # 调用 Google Search Console API 获取搜索关键词
+  search_terms = google_api().fetch_stats(site, query, pagination, search)
+  # ... 返回关键词列表
+end
+```
+
+**其他来源通用处理：**
+```elixir
+def referrer_drilldown(conn, %{"referrer" => referrer} = params) do
+  query =
+    Query.from(site, params, debug_metadata: debug_metadata(conn))
+    |> Query.add_filter([:is, "visit:source", [referrer]])  # 按来源过滤
+  
+  # 列出该来源下的所有具体 referrer 域名
+  %{results: results, meta: meta} = Stats.breakdown(site, query, metrics, pagination)
+end
+```
+
+#### 后端 API 完整列表
+`lib/plausible_web/controllers/api/stats_controller.ex:59-612`
+
+| 接口 | 维度 | 说明 |
+|------|------|------|
+| `GET /sources` | `visit:source` | 来源列表（顶层） |
+| `GET /channels` | `visit:channel` | 渠道列表（顶层） |
+| `GET /referrers/:source` | `visit:referrer` | 来源下钻 - 具体引用域名 |
+| `GET /utm_mediums` | `visit:utm_medium` | UTM 媒介 |
+| `GET /utm_sources` | `visit:utm_source` | UTM 来源 |
+| `GET /utm_campaigns` | `visit:utm_campaign` | UTM 广告系列 |
+| `GET /utm_contents` | `visit:utm_content` | UTM 内容 |
+| `GET /utm_terms` | `visit:utm_term` | UTM 关键词 |
+
+**下钻路径示例：**
+```
+/GET /sources
+  ↓ 点击 "Twitter"
+  ├─ source == "Google" → 调用 Search Console API 返回关键词
+  └─ source != "Google" → GET /referrers/Twitter → 返回 twitter.com 等具体域名
+       ↓ 点击某个域名
+       └─ 应用过滤器 "referrer is twitter.com" 到整个仪表盘
+```
 
 ---
 
@@ -496,7 +637,10 @@ field :utm_term, :string
 field :acquisition_channel, Ch, type: "LowCardinality(String)", writable: :never
 ```
 
-**注意：** `acquisition_channel` 是 `writable: :never` 的 ALIAS 列，在查询时根据其他字段动态计算。
+**关键点：**
+- `acquisition_channel` 是 `writable: :never` 且是 **MATERIALIZED 列**
+- 写入时由 ClickHouse 自动计算并持久化
+- 写入数据时排除该字段（`fields_to_ignore()`）
 
 ### 5.2 维度名称映射
 
@@ -515,7 +659,7 @@ field :acquisition_channel, Ch, type: "LowCardinality(String)", writable: :never
 | `visit:browser` | `t.browser` |
 | `visit:browser_version` | `t.browser_version` |
 | `visit:source` | `t.source`（即 referrer_source） |
-| `visit:channel` | `t.acquisition_channel` |
+| `visit:channel` | `t.acquisition_channel`（MATERIALIZED，已存储） |
 | `visit:referrer` | `t.referrer` |
 | `visit:utm_*` | `t.utm_*` |
 
@@ -523,6 +667,21 @@ field :acquisition_channel, Ch, type: "LowCardinality(String)", writable: :never
 - Source: `"Direct / None"`
 - Channel: `"Direct"`
 - 其他: `"(not set)"`
+
+### 5.3 ClickHouse Dictionary 与函数
+
+**1. 地理位置 Dictionary**
+- `location_data_dictionary`：代码 → 名称映射
+
+**2. 渠道分类 Dictionary（ClickHouse 端）**
+- `acquisition_channel_source_category_dict`：来源 → 类别
+- `acquisition_channel_paid_sources_dict`：付费来源集合
+
+**3. 渠道推断函数（ClickHouse 端）**
+```sql
+acquisition_channel(referrer_source, utm_medium, utm_campaign, utm_source, click_id_param)
+  └─→ 调用 acquisition_channel_lowered（转小写后匹配）
+```
 
 ---
 
@@ -567,8 +726,8 @@ defp pipeline() do
     drop_shield_rule_country: &drop_shield_rule_country/2,
     put_user_agent: &put_user_agent/2,             # ← 设备类型
     put_basic_info: &put_basic_info/2,
-    put_source_info: &put_source_info/2,           # ← 流量来源
-    maybe_infer_medium: &maybe_infer_medium/2,     # ← 推断 medium
+    put_source_info: &put_source_info/2,           # ← 流量来源 (Source + UTM)
+    maybe_infer_medium: &maybe_infer_medium/2,     # ← 推断 medium (Click ID)
     put_props: &put_props/2,
     put_revenue: &put_revenue/2,
     put_salts: &put_salts/2,
@@ -577,6 +736,28 @@ defp pipeline() do
     register_session: &register_session/2
   ]
 end
+```
+
+**注意：** Ingestion 阶段只解析 Source 和 UTM 参数，不解析 Channel。Channel 由 ClickHouse 的 MATERIALIZED 列在写入时自动计算。
+
+### 6.3 渠道计算的完整链路
+
+```
+Tracker 发送请求
+    ↓
+Ingestion Pipeline
+    ├─ put_source_info → 写入 referrer_source, utm_*, click_id_param
+    └─ 不计算 acquisition_channel
+    ↓
+WriteBuffer 写入 ClickHouse
+    └─ 排除 acquisition_channel 字段 (fields_to_ignore)
+    ↓
+ClickHouse MATERIALIZED 列触发
+    ├─ 调用 acquisition_channel() 函数
+    ├─ 使用 Dictionary 进行来源分类匹配
+    └─ 计算结果持久化存储
+    ↓
+后续查询直接读取已存储的 acquisition_channel 值
 ```
 
 ---
@@ -589,9 +770,11 @@ end
 | `lib/plausible/geo.ex` | Geo 数据库加载 API |
 | `lib/plausible/ingestion/event.ex` | 设备类型 + 来源解析主入口 |
 | `lib/plausible/ingestion/source.ex` | 流量来源（Source）解析 |
-| `lib/plausible/ingestion/acquisition.ex` | 流量渠道（Channel）推断 |
+| `lib/plausible/ingestion/acquisition.ex` | Channel 推断逻辑（Elixir 端，供迁移和测试用） |
+| `lib/plausible/ingestion/write_buffer.ex` | 写入缓冲区，排除 acquisition_channel |
 | `lib/plausible/ingestion/request.ex` | HTTP 请求构建 |
 | `lib/plausible/clickhouse_session_v2.ex` | Session 存储模型 |
+| `lib/plausible/data_migration/acquisition_channel.ex` | 渠道字段数据迁移 |
 | `lib/plausible/stats/sql/expression.ex` | SQL 维度/指标表达式 |
 | `lib/plausible/stats/sql/query_builder.ex` | SQL 查询构建 |
 | `lib/plausible/stats/breakdown.ex` | Breakdown 查询封装 |
@@ -599,24 +782,61 @@ end
 | `assets/js/dashboard/stats/locations/index.js` | 地理位置前端展示 |
 | `assets/js/dashboard/stats/devices/index.js` | 设备类型前端展示 |
 | `assets/js/dashboard/stats/sources/index.js` | 流量来源前端展示 |
+| `assets/js/dashboard/stats/modals/referrer-drilldown.js` | 来源下钻模态框 |
 | `priv/ref_inspector/referers.yml` | Referer 解析规则库 |
 | `priv/custom_sources.json` | 自定义来源映射 |
 | `priv/ga4-source-categories.csv` | GA4 来源类别基准 |
+| `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_functions.sql.eex` | ClickHouse 渠道函数定义 |
+| `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_add_materialized_column.sql.eex` | 渠道 MATERIALIZED 列定义 |
 
 ---
 
 ## 8. 总结
 
-三个维度的设计模式高度一致：
+三个维度的设计模式高度一致但各有特点：
 
-1. **摄入时解析**：在数据进入 ClickHouse 之前完成所有解析工作
-2. **规范化存储**：使用代码/ID 存储，而非原始字符串
-3. **查询时映射**：通过 Dictionary/ALIAS 或应用层代码映射为展示名称
-4. **分层展示**：前端使用 Tab 切换不同粒度的视图（国家→地区→城市，浏览器→版本等）
+### 8.1 共同点
+1. **摄入时解析**：在数据进入 ClickHouse 之前完成解析
+2. **规范化存储**：使用代码/ID 或规范化字符串存储
+3. **分层展示**：前端使用 Tab 切换不同粒度的视图
 
-关键技术选择：
+### 8.2 各维度差异
+
+| 维度 | 存储方式 | 计算时机 | 查询方式 |
+|------|---------|---------|---------|
+| **Geo 定位** | 代码存储（country_code 等） | Ingestion 阶段 | Dictionary + ALIAS 列映射名称 |
+| **设备类型** | 直接存储规范化值 | Ingestion 阶段 | 直接查询 |
+| **流量渠道** | MATERIALIZED 列存盘 | **ClickHouse 写入时** | 直接读取已计算值 |
+
+### 8.3 渠道计算的关键设计
+
+`acquisition_channel` 的特殊设计：
+
+1. **计算位置**：不在 Elixir Ingestion 中计算，而在 ClickHouse 写入时通过 MATERIALIZED 列计算
+2. **计算逻辑**：通过 ClickHouse SQL 函数 + Dictionary 实现
+3. **同步机制**：数据迁移脚本会从 Elixir 的 `Plausible.Ingestion.Acquisition` 模块提取规则，同步到 ClickHouse
+4. **优点**：
+   - 数据写入时自动计算，Elixir 端无需关心
+   - 可通过 ClickHouse 函数更新逻辑并 backfill 历史数据
+   - 查询时无需动态计算，性能更好
+
+### 8.4 来源下钻路径
+
+```
+Sources 列表
+    ↓
+    ├─ 点击 "Google"
+    │    └─ Search Console API → 关键词列表
+    │
+    └─ 点击其他来源
+         └─ /referrers/:source → 具体 referrer 域名列表
+              ↓
+              └─ 应用过滤器 "referrer is X" 到仪表盘
+```
+
+### 8.5 关键技术选择
+
 - **地理位置**：MaxMind/DB-IP MMDB + locus 库
 - **设备识别**：UAInspector 库 + 200ms 超时保护 + 缓存
 - **来源识别**：RefInspector 库 + 自定义规则 + UTM 参数
-- **渠道推断**：基于 GA4 分类 + Plausible 自定义扩展
-
+- **渠道推断**：ClickHouse MATERIALIZED 列 + SQL 函数 + Dictionary
