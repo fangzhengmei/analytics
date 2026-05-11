@@ -1,50 +1,47 @@
-# Plausible Analytics 维度解析与展示分析报告
-
-## 目录
-1. [概述](#1-概述)
-2. [Geo 定位维度](#2-geo-定位维度)
-3. [设备类型维度](#3-设备类型维度)
-4. [流量来源维度](#4-流量来源维度)
-5. [数据存储模型](#5-数据存储模型)
-6. [查询与展示流程](#6-查询与展示流程)
-7. [关键文件索引](#7-关键文件索引)
-
----
-
-## 1. 概述
-
-Plausible Analytics 采用完整的数据管道来处理三个核心维度数据：
-
-**完整处理流程：**
-```
-Tracker Script → HTTP Request → Ingestion Pipeline → ClickHouse Storage 
-    → SQL Query Builder → API Response → React Dashboard
-```
-
-三个维度的解析均在 **数据摄入阶段（Ingestion）** 完成，然后以规范化的字段存储到 ClickHouse 中，查询时直接使用已解析的字段进行聚合。
+﻿# Plausible Analytics 缁村害瑙ｆ瀽涓庡睍绀哄垎鏋愭姤鍛?
+## 鐩綍
+1. [姒傝堪](#1-姒傝堪)
+2. [Geo 瀹氫綅缁村害](#2-geo-瀹氫綅缁村害)
+3. [璁惧绫诲瀷缁村害](#3-璁惧绫诲瀷缁村害)
+4. [娴侀噺鏉ユ簮缁村害](#4-娴侀噺鏉ユ簮缁村害)
+5. [鏁版嵁瀛樺偍妯″瀷](#5-鏁版嵁瀛樺偍妯″瀷)
+6. [鏌ヨ涓庡睍绀烘祦绋媇(#6-鏌ヨ涓庡睍绀烘祦绋?
+7. [鍏抽敭鏂囦欢绱㈠紩](#7-鍏抽敭鏂囦欢绱㈠紩)
 
 ---
 
-## 2. Geo 定位维度
+## 1. 姒傝堪
 
-### 2.1 地理位置解析机制
-
-**核心模块：** `lib/plausible/ingestion/geolocation.ex`
-
-#### 地理位置数据源
-使用 `locus` 库加载 MaxMind 或 DB-IP 的 MMDB 数据库文件：
-- `lib/plausible/geo.ex:44-74` 提供数据库加载 API
-- 支持两种模式：
-  1. **本地文件模式**：通过 `:path` 参数指定 `.mmdb` 文件
-  2. **MaxMind 授权模式**：通过 `:license_key` + `:edition` 从 MaxMind 下载
-
-#### 地理数据解析流程
-
+Plausible Analytics 閲囩敤瀹屾暣鐨勬暟鎹閬撴潵澶勭悊涓変釜鏍稿績缁村害鏁版嵁锛?
+**瀹屾暣澶勭悊娴佺▼锛?*
 ```
-IP地址 → Plausible.Geo.lookup(ip) → MMDB查询 → 结构化地理信息
+Tracker Script 鈫?HTTP Request 鈫?Ingestion Pipeline 鈫?ClickHouse Storage 
+    鈫?SQL Query Builder 鈫?API Response 鈫?React Dashboard
 ```
 
-**关键处理步骤：** `lib/plausible/ingestion/geolocation.ex:4-52`
+涓変釜缁村害鐨勬暟鎹鐞嗗垎涓轰袱涓樁娈碉細
+- **Geo 瀹氫綅** 鍜?**璁惧绫诲瀷** 鍦?**鏁版嵁鎽勫叆闃舵锛圛ngestion锛?* 瀹屾垚瑙ｆ瀽
+- **娴侀噺鏉ユ簮锛圫ource锛?* 鍦ㄦ憚鍏ラ樁娈佃В鏋愶紝浣?**娴侀噺娓犻亾锛圕hannel锛?* 鍦?**ClickHouse 鍐欏叆鏃?* 閫氳繃 MATERIALIZED 鍒楄嚜鍔ㄨ绠?
+瑙ｆ瀽鍚庝互瑙勮寖鍖栫殑瀛楁瀛樺偍鍒?ClickHouse 涓紝鏌ヨ鏃剁洿鎺ヤ娇鐢ㄥ凡璁＄畻鐨勫瓧娈佃繘琛岃仛鍚堛€?
+---
+
+## 2. Geo 瀹氫綅缁村害
+
+### 2.1 鍦扮悊浣嶇疆瑙ｆ瀽鏈哄埗
+
+**鏍稿績妯″潡锛?* `lib/plausible/ingestion/geolocation.ex`
+
+#### 鍦扮悊浣嶇疆鏁版嵁婧?浣跨敤 `locus` 搴撳姞杞?MaxMind 鎴?DB-IP 鐨?MMDB 鏁版嵁搴撴枃浠讹細
+- `lib/plausible/geo.ex:44-74` 鎻愪緵鏁版嵁搴撳姞杞?API
+- 鏀寔涓ょ妯″紡锛?  1. **鏈湴鏂囦欢妯″紡**锛氶€氳繃 `:path` 鍙傛暟鎸囧畾 `.mmdb` 鏂囦欢
+  2. **MaxMind 鎺堟潈妯″紡**锛氶€氳繃 `:license_key` + `:edition` 浠?MaxMind 涓嬭浇
+
+#### 鍦扮悊鏁版嵁瑙ｆ瀽娴佺▼
+
+```
+IP鍦板潃 鈫?Plausible.Geo.lookup(ip) 鈫?MMDB鏌ヨ 鈫?缁撴瀯鍖栧湴鐞嗕俊鎭?```
+
+**鍏抽敭澶勭悊姝ラ锛?* `lib/plausible/ingestion/geolocation.ex:4-52`
 
 ```elixir
 def lookup(ip_address) do
@@ -52,29 +49,27 @@ def lookup(ip_address) do
     %{} = entry ->
       %{
         country_code: entry |> get_in(["country", "iso_code"]) |> ignore_unknown_country(),
-        subdivision1_code: subdivision1_code(country_code, entry),  # 一级行政区划
-        subdivision2_code: subdivision2_code(country_code, entry),  # 二级行政区划
-        city_geoname_id: city_geoname_id  # 城市 Geoname ID
+        subdivision1_code: subdivision1_code(country_code, entry),  # 涓€绾ц鏀垮尯鍒?        subdivision2_code: subdivision2_code(country_code, entry),  # 浜岀骇琛屾斂鍖哄垝
+        city_geoname_id: city_geoname_id  # 鍩庡競 Geoname ID
       }
     nil -> nil
   end
 end
 ```
 
-#### 国家代码过滤规则
-特殊国家/地区代码会被过滤掉：
-- `ZZ` - Worldwide（全球）
-- `XX` - Disputed territory（争议地区）
-- `T1` - Tor exit node（Tor 出口节点）
-
-#### 匿名 VPN IP 处理
+#### 鍥藉浠ｇ爜杩囨护瑙勫垯
+鐗规畩鍥藉/鍦板尯浠ｇ爜浼氳杩囨护鎺夛細
+- `ZZ` - Worldwide锛堝叏鐞冿級
+- `XX` - Disputed territory锛堜簤璁湴鍖猴級
+- `T1` - Tor exit node锛圱or 鍑哄彛鑺傜偣锛?
+#### 鍖垮悕 VPN IP 澶勭悊
 `lib/plausible/ingestion/event.ex:324-333`
 
 ```elixir
 defp put_geolocation(%__MODULE__{} = event, _context) do
   case event.request.ip_classification do
     "anonymous_vpn_ip" ->
-      update_session_attrs(event, %{country_code: "A1"})  # 匿名代理标记为 A1
+      update_session_attrs(event, %{country_code: "A1"})  # 鍖垮悕浠ｇ悊鏍囪涓?A1
     _any ->
       result = Plausible.Ingestion.Geolocation.lookup(event.request.remote_ip) || %{}
       update_session_attrs(event, result)
@@ -82,58 +77,50 @@ defp put_geolocation(%__MODULE__{} = event, _context) do
 end
 ```
 
-**IP 分类来源**：从 HTTP Header `x-plausible-ip-type` 获取，由边缘层（如 Cloudflare）注入。
+**IP 鍒嗙被鏉ユ簮**锛氫粠 HTTP Header `x-plausible-ip-type` 鑾峰彇锛岀敱杈圭紭灞傦紙濡?Cloudflare锛夋敞鍏ャ€?
+### 2.2 鍦扮悊鍚嶇О鏄犲皠
 
-### 2.2 地理名称映射
-
-地理代码（`country_code`, `subdivision_code`, `city_geoname_id`）在查询时通过 **ClickHouse Dictionary** 映射为可读名称。
-
-**位置数据表：** `lib/plausible/clickhouse_location_data.ex`
+鍦扮悊浠ｇ爜锛坄country_code`, `subdivision_code`, `city_geoname_id`锛夊湪鏌ヨ鏃堕€氳繃 **ClickHouse Dictionary** 鏄犲皠涓哄彲璇诲悕绉般€?
+**浣嶇疆鏁版嵁琛細** `lib/plausible/clickhouse_location_data.ex`
 
 ```elixir
 schema "location_data" do
   field :type, Ch, type: "LowCardinality(String)"  # country / region / city
-  field :id, :string                               # 代码/ID
-  field :name, :string                             # 显示名称
+  field :id, :string                               # 浠ｇ爜/ID
+  field :name, :string                             # 鏄剧ず鍚嶇О
 end
 ```
 
-该表通过 `location_data_dictionary` 字典在 ALIAS 列中被间接访问：
-- `sessions_v2.country` → ALIAS 映射到国家名称
-- `sessions_v2.region` → ALIAS 映射到地区名称
-- `sessions_v2.city` → ALIAS 映射到城市名称
+璇ヨ〃閫氳繃 `location_data_dictionary` 瀛楀吀鍦?ALIAS 鍒椾腑琚棿鎺ヨ闂細
+- `sessions_v2.country` 鈫?ALIAS 鏄犲皠鍒板浗瀹跺悕绉?- `sessions_v2.region` 鈫?ALIAS 鏄犲皠鍒板湴鍖哄悕绉?- `sessions_v2.city` 鈫?ALIAS 鏄犲皠鍒板煄甯傚悕绉?
+### 2.3 Geo 鏁版嵁灞曠ず
 
-### 2.3 Geo 数据展示
-
-#### 前端组件
+#### 鍓嶇缁勪欢
 `assets/js/dashboard/stats/locations/index.js`
 
-**展示模式：**
-1. **地图视图（Map）**：使用 `CountriesMap` 组件展示世界地图
-2. **国家列表（Countries）**：列表展示，附带国旗
-3. **地区列表（Regions）**：州/省级别
-4. **城市列表（Cities）**：城市级别
-
-#### 后端 API
+**灞曠ず妯″紡锛?*
+1. **鍦板浘瑙嗗浘锛圡ap锛?*锛氫娇鐢?`CountriesMap` 缁勪欢灞曠ず涓栫晫鍦板浘
+2. **鍥藉鍒楄〃锛圕ountries锛?*锛氬垪琛ㄥ睍绀猴紝闄勫甫鍥芥棗
+3. **鍦板尯鍒楄〃锛圧egions锛?*锛氬窞/鐪佺骇鍒?4. **鍩庡競鍒楄〃锛圕ities锛?*锛氬煄甯傜骇鍒?
+#### 鍚庣 API
 `lib/plausible_web/controllers/api/stats_controller.ex:751-912`
 
-**接口说明：**
+**鎺ュ彛璇存槑锛?*
 
-| 接口 | 维度 | 数据转换 |
+| 鎺ュ彛 | 缁村害 | 鏁版嵁杞崲 |
 |------|------|----------|
-| `GET /countries` | `visit:country` | country_code → name + flag + alpha_3 |
-| `GET /regions` | `visit:region` | subdivision_code → name + country_flag |
-| `GET /cities` | `visit:city` | geoname_id → name + country_flag |
+| `GET /countries` | `visit:country` | country_code 鈫?name + flag + alpha_3 |
+| `GET /regions` | `visit:region` | subdivision_code 鈫?name + country_flag |
+| `GET /cities` | `visit:city` | geoname_id 鈫?name + country_flag |
 
-**国家信息获取：** 使用 `Location` 库（基于 `:location` hex 包）获取国家的详细信息：
-- 国家名称（多语言支持）
-- 国旗 emoji
-- Alpha-2 / Alpha-3 代码
+**鍥藉淇℃伅鑾峰彇锛?* 浣跨敤 `Location` 搴擄紙鍩轰簬 `:location` hex 鍖咃級鑾峰彇鍥藉鐨勮缁嗕俊鎭細
+- 鍥藉鍚嶇О锛堝璇█鏀寔锛?- 鍥芥棗 emoji
+- Alpha-2 / Alpha-3 浠ｇ爜
 
-### 2.4 Geo 数据屏蔽规则
+### 2.4 Geo 鏁版嵁灞忚斀瑙勫垯
 `lib/plausible/ingestion/event.ex:335-360`
 
-支持基于国家代码的屏蔽（Shield 功能）：
+鏀寔鍩轰簬鍥藉浠ｇ爜鐨勫睆钄斤紙Shield 鍔熻兘锛夛細
 ```elixir
 defp drop_shield_rule_country(event, _context) do
   if Plausible.Shields.country_blocked?(domain, country_code) do
@@ -146,23 +133,22 @@ end
 
 ---
 
-## 3. 设备类型维度
+## 3. 璁惧绫诲瀷缁村害
 
-### 3.1 User Agent 解析机制
+### 3.1 User Agent 瑙ｆ瀽鏈哄埗
 
-**核心模块：** `lib/plausible/ingestion/event.ex:256-551`
+**鏍稿績妯″潡锛?* `lib/plausible/ingestion/event.ex:256-551`
 
-使用 `UAInspector` 库进行 User Agent 解析，配合异步任务和超时保护。
-
-#### UA 解析流程
+浣跨敤 `UAInspector` 搴撹繘琛?User Agent 瑙ｆ瀽锛岄厤鍚堝紓姝ヤ换鍔″拰瓒呮椂淇濇姢銆?
+#### UA 瑙ｆ瀽娴佺▼
 ```
-User-Agent Header → UAInspector.parse() → {os, browser, device}
+User-Agent Header 鈫?UAInspector.parse() 鈫?{os, browser, device}
 ```
 
-**关键实现：** `lib/plausible/ingestion/event.ex:444-470`
+**鍏抽敭瀹炵幇锛?* `lib/plausible/ingestion/event.ex:444-470`
 
 ```elixir
-@parse_user_agent_timeout 200  # 200ms 超时保护
+@parse_user_agent_timeout 200  # 200ms 瓒呮椂淇濇姢
 
 defp parse_user_agent_safe(user_agent) do
   task = Task.Supervisor.async_nolink(
@@ -179,18 +165,16 @@ defp parse_user_agent_safe(user_agent) do
 end
 ```
 
-**缓存机制：** 解析结果会缓存在 `:user_agents` Cache 中，避免重复解析。
-
-#### Bot 检测与过滤
+**缂撳瓨鏈哄埗锛?* 瑙ｆ瀽缁撴灉浼氱紦瀛樺湪 `:user_agents` Cache 涓紝閬垮厤閲嶅瑙ｆ瀽銆?
+#### Bot 妫€娴嬩笌杩囨护
 `lib/plausible/ingestion/event.ex:256-276`
 
-以下 User Agent 会被标记为 bot 并丢弃：
-1. `UAInspector.Result.Bot{}` - 明确的机器人
-2. `Headless Chrome` - 无头浏览器
+浠ヤ笅 User Agent 浼氳鏍囪涓?bot 骞朵涪寮冿細
+1. `UAInspector.Result.Bot{}` - 鏄庣‘鐨勬満鍣ㄤ汉
+2. `Headless Chrome` - 鏃犲ご娴忚鍣?
+#### 璁惧瀛楁瑙ｆ瀽
 
-#### 设备字段解析
-
-**操作系统（Operating System）：** `lib/plausible/ingestion/event.ex:526-531`
+**鎿嶄綔绯荤粺锛圤perating System锛夛細** `lib/plausible/ingestion/event.ex:526-531`
 ```elixir
 defp os_name(ua) do
   case ua.os do
@@ -200,10 +184,10 @@ defp os_name(ua) do
 end
 ```
 
-**浏览器（Browser）：** `lib/plausible/ingestion/event.ex:472-488`
+**娴忚鍣紙Browser锛夛細** `lib/plausible/ingestion/event.ex:472-488`
 
-移动端浏览器会被规范化：
-| 原始名称 | 规范化后 |
+绉诲姩绔祻瑙堝櫒浼氳瑙勮寖鍖栵細
+| 鍘熷鍚嶇О | 瑙勮寖鍖栧悗 |
 |---------|---------|
 | Mobile Safari | Safari |
 | Chrome Mobile | Chrome |
@@ -211,10 +195,9 @@ end
 | Firefox Mobile | Firefox |
 | Chrome Webview / mobile app | Mobile App |
 
-**屏幕尺寸/设备类型（Screen Size）：** `lib/plausible/ingestion/event.ex:490-516`
+**灞忓箷灏哄/璁惧绫诲瀷锛圫creen Size锛夛細** `lib/plausible/ingestion/event.ex:490-516`
 
-基于 `UAInspector.Result.Device.type` 分类：
-
+鍩轰簬 `UAInspector.Result.Device.type` 鍒嗙被锛?
 ```elixir
 @mobile_types ["smartphone", "feature phone", "portable media player", 
                "phablet", "wearable", "camera"]
@@ -231,49 +214,47 @@ defp screen_size(ua) do
 end
 ```
 
-**版本号处理：** `lib/plausible/ingestion/event.ex:540-551`
+**鐗堟湰鍙峰鐞嗭細** `lib/plausible/ingestion/event.ex:540-551`
 ```elixir
 defp major_minor(version) do
   version
   |> String.split(".")
-  |> Enum.take(2)      # 只取主版本.次版本
-  |> Enum.join(".")
+  |> Enum.take(2)      # 鍙彇涓荤増鏈?娆＄増鏈?  |> Enum.join(".")
 end
 ```
 
-### 3.2 设备数据展示
+### 3.2 璁惧鏁版嵁灞曠ず
 
-#### 前端组件
+#### 鍓嶇缁勪欢
 `assets/js/dashboard/stats/devices/index.js`
 
-**三个 Tab 视图：**
+**涓変釜 Tab 瑙嗗浘锛?*
 
-1. **浏览器（Browsers）**
-   - 维度：`visit:browser`
-   - 显示浏览器图标（Chrome, Safari, Firefox, Edge 等）
-   - 点击可下钻到版本明细
+1. **娴忚鍣紙Browsers锛?*
+   - 缁村害锛歚visit:browser`
+   - 鏄剧ず娴忚鍣ㄥ浘鏍囷紙Chrome, Safari, Firefox, Edge 绛夛級
+   - 鐐瑰嚮鍙笅閽诲埌鐗堟湰鏄庣粏
 
-2. **操作系统（Operating Systems）**
-   - 维度：`visit:os`
-   - 显示 OS 图标（Windows, macOS, iOS, Android 等）
-   - 点击可下钻到版本明细
+2. **鎿嶄綔绯荤粺锛圤perating Systems锛?*
+   - 缁村害锛歚visit:os`
+   - 鏄剧ず OS 鍥炬爣锛圵indows, macOS, iOS, Android 绛夛級
+   - 鐐瑰嚮鍙笅閽诲埌鐗堟湰鏄庣粏
 
-3. **设备类型（Devices）**
-   - 维度：`visit:device`（即 screen_size）
-   - 显示 SVG 图标：Mobile / Tablet / Desktop
+3. **璁惧绫诲瀷锛圖evices锛?*
+   - 缁村害锛歚visit:device`锛堝嵆 screen_size锛?   - 鏄剧ず SVG 鍥炬爣锛歁obile / Tablet / Desktop
 
-#### 后端 API
+#### 鍚庣 API
 `lib/plausible_web/controllers/api/stats_controller.ex:915-1121`
 
-| 接口 | 维度 | 说明 |
+| 鎺ュ彛 | 缁村害 | 璇存槑 |
 |------|------|------|
-| `GET /browsers` | `visit:browser` | 浏览器列表 |
-| `GET /browser-versions` | `visit:browser_version` | 版本明细（同时返回 browser 分组） |
-| `GET /operating-systems` | `visit:os` | 操作系统列表 |
-| `GET /operating-system-versions` | `visit:os_version` | 系统版本明细 |
-| `GET /screen-sizes` | `visit:device` | 设备类型（Mobile/Tablet/Desktop） |
+| `GET /browsers` | `visit:browser` | 娴忚鍣ㄥ垪琛?|
+| `GET /browser-versions` | `visit:browser_version` | 鐗堟湰鏄庣粏锛堝悓鏃惰繑鍥?browser 鍒嗙粍锛?|
+| `GET /operating-systems` | `visit:os` | 鎿嶄綔绯荤粺鍒楄〃 |
+| `GET /operating-system-versions` | `visit:os_version` | 绯荤粺鐗堟湰鏄庣粏 |
+| `GET /screen-sizes` | `visit:device` | 璁惧绫诲瀷锛圡obile/Tablet/Desktop锛?|
 
-**版本查询特殊处理：** `lib/plausible/stats/breakdown.ex:135-139`
+**鐗堟湰鏌ヨ鐗规畩澶勭悊锛?* `lib/plausible/stats/breakdown.ex:135-139`
 ```elixir
 def transform_dimensions("visit:browser_version"),
   do: ["visit:browser", "visit:browser_version"]
@@ -281,20 +262,18 @@ def transform_dimensions("visit:browser_version"),
 def transform_dimensions("visit:os_version"), 
   do: ["visit:os", "visit:os_version"]
 ```
-查询版本时会同时查询主名称，用于前端显示组合名称。
-
+鏌ヨ鐗堟湰鏃朵細鍚屾椂鏌ヨ涓诲悕绉帮紝鐢ㄤ簬鍓嶇鏄剧ず缁勫悎鍚嶇О銆?
 ---
 
-## 4. 流量来源维度
+## 4. 娴侀噺鏉ユ簮缁村害
 
-### 4.1 来源解析机制
+### 4.1 鏉ユ簮瑙ｆ瀽鏈哄埗
 
-**核心模块：** 
-- `lib/plausible/ingestion/source.ex` - Source 解析
-- `lib/plausible/ingestion/acquisition.ex` - Channel 推断
+**鏍稿績妯″潡锛?* 
+- `lib/plausible/ingestion/source.ex` - Source 瑙ｆ瀽
+- `lib/plausible/ingestion/acquisition.ex` - Channel 鎺ㄦ柇
 
-#### 来源解析优先级
-`lib/plausible/ingestion/source.ex:66-80`
+#### 鏉ユ簮瑙ｆ瀽浼樺厛绾?`lib/plausible/ingestion/source.ex:66-80`
 
 ```elixir
 def resolve(request) do
@@ -305,59 +284,48 @@ def resolve(request) do
 
   source =
     cond do
-      tagged_source -> tagged_source                           # 1. UTM 参数优先
-      has_valid_referral?(request) -> parse(request.referrer)  # 2. Referer 头
-      true -> nil
+      tagged_source -> tagged_source                           # 1. UTM 鍙傛暟浼樺厛
+      has_valid_referral?(request) -> parse(request.referrer)  # 2. Referer 澶?      true -> nil
     end
 
-  find_mapping(source)  # 3. 规范化映射
-end
+  find_mapping(source)  # 3. 瑙勮寖鍖栨槧灏?end
 ```
 
-#### Referer 解析
+#### Referer 瑙ｆ瀽
 `lib/plausible/ingestion/source.ex:82-100`
 
-使用 `RefInspector` 库解析 Referer：
-```elixir
+浣跨敤 `RefInspector` 搴撹В鏋?Referer锛?```elixir
 def parse(ref) do
   case RefInspector.parse(ref).source do
     :unknown ->
       uri = URI.parse(String.trim(ref))
-      format_referrer_host(uri)   # 未知来源用域名
-    source ->
-      source                      # 已知来源（如 "Google"）
-  end
+      format_referrer_host(uri)   # 鏈煡鏉ユ簮鐢ㄥ煙鍚?    source ->
+      source                      # 宸茬煡鏉ユ簮锛堝 "Google"锛?  end
 end
 ```
 
-**来源规范化映射：**
-- 内置 `RefInspector` 数据库（`priv/ref_inspector/referers.yml`）
-- 自定义扩展 `priv/custom_sources.json`
-- 支持大小写不敏感匹配
+**鏉ユ簮瑙勮寖鍖栨槧灏勶細**
+- 鍐呯疆 `RefInspector` 鏁版嵁搴擄紙`priv/ref_inspector/referers.yml`锛?- 鑷畾涔夋墿灞?`priv/custom_sources.json`
+- 鏀寔澶у皬鍐欎笉鏁忔劅鍖归厤
 
-**自定义来源示例：**
-| 缩写/变体 | 规范化后 |
+**鑷畾涔夋潵婧愮ず渚嬶細**
+| 缂╁啓/鍙樹綋 | 瑙勮寖鍖栧悗 |
 |----------|---------|
 | ig | Instagram |
 | adwords | Google |
 | yt-ads | YouTube |
 
-#### 有效 Referer 检查
-`lib/plausible/ingestion/source.ex:110-124`
+#### 鏈夋晥 Referer 妫€鏌?`lib/plausible/ingestion/source.ex:110-124`
 
-必须满足以下条件才认为是有效引用：
-1. Scheme 为 `http` / `https` / `android-app`
-2. Host 不为空
-3. **不是内部域名**（与当前站点 hostname 对比）
-4. **不是 localhost**
+蹇呴』婊¤冻浠ヤ笅鏉′欢鎵嶈涓烘槸鏈夋晥寮曠敤锛?1. Scheme 涓?`http` / `https` / `android-app`
+2. Host 涓嶄负绌?3. **涓嶆槸鍐呴儴鍩熷悕**锛堜笌褰撳墠绔欑偣 hostname 瀵规瘮锛?4. **涓嶆槸 localhost**
 
-#### 流量获取渠道推断
+#### 娴侀噺鑾峰彇娓犻亾鎺ㄦ柇
 
-**核心机制：MATERIALIZED 列 + ClickHouse 函数**
+**鏍稿績鏈哄埗锛歁ATERIALIZED 鍒?+ ClickHouse 鍑芥暟**
 
-`acquisition_channel` 是 **MATERIALIZED 列**，在数据写入时由 ClickHouse 自动计算并持久化存储。
-
-**1. ClickHouse 函数定义**
+`acquisition_channel` 鏄?**MATERIALIZED 鍒?*锛屽湪鏁版嵁鍐欏叆鏃剁敱 ClickHouse 鑷姩璁＄畻骞舵寔涔呭寲瀛樺偍銆?
+**1. ClickHouse 鍑芥暟瀹氫箟**
 `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_functions.sql.eex:198-230`
 
 ```sql
@@ -396,7 +364,7 @@ CREATE OR REPLACE FUNCTION acquisition_channel_lowered AS
     );
 ```
 
-**2. 表列定义 - MATERIALIZED**
+**2. 琛ㄥ垪瀹氫箟 - MATERIALIZED**
 `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_add_materialized_column.sql.eex:1-4`
 
 ```sql
@@ -405,48 +373,43 @@ ADD COLUMN IF NOT EXISTS acquisition_channel LowCardinality(String)
 MATERIALIZED acquisition_channel(referrer_source, utm_medium, utm_campaign, utm_source, click_id_param)
 ```
 
-**3. 写入时排除**
+**3. 鍐欏叆鏃舵帓闄?*
 `lib/plausible/ingestion/write_buffer.ex:153`
 
 ```elixir
 defp fields_to_ignore(), do: [:acquisition_channel, :interactive?]
 ```
 
-写入时不包含 `acquisition_channel` 字段，ClickHouse 会根据行数据自动计算并存盘。
+鍐欏叆鏃朵笉鍖呭惈 `acquisition_channel` 瀛楁锛孋lickHouse 浼氭牴鎹鏁版嵁鑷姩璁＄畻骞跺瓨鐩樸€?
+**4. 娓犻亾鍒嗙被瀹屾暣鍒楄〃锛堜紭鍏堢骇浠庨珮鍒颁綆锛屽叡 19 绫伙級**
 
-**4. 渠道分类完整列表（优先级从高到低，共 19 类）**
-
-| 序号 | 渠道 | 条件 |
+| 搴忓彿 | 娓犻亾 | 鏉′欢 |
 |------|------|------|
-| 1 | Cross-network | utm_campaign 包含 "cross-network" |
+| 1 | Cross-network | utm_campaign 鍖呭惈 "cross-network" |
 | 2 | Display | utm_medium IN ('display', 'banner', 'expandable', 'interstitial', 'cpm') |
-| 3 | Paid Shopping | 购物来源 + 付费 medium 或 shopping campaign |
-| 4 | Paid Search | 搜索来源 + 付费 medium/utm_source 或 gclid/msclkid |
-| 5 | Paid Social | 社交来源 + 付费 medium/utm_source |
-| 6 | Paid Video | 视频来源 + 付费 medium/utm_source |
-| 7 | **Paid Other** | utm_medium 匹配 `^(.*cp.*\|ppc\|retargeting\|paid.*)$` |
-| 8 | Organic Shopping | 购物来源或 shopping campaign |
-| 9 | Organic Social | 社交来源或 utm_medium 包含 social |
-| 10 | Organic Video | 视频来源或 utm_medium 包含 video |
-| 11 | Organic Search | 搜索来源 |
-| 12 | Email | 邮件来源或 utm 参数包含 email 关键词 |
+| 3 | Paid Shopping | 璐墿鏉ユ簮 + 浠樿垂 medium 鎴?shopping campaign |
+| 4 | Paid Search | 鎼滅储鏉ユ簮 + 浠樿垂 medium/utm_source 鎴?gclid/msclkid |
+| 5 | Paid Social | 绀句氦鏉ユ簮 + 浠樿垂 medium/utm_source |
+| 6 | Paid Video | 瑙嗛鏉ユ簮 + 浠樿垂 medium/utm_source |
+| 7 | **Paid Other** | utm_medium 鍖归厤 `^(.*cp.*\|ppc\|retargeting\|paid.*)$` |
+| 8 | Organic Shopping | 璐墿鏉ユ簮鎴?shopping campaign |
+| 9 | Organic Social | 绀句氦鏉ユ簮鎴?utm_medium 鍖呭惈 social |
+| 10 | Organic Video | 瑙嗛鏉ユ簮鎴?utm_medium 鍖呭惈 video |
+| 11 | Organic Search | 鎼滅储鏉ユ簮 |
+| 12 | Email | 閭欢鏉ユ簮鎴?utm 鍙傛暟鍖呭惈 email 鍏抽敭璇?|
 | 13 | Affiliates | utm_medium == "affiliate" |
 | 14 | Audio | utm_medium == "audio" |
 | 15 | SMS | utm_source/utm_medium == "sms" |
-| 16 | Mobile Push Notifications | utm_medium 包含 push/mobile/notification 或 source == firebase |
-| 17 | Referral | utm_medium 为 referral/app/link 或有 source |
-| 18 | Direct | 其他所有情况 |
+| 16 | Mobile Push Notifications | utm_medium 鍖呭惈 push/mobile/notification 鎴?source == firebase |
+| 17 | Referral | utm_medium 涓?referral/app/link 鎴栨湁 source |
+| 18 | Direct | 鍏朵粬鎵€鏈夋儏鍐?|
 
-**注意：** 此处共 17 种显式分类 + 1 个默认 Direct，共 18 个可返回值（SMS 被两个条件检查）。
+**娉ㄦ剰锛?* 姝ゅ鍏?17 绉嶆樉寮忓垎绫?+ 1 涓粯璁?Direct锛屽叡 18 涓彲杩斿洖鍊硷紙SMS 琚袱涓潯浠舵鏌ワ級銆?
+**5. 鏉ユ簮绫诲埆 Dictionary**
 
-**5. 来源类别 Dictionary**
-
-ClickHouse 中创建了两个 Dictionary 用于来源分类：
-
-- `acquisition_channel_source_category_dict`：来源 → 类别（SEARCH/SOCIAL/SHOPPING/VIDEO/EMAIL）
-- `acquisition_channel_paid_sources_dict`：付费来源集合
-
-**自定义来源类别扩展：**
+ClickHouse 涓垱寤轰簡涓や釜 Dictionary 鐢ㄤ簬鏉ユ簮鍒嗙被锛?
+- `acquisition_channel_source_category_dict`锛氭潵婧?鈫?绫诲埆锛圫EARCH/SOCIAL/SHOPPING/VIDEO/EMAIL锛?- `acquisition_channel_paid_sources_dict`锛氫粯璐规潵婧愰泦鍚?
+**鑷畾涔夋潵婧愮被鍒墿灞曪細**
 `lib/plausible/ingestion/acquisition.ex:20-40`
 
 ```elixir
@@ -458,8 +421,8 @@ ClickHouse 中创建了两个 Dictionary 用于来源分类：
   {"slack", "SOURCE_CATEGORY_SOCIAL"},
   {"producthunt", "SOURCE_CATEGORY_SOCIAL"},
   {"github", "SOURCE_CATEGORY_SOCIAL"},
-  {"perplexity", "SOURCE_CATEGORY_SEARCH"},     # AI 搜索
-  {"chatgpt.com", "SOURCE_CATEGORY_SEARCH"},    # AI 搜索
+  {"perplexity", "SOURCE_CATEGORY_SEARCH"},     # AI 鎼滅储
+  {"chatgpt.com", "SOURCE_CATEGORY_SEARCH"},    # AI 鎼滅储
   {"brave", "SOURCE_CATEGORY_SEARCH"},
   {"discord", "SOURCE_CATEGORY_SOCIAL"},
   {"temu.com", "SOURCE_CATEGORY_SHOPPING"},
@@ -467,9 +430,8 @@ ClickHouse 中创建了两个 Dictionary 用于来源分类：
 ]
 ```
 
-**基础数据源：** `priv/ga4-source-categories.csv`（来自 Google Analytics 4 官方分类）
-
-**6. Click ID 自动推断**
+**鍩虹鏁版嵁婧愶細** `priv/ga4-source-categories.csv`锛堟潵鑷?Google Analytics 4 瀹樻柟鍒嗙被锛?
+**6. Click ID 鑷姩鎺ㄦ柇**
 `lib/plausible/ingestion/event.ex:312-322`
 
 ```elixir
@@ -485,63 +447,35 @@ defp maybe_infer_medium(%__MODULE__{} = event, _context) do
 end
 ```
 
-支持的 Click ID 参数：`gclid`, `gbraid`, `wbraid`, `msclkid`, `fbclid`, `twclid`
+鏀寔鐨?Click ID 鍙傛暟锛歚gclid`, `gbraid`, `wbraid`, `msclkid`, `fbclid`, `twclid`
 
-### 4.2 流量来源数据展示
+### 4.2 娴侀噺鏉ユ簮鏁版嵁灞曠ず
 
-#### 前端组件
+#### 鍓嶇缁勪欢
 `assets/js/dashboard/stats/sources/index.js`
 
-**四个视图模式：**
+**鍥涗釜瑙嗗浘妯″紡锛?*
 
-1. **Channels（渠道）**
-   - 维度：`visit:channel`
-   - 展示：Organic Search, Direct, Paid Search, Paid Other, Social, Referral, Email 等
+1. **Channels锛堟笭閬擄級**
+   - 缁村害锛歚visit:channel`
+   - 灞曠ず锛歄rganic Search, Direct, Paid Search, Paid Other, Social, Referral, Email 绛?
+2. **Sources锛堟潵婧愶級**
+   - 缁村害锛歚visit:source`
+   - 灞曠ず鏉ユ簮缃戠珯鍥炬爣锛坒avicon锛?   - 鏀寔涓嬮捇鍔熻兘
 
-2. **Sources（来源）**
-   - 维度：`visit:source`
-   - 展示来源网站图标（favicon）
-   - 支持下钻功能
+3. **UTM 鍙傛暟**
+   - 涓嬫媺鑿滃崟鍖呭惈锛歶tm_medium, utm_source, utm_campaign, utm_content, utm_term
 
-3. **UTM 参数**
-   - 下拉菜单包含：utm_medium, utm_source, utm_campaign, utm_content, utm_term
-
-#### 完整下钻路径
+#### 瀹屾暣涓嬮捇璺緞
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    流量来源视图                             │
-├─────────────────────────────────────────────────────────────┤
-│  Channels(渠道)  │  Sources(来源)  │  UTM(参数)              │
-├──────────────────┼─────────────────┼────────────────────────┤
-│                  │ ┌─────────────┐ │                        │
-│                  │ │  Google     │ │── 点击 Google 来源    │
-│                  │ └──────┬──────┘ │   (特殊处理)           │
-│                  │        │        │                        │
-│                  │        ▼        │                        │
-│                  │ ┌─────────────┐ │   Search Console API  │
-│                  │ │ 关键词列表  │ │   → 搜索关键词         │
-│                  │ └─────────────┘ │                        │
-│                  │                 │                        │
-│                  │ ┌─────────────┐ │                        │
-│                  │ │  Twitter    │ │── 点击其他来源         │
-│                  │ └──────┬──────┘ │   (通用路径)           │
-│                  │        │        │                        │
-│                  │        ▼        │                        │
-│                  │ ┌─────────────┐ │   /referrers/:source  │
-│                  │ │ 具体referrer│ │   → 引用域名列表       │
-│                  │ │ (twitter.com │ │                        │
-│                  │ │  github.com) │ │                        │
-│                  │ └─────────────┘ │                        │
-└──────────────────┴─────────────────┴────────────────────────┘
-```
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                   娴侀噺鏉ユ簮瑙嗗浘                             鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹? Channels(娓犻亾)  鈹? Sources(鏉ユ簮)  鈹? UTM(鍙傛暟)              鈹?鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                 鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                       鈹?鈹?                 鈹?鈹? Google     鈹?鈹傗攢鈹€ 鐐瑰嚮 Google 鏉ユ簮    鈹?鈹?                 鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹?鈹?  (鐗规畩澶勭悊)           鈹?鈹?                 鈹?       鈹?       鈹?                       鈹?鈹?                 鈹?       鈻?       鈹?                       鈹?鈹?                 鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?  Search Console API  鈹?鈹?                 鈹?鈹?鍏抽敭璇嶅垪琛? 鈹?鈹?  鈫?鎼滅储鍏抽敭璇?        鈹?鈹?                 鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                       鈹?鈹?                 鈹?                鈹?                       鈹?鈹?                 鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                       鈹?鈹?                 鈹?鈹? Twitter    鈹?鈹傗攢鈹€ 鐐瑰嚮鍏朵粬鏉ユ簮         鈹?鈹?                 鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹?鈹?  (閫氱敤璺緞)           鈹?鈹?                 鈹?       鈹?       鈹?                       鈹?鈹?                 鈹?       鈻?       鈹?                       鈹?鈹?                 鈹?鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?  /referrers/:referrer  鈹?鈹?                 鈹?鈹?鍏蜂綋referrer鈹?鈹?  鈫?寮曠敤鍩熷悕鍒楄〃       鈹?鈹?                 鈹?鈹?(twitter.com 鈹?鈹?                       鈹?鈹?                 鈹?鈹? github.com) 鈹?鈹?                       鈹?鈹?                 鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹?                       鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?```
 
-**1. Sources 列表组件**
+**1. Sources 鍒楄〃缁勪欢**
 `assets/js/dashboard/stats/sources/index.js`
 
-点击某个来源后，如果是 "Google"，会有特殊处理；其他来源跳转到 ReferrerDrilldownModal。
-
-**2. Referrer 下钻模态框**
+鐐瑰嚮鏌愪釜鏉ユ簮鍚庯紝濡傛灉鏄?"Google"锛屼細鏈夌壒娈婂鐞嗭紱鍏朵粬鏉ユ簮璺宠浆鍒?ReferrerDrilldownModal銆?
+**2. Referrer 涓嬮捇妯℃€佹**
 `assets/js/dashboard/stats/modals/referrer-drilldown.js`
 
 ```javascript
@@ -554,82 +488,74 @@ const reportInfo = {
 }
 ```
 
-**3. 后端下钻 API**
+**3. 鍚庣涓嬮捇 API**
 `lib/plausible_web/controllers/api/stats_controller.ex:526-612`
 
-**Google 来源特殊处理：**
+**Google 鏉ユ簮鐗规畩澶勭悊锛?*
 ```elixir
 def referrer_drilldown(conn, %{"referrer" => "Google"} = params) do
-  # 调用 Google Search Console API 获取搜索关键词
-  search_terms = google_api().fetch_stats(site, query, pagination, search)
-  # ... 返回关键词列表
-end
+  # 璋冪敤 Google Search Console API 鑾峰彇鎼滅储鍏抽敭璇?  search_terms = google_api().fetch_stats(site, query, pagination, search)
+  # ... 杩斿洖鍏抽敭璇嶅垪琛?end
 ```
 
-**其他来源通用处理：**
+**鍏朵粬鏉ユ簮閫氱敤澶勭悊锛?*
 ```elixir
 def referrer_drilldown(conn, %{"referrer" => referrer} = params) do
   query =
     Query.from(site, params, debug_metadata: debug_metadata(conn))
-    |> Query.add_filter([:is, "visit:source", [referrer]])  # 按来源过滤
-  
-  # 列出该来源下的所有具体 referrer 域名
+    |> Query.add_filter([:is, "visit:source", [referrer]])  # 鎸夋潵婧愯繃婊?  
+  # 鍒楀嚭璇ユ潵婧愪笅鐨勬墍鏈夊叿浣?referrer 鍩熷悕
   %{results: results, meta: meta} = Stats.breakdown(site, query, metrics, pagination)
 end
 ```
 
-#### 后端 API 完整列表
+#### 鍚庣 API 瀹屾暣鍒楄〃
 `lib/plausible_web/controllers/api/stats_controller.ex:59-612`
 
-| 接口 | 维度 | 说明 |
+| 鎺ュ彛 | 缁村害 | 璇存槑 |
 |------|------|------|
-| `GET /sources` | `visit:source` | 来源列表（顶层） |
-| `GET /channels` | `visit:channel` | 渠道列表（顶层） |
-| `GET /referrers/:source` | `visit:referrer` | 来源下钻 - 具体引用域名 |
-| `GET /utm_mediums` | `visit:utm_medium` | UTM 媒介 |
-| `GET /utm_sources` | `visit:utm_source` | UTM 来源 |
-| `GET /utm_campaigns` | `visit:utm_campaign` | UTM 广告系列 |
-| `GET /utm_contents` | `visit:utm_content` | UTM 内容 |
-| `GET /utm_terms` | `visit:utm_term` | UTM 关键词 |
+| `GET /sources` | `visit:source` | 鏉ユ簮鍒楄〃锛堥《灞傦級 |
+| `GET /channels` | `visit:channel` | 娓犻亾鍒楄〃锛堥《灞傦級 |
+| `GET /referrers/:referrer` | `visit:referrer` | 鏉ユ簮涓嬮捇 - 鍏蜂綋寮曠敤鍩熷悕 |
+| `GET /utm_mediums` | `visit:utm_medium` | UTM 濯掍粙 |
+| `GET /utm_sources` | `visit:utm_source` | UTM 鏉ユ簮 |
+| `GET /utm_campaigns` | `visit:utm_campaign` | UTM 骞垮憡绯诲垪 |
+| `GET /utm_contents` | `visit:utm_content` | UTM 鍐呭 |
+| `GET /utm_terms` | `visit:utm_term` | UTM 鍏抽敭璇?|
 
-**下钻路径示例：**
+**涓嬮捇璺緞绀轰緥锛?*
 ```
 /GET /sources
-  ↓ 点击 "Twitter"
-  ├─ source == "Google" → 调用 Search Console API 返回关键词
-  └─ source != "Google" → GET /referrers/Twitter → 返回 twitter.com 等具体域名
-       ↓ 点击某个域名
-       └─ 应用过滤器 "referrer is twitter.com" 到整个仪表盘
+  鈫?鐐瑰嚮 "Twitter"
+  鈹溾攢 source == "Google" 鈫?璋冪敤 Search Console API 杩斿洖鍏抽敭璇?  鈹斺攢 source != "Google" 鈫?GET /referrers/Twitter 鈫?杩斿洖 twitter.com 绛夊叿浣撳煙鍚?       鈫?鐐瑰嚮鏌愪釜鍩熷悕
+       鈹斺攢 搴旂敤杩囨护鍣?"referrer is twitter.com" 鍒版暣涓华琛ㄧ洏
 ```
 
 ---
 
-## 5. 数据存储模型
+## 5. 鏁版嵁瀛樺偍妯″瀷
 
-### 5.1 Session 表结构
-`lib/plausible/clickhouse_session_v2.ex`
+### 5.1 Session 琛ㄧ粨鏋?`lib/plausible/clickhouse_session_v2.ex`
 
-核心维度字段：
-
+鏍稿績缁村害瀛楁锛?
 ```elixir
-# Geo 定位
+# Geo 瀹氫綅
 field :country_code, Ch, type: "LowCardinality(FixedString(2))"
 field :subdivision1_code, Ch, type: "LowCardinality(String)"
 field :subdivision2_code, Ch, type: "LowCardinality(String)"
 field :city_geoname_id, Ch, type: "UInt32"
 
-# 设备类型
+# 璁惧绫诲瀷
 field :screen_size, Ch, type: "LowCardinality(String)"       # Mobile/Tablet/Desktop
 field :operating_system, Ch, type: "LowCardinality(String)"
 field :operating_system_version, Ch, type: "LowCardinality(String)"
 field :browser, Ch, type: "LowCardinality(String)"
 field :browser_version, Ch, type: "LowCardinality(String)"
 
-# 流量来源
-field :referrer_source, :string                            # 规范化来源名
-field :referrer, :string                                    # 具体引用 URL
-field :click_id_param, Ch, type: "LowCardinality(String)"  # gclid/msclkid 等
-field :utm_medium, :string
+# 娴侀噺鏉ユ簮
+field :referrer_source, :string                            # 瑙勮寖鍖栨潵婧愬悕
+field :referrer, :string                                    # 鍏蜂綋寮曠敤 URL
+field :click_id_param, Ch, type: "LowCardinality(String)"  # gclid/msclkid 绛?field :utm_medium, :string
 field :utm_source, :string
 field :utm_campaign, :string
 field :utm_content, :string
@@ -637,80 +563,70 @@ field :utm_term, :string
 field :acquisition_channel, Ch, type: "LowCardinality(String)", writable: :never
 ```
 
-**关键点：**
-- `acquisition_channel` 是 `writable: :never` 且是 **MATERIALIZED 列**
-- 写入时由 ClickHouse 自动计算并持久化
-- 写入数据时排除该字段（`fields_to_ignore()`）
-
-### 5.2 维度名称映射
+**鍏抽敭鐐癸細**
+- `acquisition_channel` 鏄?`writable: :never` 涓旀槸 **MATERIALIZED 鍒?*
+- 鍐欏叆鏃剁敱 ClickHouse 鑷姩璁＄畻骞舵寔涔呭寲
+- 鍐欏叆鏁版嵁鏃舵帓闄よ瀛楁锛坄fields_to_ignore()`锛?
+### 5.2 缁村害鍚嶇О鏄犲皠
 
 `lib/plausible/stats/sql/expression.ex:164-246`
 
-查询时的维度选择：
-
-| 查询维度 | 对应字段 |
+鏌ヨ鏃剁殑缁村害閫夋嫨锛?
+| 鏌ヨ缁村害 | 瀵瑰簲瀛楁 |
 |---------|---------|
-| `visit:country` | `t.country`（ALIAS → 名称） |
-| `visit:region` | `t.region`（ALIAS → 名称） |
-| `visit:city` | `t.city`（ALIAS → 名称） |
-| `visit:device` | `t.device`（即 screen_size） |
+| `visit:country` | `t.country`锛圓LIAS 鈫?鍚嶇О锛?|
+| `visit:region` | `t.region`锛圓LIAS 鈫?鍚嶇О锛?|
+| `visit:city` | `t.city`锛圓LIAS 鈫?鍚嶇О锛?|
+| `visit:device` | `t.device`锛堝嵆 screen_size锛?|
 | `visit:os` | `t.os` |
 | `visit:os_version` | `t.os_version` |
 | `visit:browser` | `t.browser` |
 | `visit:browser_version` | `t.browser_version` |
-| `visit:source` | `t.source`（即 referrer_source） |
-| `visit:channel` | `t.acquisition_channel`（MATERIALIZED，已存储） |
+| `visit:source` | `t.source`锛堝嵆 referrer_source锛?|
+| `visit:channel` | `t.acquisition_channel`锛圡ATERIALIZED锛屽凡瀛樺偍锛?|
 | `visit:referrer` | `t.referrer` |
 | `visit:utm_*` | `t.utm_*` |
 
-空值处理：
+绌哄€煎鐞嗭細
 - Source: `"Direct / None"`
 - Channel: `"Direct"`
-- 其他: `"(not set)"`
+- 鍏朵粬: `"(not set)"`
 
-### 5.3 ClickHouse Dictionary 与函数
+### 5.3 ClickHouse Dictionary 涓庡嚱鏁?
+**1. 鍦扮悊浣嶇疆 Dictionary**
+- `location_data_dictionary`锛氫唬鐮?鈫?鍚嶇О鏄犲皠
 
-**1. 地理位置 Dictionary**
-- `location_data_dictionary`：代码 → 名称映射
-
-**2. 渠道分类 Dictionary（ClickHouse 端）**
-- `acquisition_channel_source_category_dict`：来源 → 类别
-- `acquisition_channel_paid_sources_dict`：付费来源集合
-
-**3. 渠道推断函数（ClickHouse 端）**
+**2. 娓犻亾鍒嗙被 Dictionary锛圕lickHouse 绔級**
+- `acquisition_channel_source_category_dict`锛氭潵婧?鈫?绫诲埆
+- `acquisition_channel_paid_sources_dict`锛氫粯璐规潵婧愰泦鍚?
+**3. 娓犻亾鎺ㄦ柇鍑芥暟锛圕lickHouse 绔級**
 ```sql
 acquisition_channel(referrer_source, utm_medium, utm_campaign, utm_source, click_id_param)
-  └─→ 调用 acquisition_channel_lowered（转小写后匹配）
+  鈹斺攢鈫?璋冪敤 acquisition_channel_lowered锛堣浆灏忓啓鍚庡尮閰嶏級
 ```
 
 ---
 
-## 6. 查询与展示流程
-
-### 6.1 完整数据流
-
+## 6. 鏌ヨ涓庡睍绀烘祦绋?
+### 6.1 瀹屾暣鏁版嵁娴?
 ```
-前端请求
-    ↓
-PlausibleWeb.Api.StatsController
-    ↓  (选择 property 参数如 "visit:country")
+鍓嶇璇锋眰
+    鈫?PlausibleWeb.Api.StatsController
+    鈫? (閫夋嫨 property 鍙傛暟濡?"visit:country")
 Plausible.Stats.breakdown/4
-    ↓
-Plausible.Stats.Breakdown.breakdown/5
-    ↓  (构建 Query 结构体)
+    鈫?Plausible.Stats.Breakdown.breakdown/5
+    鈫? (鏋勫缓 Query 缁撴瀯浣?
 Plausible.Stats.QueryRunner.run/2
-    ↓
-Plausible.Stats.SQL.QueryBuilder.build/2
-    ↓  (生成 ClickHouse SQL)
-ClickHouse 查询
-    ↓  (按维度 GROUP BY + 指标聚合)
-查询结果
-    ↓  (API 层附加名称/国旗等展示信息)
-前端 React 组件渲染
+    鈫?Plausible.Stats.SQL.QueryBuilder.build/2
+    鈫? (鐢熸垚 ClickHouse SQL)
+ClickHouse 鏌ヨ
+    鈫? (鎸夌淮搴?GROUP BY + 鎸囨爣鑱氬悎)
+鏌ヨ缁撴灉
+    鈫? (API 灞傞檮鍔犲悕绉?鍥芥棗绛夊睍绀轰俊鎭?
+鍓嶇 React 缁勪欢娓叉煋
 ```
 
-### 6.2 数据摄入流水线
-
+### 6.2 鏁版嵁鎽勫叆娴佹按绾?
 `lib/plausible/ingestion/event.ex:130-151`
 
 ```elixir
@@ -722,12 +638,12 @@ defp pipeline() do
     drop_shield_rule_hostname: &drop_shield_rule_hostname/2,
     drop_shield_rule_page: &drop_shield_rule_page/2,
     drop_shield_rule_ip: &drop_shield_rule_ip/2,
-    put_geolocation: &put_geolocation/2,           # ← Geo 定位
+    put_geolocation: &put_geolocation/2,           # 鈫?Geo 瀹氫綅
     drop_shield_rule_country: &drop_shield_rule_country/2,
-    put_user_agent: &put_user_agent/2,             # ← 设备类型
+    put_user_agent: &put_user_agent/2,             # 鈫?璁惧绫诲瀷
     put_basic_info: &put_basic_info/2,
-    put_source_info: &put_source_info/2,           # ← 流量来源 (Source + UTM)
-    maybe_infer_medium: &maybe_infer_medium/2,     # ← 推断 medium (Click ID)
+    put_source_info: &put_source_info/2,           # 鈫?娴侀噺鏉ユ簮 (Source + UTM)
+    maybe_infer_medium: &maybe_infer_medium/2,     # 鈫?鎺ㄦ柇 medium (Click ID)
     put_props: &put_props/2,
     put_revenue: &put_revenue/2,
     put_salts: &put_salts/2,
@@ -738,105 +654,83 @@ defp pipeline() do
 end
 ```
 
-**注意：** Ingestion 阶段只解析 Source 和 UTM 参数，不解析 Channel。Channel 由 ClickHouse 的 MATERIALIZED 列在写入时自动计算。
-
-### 6.3 渠道计算的完整链路
-
+**娉ㄦ剰锛?* Ingestion 闃舵鍙В鏋?Source 鍜?UTM 鍙傛暟锛屼笉瑙ｆ瀽 Channel銆侰hannel 鐢?ClickHouse 鐨?MATERIALIZED 鍒楀湪鍐欏叆鏃惰嚜鍔ㄨ绠椼€?
+### 6.3 娓犻亾璁＄畻鐨勫畬鏁撮摼璺?
 ```
-Tracker 发送请求
-    ↓
-Ingestion Pipeline
-    ├─ put_source_info → 写入 referrer_source, utm_*, click_id_param
-    └─ 不计算 acquisition_channel
-    ↓
-WriteBuffer 写入 ClickHouse
-    └─ 排除 acquisition_channel 字段 (fields_to_ignore)
-    ↓
-ClickHouse MATERIALIZED 列触发
-    ├─ 调用 acquisition_channel() 函数
-    ├─ 使用 Dictionary 进行来源分类匹配
-    └─ 计算结果持久化存储
-    ↓
-后续查询直接读取已存储的 acquisition_channel 值
-```
+Tracker 鍙戦€佽姹?    鈫?Ingestion Pipeline
+    鈹溾攢 put_source_info 鈫?鍐欏叆 referrer_source, utm_*, click_id_param
+    鈹斺攢 涓嶈绠?acquisition_channel
+    鈫?WriteBuffer 鍐欏叆 ClickHouse
+    鈹斺攢 鎺掗櫎 acquisition_channel 瀛楁 (fields_to_ignore)
+    鈫?ClickHouse MATERIALIZED 鍒楄Е鍙?    鈹溾攢 璋冪敤 acquisition_channel() 鍑芥暟
+    鈹溾攢 浣跨敤 Dictionary 杩涜鏉ユ簮鍒嗙被鍖归厤
+    鈹斺攢 璁＄畻缁撴灉鎸佷箙鍖栧瓨鍌?    鈫?鍚庣画鏌ヨ鐩存帴璇诲彇宸插瓨鍌ㄧ殑 acquisition_channel 鍊?```
 
 ---
 
-## 7. 关键文件索引
+## 7. 鍏抽敭鏂囦欢绱㈠紩
 
-| 文件路径 | 职责 |
+| 鏂囦欢璺緞 | 鑱岃矗 |
 |---------|------|
-| `lib/plausible/ingestion/geolocation.ex` | Geo 定位解析 |
-| `lib/plausible/geo.ex` | Geo 数据库加载 API |
-| `lib/plausible/ingestion/event.ex` | 设备类型 + 来源解析主入口 |
-| `lib/plausible/ingestion/source.ex` | 流量来源（Source）解析 |
-| `lib/plausible/ingestion/acquisition.ex` | Channel 推断逻辑（Elixir 端，供迁移和测试用） |
-| `lib/plausible/ingestion/write_buffer.ex` | 写入缓冲区，排除 acquisition_channel |
-| `lib/plausible/ingestion/request.ex` | HTTP 请求构建 |
-| `lib/plausible/clickhouse_session_v2.ex` | Session 存储模型 |
-| `lib/plausible/data_migration/acquisition_channel.ex` | 渠道字段数据迁移 |
-| `lib/plausible/stats/sql/expression.ex` | SQL 维度/指标表达式 |
-| `lib/plausible/stats/sql/query_builder.ex` | SQL 查询构建 |
-| `lib/plausible/stats/breakdown.ex` | Breakdown 查询封装 |
-| `lib/plausible_web/controllers/api/stats_controller.ex` | 统计 API 端点 |
-| `assets/js/dashboard/stats/locations/index.js` | 地理位置前端展示 |
-| `assets/js/dashboard/stats/devices/index.js` | 设备类型前端展示 |
-| `assets/js/dashboard/stats/sources/index.js` | 流量来源前端展示 |
-| `assets/js/dashboard/stats/modals/referrer-drilldown.js` | 来源下钻模态框 |
-| `priv/ref_inspector/referers.yml` | Referer 解析规则库 |
-| `priv/custom_sources.json` | 自定义来源映射 |
-| `priv/ga4-source-categories.csv` | GA4 来源类别基准 |
-| `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_functions.sql.eex` | ClickHouse 渠道函数定义 |
-| `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_add_materialized_column.sql.eex` | 渠道 MATERIALIZED 列定义 |
+| `lib/plausible/ingestion/geolocation.ex` | Geo 瀹氫綅瑙ｆ瀽 |
+| `lib/plausible/geo.ex` | Geo 鏁版嵁搴撳姞杞?API |
+| `lib/plausible/ingestion/event.ex` | 璁惧绫诲瀷 + 鏉ユ簮瑙ｆ瀽涓诲叆鍙?|
+| `lib/plausible/ingestion/source.ex` | 娴侀噺鏉ユ簮锛圫ource锛夎В鏋?|
+| `lib/plausible/ingestion/acquisition.ex` | Channel 鎺ㄦ柇閫昏緫锛圗lixir 绔紝渚涜縼绉诲拰娴嬭瘯鐢級 |
+| `lib/plausible/ingestion/write_buffer.ex` | 鍐欏叆缂撳啿鍖猴紝鎺掗櫎 acquisition_channel |
+| `lib/plausible/ingestion/request.ex` | HTTP 璇锋眰鏋勫缓 |
+| `lib/plausible/clickhouse_session_v2.ex` | Session 瀛樺偍妯″瀷 |
+| `lib/plausible/data_migration/acquisition_channel.ex` | 娓犻亾瀛楁鏁版嵁杩佺Щ |
+| `lib/plausible/stats/sql/expression.ex` | SQL 缁村害/鎸囨爣琛ㄨ揪寮?|
+| `lib/plausible/stats/sql/query_builder.ex` | SQL 鏌ヨ鏋勫缓 |
+| `lib/plausible/stats/breakdown.ex` | Breakdown 鏌ヨ灏佽 |
+| `lib/plausible_web/controllers/api/stats_controller.ex` | 缁熻 API 绔偣 |
+| `assets/js/dashboard/stats/locations/index.js` | 鍦扮悊浣嶇疆鍓嶇灞曠ず |
+| `assets/js/dashboard/stats/devices/index.js` | 璁惧绫诲瀷鍓嶇灞曠ず |
+| `assets/js/dashboard/stats/sources/index.js` | 娴侀噺鏉ユ簮鍓嶇灞曠ず |
+| `assets/js/dashboard/stats/modals/referrer-drilldown.js` | 鏉ユ簮涓嬮捇妯℃€佹 |
+| `priv/ref_inspector/referers.yml` | Referer 瑙ｆ瀽瑙勫垯搴?|
+| `priv/custom_sources.json` | 鑷畾涔夋潵婧愭槧灏?|
+| `priv/ga4-source-categories.csv` | GA4 鏉ユ簮绫诲埆鍩哄噯 |
+| `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_functions.sql.eex` | ClickHouse 娓犻亾鍑芥暟瀹氫箟 |
+| `priv/data_migrations/AcquisitionChannel/sql/acquisition_channel_add_materialized_column.sql.eex` | 娓犻亾 MATERIALIZED 鍒楀畾涔?|
 
 ---
 
-## 8. 总结
+## 8. 鎬荤粨
 
-三个维度的设计模式高度一致但各有特点：
-
-### 8.1 共同点
-1. **摄入时解析**：在数据进入 ClickHouse 之前完成解析
-2. **规范化存储**：使用代码/ID 或规范化字符串存储
-3. **分层展示**：前端使用 Tab 切换不同粒度的视图
-
-### 8.2 各维度差异
-
-| 维度 | 存储方式 | 计算时机 | 查询方式 |
+涓変釜缁村害鐨勮璁℃ā寮忛珮搴︿竴鑷翠絾鍚勬湁鐗圭偣锛?
+### 8.1 鍏卞悓鐐?1. **鎽勫叆鏃惰В鏋?*锛氬湪鏁版嵁杩涘叆 ClickHouse 涔嬪墠瀹屾垚瑙ｆ瀽
+2. **瑙勮寖鍖栧瓨鍌?*锛氫娇鐢ㄤ唬鐮?ID 鎴栬鑼冨寲瀛楃涓插瓨鍌?3. **鍒嗗眰灞曠ず**锛氬墠绔娇鐢?Tab 鍒囨崲涓嶅悓绮掑害鐨勮鍥?
+### 8.2 鍚勭淮搴﹀樊寮?
+| 缁村害 | 瀛樺偍鏂瑰紡 | 璁＄畻鏃舵満 | 鏌ヨ鏂瑰紡 |
 |------|---------|---------|---------|
-| **Geo 定位** | 代码存储（country_code 等） | Ingestion 阶段 | Dictionary + ALIAS 列映射名称 |
-| **设备类型** | 直接存储规范化值 | Ingestion 阶段 | 直接查询 |
-| **流量渠道** | MATERIALIZED 列存盘 | **ClickHouse 写入时** | 直接读取已计算值 |
+| **Geo 瀹氫綅** | 浠ｇ爜瀛樺偍锛坈ountry_code 绛夛級 | Ingestion 闃舵 | Dictionary + ALIAS 鍒楁槧灏勫悕绉?|
+| **璁惧绫诲瀷** | 鐩存帴瀛樺偍瑙勮寖鍖栧€?| Ingestion 闃舵 | 鐩存帴鏌ヨ |
+| **娴侀噺娓犻亾** | MATERIALIZED 鍒楀瓨鐩?| **ClickHouse 鍐欏叆鏃?* | 鐩存帴璇诲彇宸茶绠楀€?|
 
-### 8.3 渠道计算的关键设计
+### 8.3 娓犻亾璁＄畻鐨勫叧閿璁?
+`acquisition_channel` 鐨勭壒娈婅璁★細
 
-`acquisition_channel` 的特殊设计：
+1. **璁＄畻浣嶇疆**锛氫笉鍦?Elixir Ingestion 涓绠楋紝鑰屽湪 ClickHouse 鍐欏叆鏃堕€氳繃 MATERIALIZED 鍒楄绠?2. **璁＄畻閫昏緫**锛氶€氳繃 ClickHouse SQL 鍑芥暟 + Dictionary 瀹炵幇
+3. **鍚屾鏈哄埗**锛氭暟鎹縼绉昏剼鏈細浠?Elixir 鐨?`Plausible.Ingestion.Acquisition` 妯″潡鎻愬彇瑙勫垯锛屽悓姝ュ埌 ClickHouse
+4. **浼樼偣**锛?   - 鏁版嵁鍐欏叆鏃惰嚜鍔ㄨ绠楋紝Elixir 绔棤闇€鍏冲績
+   - 鍙€氳繃 ClickHouse 鍑芥暟鏇存柊閫昏緫骞?backfill 鍘嗗彶鏁版嵁
+   - 鏌ヨ鏃舵棤闇€鍔ㄦ€佽绠楋紝鎬ц兘鏇村ソ
 
-1. **计算位置**：不在 Elixir Ingestion 中计算，而在 ClickHouse 写入时通过 MATERIALIZED 列计算
-2. **计算逻辑**：通过 ClickHouse SQL 函数 + Dictionary 实现
-3. **同步机制**：数据迁移脚本会从 Elixir 的 `Plausible.Ingestion.Acquisition` 模块提取规则，同步到 ClickHouse
-4. **优点**：
-   - 数据写入时自动计算，Elixir 端无需关心
-   - 可通过 ClickHouse 函数更新逻辑并 backfill 历史数据
-   - 查询时无需动态计算，性能更好
-
-### 8.4 来源下钻路径
+### 8.4 鏉ユ簮涓嬮捇璺緞
 
 ```
-Sources 列表
-    ↓
-    ├─ 点击 "Google"
-    │    └─ Search Console API → 关键词列表
-    │
-    └─ 点击其他来源
-         └─ /referrers/:source → 具体 referrer 域名列表
-              ↓
-              └─ 应用过滤器 "referrer is X" 到仪表盘
+Sources 鍒楄〃
+    鈫?    鈹溾攢 鐐瑰嚮 "Google"
+    鈹?   鈹斺攢 Search Console API 鈫?鍏抽敭璇嶅垪琛?    鈹?    鈹斺攢 鐐瑰嚮鍏朵粬鏉ユ簮
+         鈹斺攢 /referrers/:referrer 鈫?鍏蜂綋 referrer 鍩熷悕鍒楄〃
+              鈫?              鈹斺攢 搴旂敤杩囨护鍣?"referrer is X" 鍒颁华琛ㄧ洏
 ```
 
-### 8.5 关键技术选择
+### 8.5 鍏抽敭鎶€鏈€夋嫨
 
-- **地理位置**：MaxMind/DB-IP MMDB + locus 库
-- **设备识别**：UAInspector 库 + 200ms 超时保护 + 缓存
-- **来源识别**：RefInspector 库 + 自定义规则 + UTM 参数
-- **渠道推断**：ClickHouse MATERIALIZED 列 + SQL 函数 + Dictionary
+- **鍦扮悊浣嶇疆**锛歁axMind/DB-IP MMDB + locus 搴?- **璁惧璇嗗埆**锛歎AInspector 搴?+ 200ms 瓒呮椂淇濇姢 + 缂撳瓨
+- **鏉ユ簮璇嗗埆**锛歊efInspector 搴?+ 鑷畾涔夎鍒?+ UTM 鍙傛暟
+- **娓犻亾鎺ㄦ柇**锛欳lickHouse MATERIALIZED 鍒?+ SQL 鍑芥暟 + Dictionary
+
